@@ -1,0 +1,28 @@
+{
+  "name": "dropped_third_putout_at_first",
+  "description": "Uncaught third strike on which the batter was retired at first, catcher to first baseman. Uncaught, but the batter did NOT reach -- the distinction the ontology exists to make.",
+  "source": {
+    "citation": "Retrosheet event file documentation, K23 example",
+    "note": "play,6,1,wynnm001,22,..BBFCFS,K23",
+    "status": "verified -- documented example, and common throughout the corpus"
+  },
+  "input": {
+    "subject": "K23",
+    "state_before": {"inning": 6, "half": "bottom", "outs": 0,
+                     "bases": {"1": null, "2": null, "3": null}}
+  },
+  "expected_parse": {
+    "basic": [{"type": "Strikeout",
+               "groups": [{"fielders": "23", "runner": null}]}],
+    "modifiers": [],
+    "advances": [],
+    "trivia": []
+  },
+  "expected_state": {
+    "batter_dest": "out", "batter_is_out": true,
+    "outs_recorded": 1, "outs_after": 1, "runs_on_play": 0
+  },
+  "expected_tags": ["Strikeout", "UncaughtThirdStrike", "NoOuts"],
+  "forbidden_tags": ["BatterReachedOnK", "ForceOut", "TagOut", "DoublePlay"],
+  "roundtrip": "K23"
+}

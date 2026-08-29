@@ -1,0 +1,31 @@
+{
+  "name": "strikeout_throw_out",
+  "description": "Clean third strike with a runner thrown out stealing second. The X advance belongs to the runner, not the batter -- a rule keyed on 'K with an X advance' wrongly reads this as an uncaught third strike.",
+  "source": {
+    "citation": "Retrosheet event file documentation, K/DP example",
+    "note": "play,4,1,stubf001,32,CBFBBFFS,K/DP.1X2(26)",
+    "status": "verified -- documented example"
+  },
+  "input": {
+    "subject": "K/DP.1X2(26)",
+    "state_before": {"inning": 4, "half": "bottom", "outs": 0,
+                     "bases": {"1": "runner_a", "2": null, "3": null}}
+  },
+  "expected_parse": {
+    "basic": [{"type": "Strikeout", "groups": []}],
+    "modifiers": [{"kind": "named", "code": "DP"}],
+    "advances": [
+      {"origin": "1", "dest": "2", "marked_out": true, "is_out": true,
+       "credits": [{"fielder": "2", "is_error": false},
+                   {"fielder": "6", "is_error": false}]}
+    ],
+    "trivia": []
+  },
+  "expected_state": {
+    "batter_dest": "out", "batter_is_out": true,
+    "outs_recorded": 2, "outs_after": 2, "runs_on_play": 0
+  },
+  "expected_tags": ["Strikeout", "DoublePlay", "NoOuts"],
+  "forbidden_tags": ["UncaughtThirdStrike", "BatterReachedOnK", "ForceOut"],
+  "roundtrip": "K/DP.1X2(26)"
+}

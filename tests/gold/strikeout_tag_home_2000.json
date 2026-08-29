@@ -1,0 +1,58 @@
+{
+  "name": "strikeout_tag_home_2000",
+  "description": "Runners on first and third, one out. Sanchez strikes out; Ortiz is retired at the plate, catcher to pitcher. The batter was out on strikes and never became a runner, so the out at home is a TAG, not a force -- despite an event string almost identical to the 2026 Tigers force play.",
+  "source": {
+    "game_id": "KCA200009270",
+    "citation": "Retrosheet 2000KCA.EVA",
+    "note": "Detroit at Kansas City, 2000-09-27, Kauffman Stadium, Royals 3rd",
+    "status": "verified against the released event file"
+  },
+  "input": {
+    "records": [
+      "play,3,1,ortih001,22,BCCBX,D7/L78S+",
+      "play,3,1,feblc001,12,FFBS,K",
+      "play,3,1,damoj001,22,BFFBX,S9/L34D.2-3",
+      "play,3,1,sancr001,12,CBFS,K/NDP.3XH(21)"
+    ],
+    "subject": "K/NDP.3XH(21)",
+    "state_before": {
+      "inning": 3, "half": "bottom", "outs": 1,
+      "bases": {"1": "damoj001", "2": null, "3": "ortih001"}
+    }
+  },
+  "expected_parse": {
+    "basic": [{"type": "Strikeout", "groups": []}],
+    "modifiers": [{"kind": "named", "code": "NDP"}],
+    "advances": [
+      {"origin": "3", "dest": "H", "marked_out": true, "is_out": true,
+       "credits": [{"fielder": "2", "is_error": false},
+                   {"fielder": "1", "is_error": false}]}
+    ],
+    "trivia": []
+  },
+  "expected_state": {
+    "batter_dest": "out",
+    "batter_is_out": true,
+    "outs_recorded": 2,
+    "outs_after": 3,
+    "runs_on_play": 0,
+    "advances": [
+      {"origin": "3", "dest": "H", "is_out": true,
+       "is_force": false, "force_certainty": "derived"}
+    ]
+  },
+  "expected_tags": ["Strikeout", "TagOut", "InningEnding", "OneOut"],
+  "forbidden_tags": [
+    "ForceOut", "ForceOutAtHome", "BatterReachedOnK",
+    "UncaughtThirdStrike", "DoublePlay"
+  ],
+  "expected_sql_fields": {
+    "bases_before": "101", "outs_before": 1, "outs_after": 3,
+    "is_inning_ending": 1
+  },
+  "roundtrip": "K/NDP.3XH(21)",
+  "notes": [
+    "UncaughtThirdStrike is forbidden even though the catcher throwing to a covering pitcher all but requires the ball got away: no WP, PB or error is charged, so the event string carries no trace of it (spec/04-ONTOLOGY.md 3.1.1).",
+    "DoublePlay is forbidden because /NDP suppresses it, despite two outs being recorded on the play."
+  ]
+}

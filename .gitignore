@@ -1,0 +1,11 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+
+# Retrosheet source files, and everything derived from them. The corpus is
+# downloaded with `rsse fetch`; sweep reports and the database are rebuilt from
+# it. Retrosheet reissues corrected files, so a checked-in copy would go stale
+# silently -- see spec/01-CORPUS.md §4.
+data/
+*.zip

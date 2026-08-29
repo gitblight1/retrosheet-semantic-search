@@ -1,0 +1,24 @@
+Retrosheet Semantic Search Engine (RSSE)
+Copyright 2026 J. Bowman Light
+
+This product includes software developed by J. Bowman Light, licensed under the
+Apache License, Version 2.0.
+
+--------------------------------------------------------------------------
+Retrosheet data
+--------------------------------------------------------------------------
+
+This project reads, and its test fixtures embed, play-by-play data obtained
+from Retrosheet. Retrosheet requires the following statement to accompany any
+transfer of their data or any product developed from it:
+
+     The information used here was obtained free of charge from and is
+     copyrighted by Retrosheet.  Interested parties may contact Retrosheet
+     at "www.retrosheet.org".
+
+Retrosheet makes no guarantee of accuracy for the information supplied, and
+all information is subject to correction as additional data are received.
+
+Retrosheet data is not covered by the Apache License above. Retrosheet
+permits any use of the data, including commercial use, subject only to the
+attribution statement reproduced here.

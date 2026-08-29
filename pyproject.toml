@@ -1,0 +1,16 @@
+[project]
+name = "rsse"
+version = "0.1.0"
+description = "Retrosheet Semantic Search Engine - semantic query over Retrosheet event files"
+requires-python = ">=3.11"
+dependencies = []
+
+[project.scripts]
+rsse = "rsse.cli:main"
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["rsse*"]

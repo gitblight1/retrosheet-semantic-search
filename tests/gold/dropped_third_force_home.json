@@ -1,0 +1,51 @@
+{
+  "name": "dropped_third_force_home",
+  "description": "Bases loaded, two outs. Uncaught third strike; the catcher retrieves the ball and throws to the pitcher covering home for the force. Inning over. The motivating play for the project.",
+  "source": {
+    "game_id": "DET202607230",
+    "citation": "Retrosheet 2026DET.EVA",
+    "note": "Kansas City at Detroit, 2026-07-23, Comerica Park, 1st inning",
+    "status": "PLACEHOLDER -- the 2026 season is not yet released. The event string, state and tags are the assertion; player ids, count and pitch sequence are invented and must be replaced when the file is published."
+  },
+  "input": {
+    "subject": "K.B-1;3XH(21)",
+    "state_before": {
+      "inning": 1, "half": "top", "outs": 2,
+      "bases": {"1": "runner_a", "2": "runner_b", "3": "runner_c"}
+    }
+  },
+  "equivalents": ["K.3XH(21)", "K.B-1;3XH(21)", "K+WP.3XH(21);B-1"],
+  "expected_parse": {
+    "basic": [{"type": "Strikeout", "groups": []}],
+    "modifiers": [],
+    "advances": [
+      {"origin": "B", "dest": "1", "marked_out": false, "is_out": false,
+       "credits": []},
+      {"origin": "3", "dest": "H", "marked_out": true, "is_out": true,
+       "credits": [{"fielder": "2", "is_error": false},
+                   {"fielder": "1", "is_error": false}]}
+    ],
+    "trivia": []
+  },
+  "expected_state": {
+    "batter_dest": "1",
+    "batter_is_out": false,
+    "outs_recorded": 1,
+    "outs_after": 3,
+    "runs_on_play": 0,
+    "advances": [
+      {"origin": "3", "dest": "H", "is_out": true,
+       "is_force": true, "force_certainty": "derived"}
+    ]
+  },
+  "expected_tags": [
+    "Strikeout", "UncaughtThirdStrike", "BatterReachedOnK",
+    "ForceOut", "ForceOutAtHome", "BasesLoaded", "TwoOuts", "InningEnding"
+  ],
+  "forbidden_tags": ["CaughtStealing", "TagOut", "DoublePlay"],
+  "expected_sql_fields": {
+    "bases_before": "111", "outs_before": 2, "outs_after": 3,
+    "is_inning_ending": 1
+  },
+  "roundtrip": "K.B-1;3XH(21)"
+}
