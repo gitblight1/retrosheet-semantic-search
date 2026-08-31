@@ -58,6 +58,32 @@ batter is out on strikes, two outs on the play. `K.B-1;...` is a batter who
 reached. The presence of an `X` advance says nothing about the batter. See
 [04-ONTOLOGY](04-ONTOLOGY.md) §3.1.
 
+**A fielded out does not always retire the batter.** `64(1)3` ends with a bare
+`3` — the throw went on to first — so the batter is out. `64(1)/FO/G6` ends
+with the runner designator, so only the runner from first was retired and the
+batter reached. The rule: the batter is out if any group designates `B`, or if
+the **last** group carries no designator. Reading every fielded out as a batter
+out double-counts every force out in the corpus.
+
+### 2.1 Outs recorded outside the advance section
+
+Three sources of outs must all be counted, and a replay reading only the
+advance section misses two of them:
+
+| Source | Example | Effect |
+|---|---|---|
+| Advance marked `X` | `.3XH(21)` | one out, unless negated by an error |
+| Runner designator in a putout group | `64(1)3` | the runner from first is out |
+| Base-running event in the basic section | `CS2(26)`, `PO1(13)`, `POCS2(1361)` | the runner is out, unless negated |
+
+Base-running events also move runners with no advance section at all: `SB2`
+takes the runner from first to second, `SBH` scores from third, and `SB3;SB2`
+moves two. A replay that only applies the advance section leaves those runners
+where they were.
+
+An explicit advance for a runner always overrides the implicit movement, so
+`CS2(2E4).1-3` puts the runner on third rather than out at second.
+
 ## 3. Advance resolution
 
 1. Start from `bases_before`.
@@ -76,7 +102,7 @@ reached. The presence of an `X` advance says nothing about the batter. See
 
 These are validation, not inference. A failure sets
 `parse_status = 'state_inconsistent'` and the play is excluded from default
-results ([01-CORPUS](01-CORPUS.md) §5.4).
+results ([01-CORPUS](01-CORPUS.md) §5.5).
 
 - `outs_before + outs_recorded <= 3`.
 - No two runners occupy the same base in `bases_after`.
@@ -113,7 +139,29 @@ If the batter-runner is not live — a strikeout with the batter retired, a caug
 fly, a pure base-running play — **no runner is forced**, however the bases are
 occupied.
 
-### 4.2 When is the batter-runner live?
+### 4.2 Did the batter become a runner?
+
+The force test in §4.1 is keyed on the batter **becoming a runner**, which is
+not the same as reaching safely. On `64(1)3/GDP/G6` the batter is retired at
+first, yet the force at second is real, because he was running while the throw
+was made. On `8(B)84(2)/LDP/L8` the liner was caught, the batter never left the
+box, and the runner doubled off second was tagged rather than forced. Keying
+the force on "the batter was safe" misclassifies every ground-ball double play.
+
+The rule, in order:
+
+1. Batter reached a base → became a runner.
+2. Retired on strikes without reaching → did not.
+3. Trajectory modifier present → `G`/`BG` means he ran; `F`/`P`/`L`/`BP`/`BL`
+   means the ball was caught and he did not.
+4. `/FO`, `/GDP`, `/GTP`, `/BGDP`, `/SH` imply he ran; `/SF`, `/FDP`, `/LDP`,
+   `/LTP`, `/BPDP`, `/IF` imply he did not.
+5. No trajectory and no such modifier: a putout **with an assist** is a throw,
+   which the batter had to be running to make necessary; a lone fielder caught
+   the ball. This is the one inference in the chain, so any force it decides is
+   marked `force_certainty = 'ambiguous'` rather than `derived`.
+
+### 4.3 When is the batter-runner live on an uncaught third strike?
 
 For batted balls and walks: whenever §2 puts the batter anywhere other than
 "out". For an uncaught third strike the rule is the rulebook's:
@@ -126,7 +174,7 @@ records the outcome. It applies it as a **check**: if the encoding says the
 batter reached but the rule says he could not have, the play is flagged
 `state_inconsistent`. Encoding is authoritative; the rule catches errors.
 
-### 4.3 Ordering and the removal of the force
+### 4.4 Ordering and the removal of the force
 
 The force is off for trailing runners once a preceding forced runner is retired.
 Force status is therefore evaluated **per out, in the order the outs occurred**,
@@ -152,7 +200,7 @@ Rules:
 match `derived` only, unless the caller opts in
 ([06-QUERY](06-QUERY.md) §4).
 
-### 4.4 Worked case — the motivating play
+### 4.5 Worked case — the motivating play
 
 Bases loaded, two outs, swinging third strike gets away from the catcher, who
 retrieves it and throws to the pitcher covering the plate.
@@ -168,10 +216,10 @@ Derivation:
 1. §2 — the `K` has no fielder digits. Out-count check: if the batter were out
    on strikes, `outs_before(2) + strikeout(1) + out at home(1) = 4`. Impossible.
    Therefore the batter-runner is live.
-2. §4.2 — two outs, so the batter was entitled to run. Consistent.
+2. §4.3 — two outs, so the batter was entitled to run. Consistent.
 3. §4.1 — batter-runner live, 1 and 2 occupied, so the runner on **3 is forced
    at home**.
-4. §4.3 — one out in the advance section. Order unambiguous;
+4. §4.4 — one out in the advance section. Order unambiguous;
    `force_certainty = 'derived'`.
 5. `(21)` — assist to the catcher, putout to the pitcher. Putout sequence
    `[2, 1]`.
@@ -253,3 +301,85 @@ query filter:
 
 `is_walkoff` requires knowing the game ended, so it is stamped in a second pass
 after the game is fully replayed.
+
+## 8. Validation status
+
+The replay is implemented and run over the whole corpus. Final-score
+reconciliation ([07-TESTING](07-TESTING.md) §4) needs Retrosheet's game logs,
+which are a separate download and not yet held, so the strongest check
+available from event files alone is the out accounting:
+
+> **Every half-inning must end with exactly three outs**, except the last of a
+> game, which can end early on a walk-off or not be played at all.
+
+That single invariant exercises nearly everything above — batter destination,
+advance resolution, error negation, designator outs and base-running outs all
+surface as a miscounted inning.
+
+| | |
+|---|---|
+| games replayed | 203,285 |
+| plays | 17,891,790 |
+| plays flagged `state_inconsistent` | **0** |
+| games with a short half-inning | **3**, all explained by known source defects |
+| unexplained short half-innings | **0** |
+| plays flagged `data_contradicts_rules` | 6 |
+| plays flagged `state_ambiguous` | 9,347 (0.05%) |
+| runtime | ~15 min |
+
+### 8.1 What the invariant caught
+
+The first run failed **75 of 81 games**. Seven bugs, each localised by the same
+check:
+
+| Bug | Symptom | Fix |
+|---|---|---|
+| Every fielded out read as a batter out | force outs counted twice; innings closed at 4–5 outs | §2, last-group rule |
+| `CS`/`PO`/`POCS` outs ignored | innings closed at 2 outs | §2.1 |
+| `SB` never moved the runner | wrong base state | §2.1 |
+| An error anywhere in an advance negated the out | `OA.1X3(E1)(35)` lost a real out | [02-GRAMMAR](02-GRAMMAR.md) §5 |
+| A `+`-joined event overrode the batter's fate | `K+E2` put a phantom runner on first, corrupting the rest of the inning | §2 |
+| A safe advance cancelled a recorded out | `CS2(25).1-2` dropped the out | §2.1 |
+| A parameter with no credits counted as a putout | `BXH(TH)(E2/TH)(8E2)` kept an out that two errors had negated | [02-GRAMMAR](02-GRAMMAR.md) §5 |
+
+Most were invisible to unit tests written from the documentation: its examples
+are well-formed single-purpose plays, and every one of these bugs needed a play
+combining two features. The corpus-wide invariant found them all.
+
+The `K+E2` bug is the instructive one. It was a single wrong line — treating
+the second event of a `+` chain as the batter's — and it accounted for 12 of
+the 17 remaining failures *and* silently corrupted base state for the rest of
+each affected inning. Retrosheet documents `K+event` and `W+event` with event
+one of `SB%`, `CS%`, `OA`, `PO%`, `PB`, `WP`, `E$`: all base-running. Only the
+first basic event describes the batter.
+
+### 8.2 What remains, and why it is not a bug
+
+**Three short half-innings**, in `MIN199606081`, `SDN199607050` and
+`TOR199604130`. Each of those games contains one of the seven records that are
+malformed at source ([02-GRAMMAR](02-GRAMMAR.md) §8.1). A play that cannot be
+parsed cannot record its out, so the inning is one short. `rsse replay`
+attributes these and exits zero; an unexplained short inning fails.
+
+**Six plays flagged `data_contradicts_rules`**, every one of them pre-1947:
+
+```
+1909  K+PB.1-2;B-1
+1911  K+PB.3-H(UR);2-H(UR);1-3;B-2
+1913  K+PB.3-H(UR);1-3;B-1
+1932  K+E2.1X2(236);B-1
+1934  K.B-1(E2)
+1946  K+E2.3-H(UR);2-3;1-2;B-1
+```
+
+Each records a batter reaching on an uncaught third strike with first base
+occupied and fewer than two outs, which the modern rule does not allow. The
+replays are self-consistent — the innings balance — so this is a statement
+about the data, not a state-machine failure, and it gets its own status rather
+than being counted as one. Whether the rule was applied differently in that era
+or the accounts are imperfect is a question for Retrosheet.
+
+**9,347 plays flagged `state_ambiguous`** are expected. Those are force
+determinations that fell back on §4.2 rule 5 — a fielded out with no trajectory
+modifier — where certainty is recorded rather than guessed. They are excluded
+from default query results by [06-QUERY](06-QUERY.md) §4.

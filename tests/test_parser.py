@@ -2,7 +2,9 @@
 resolution rules that the grammar spec calls out as ambiguous.
 """
 
+import json
 import unittest
+from pathlib import Path
 
 from rsse.parser import grammar as G
 from rsse.parser.parser import ParseError, parse
@@ -39,6 +41,21 @@ CORPUS_EXAMPLES = [
     "1/G/SH/B.1-2", "E1/TH/SH/B.1-3;B-2",
     "13/R6524", "HR9/F9LS/IPHR/R652", "PO2(E2)/R862.2-H(UR)",
     "DGR9.2-H", "DGR7.2-H;1-3",
+    # 1996-97 coverage modifiers, and stolen bases named in an advance.
+    "9/F9D/R4U6", "7/F7D/R6/U4", "64(1)/FO/G6M/U6", "D7/F78XD/U8/R6",
+    "9/F89M/R", "3/G3/R6/U7/R5.1-2", "E3/G3/U9.B-2",
+    "K+SB2/R4/U85.1-3(E2/TH)", "S8/L8RS/R95U1.2-H;1-3;B-2",
+    "BK.2-3(SB3);1-2", "BK.3-H(SBH);2-3;1-2",
+]
+
+#: Malformed strings present in the corpus. The grammar must REJECT these --
+#: accepting them would weaken it as a validator (spec/02-GRAMMAR.md §8.1).
+#: Read from the same file the corpus sweep uses, so the two cannot drift.
+KNOWN_SOURCE_DEFECTS = [
+    d["event"]
+    for d in json.loads(
+        (Path(__file__).parent / "known-source-defects.json").read_text()
+    )["defects"]
 ]
 
 
@@ -96,7 +113,26 @@ class Resolution(unittest.TestCase):
         self.assertEqual(parse("DGR/L9LS").event.basics[0].fielders, "")
 
     def test_relay_takes_any_number_of_fielders(self):
-        self.assertEqual(parse("13/R6524").event.modifiers[0].fielders, "6524")
+        self.assertEqual(parse("13/R6524").event.modifiers[0].relay_fielders, "6524")
+
+    def test_coverage_groups_alternate_r_and_u(self):
+        """`R4U6` is two groups, not one R group with fielders "4U6"."""
+        m = parse("9/F9D/R4U6").event.modifiers[1]
+        self.assertEqual(m.groups, (("R", "4"), ("U", "6")))
+        self.assertEqual((m.relay_fielders, m.u_group_fielders), ("4", "6"))
+
+    def test_coverage_group_may_name_no_fielder(self):
+        self.assertEqual(parse("9/F89M/R").event.modifiers[1].groups, (("R", ""),))
+
+    def test_coverage_groups_may_repeat(self):
+        m = parse("3/G3/R6/U7/R5.1-2").event.modifiers
+        self.assertEqual([x.groups for x in m[1:]],
+                         [(("R", "6"),), (("U", "7"),), (("R", "5"),)])
+
+    def test_stolen_base_as_an_advance_parameter(self):
+        """`BK.2-3(SB3)` names the event in the advance, like `(WP)`/`(PB)`."""
+        adv = parse("BK.2-3(SB3);1-2").event.advances[0]
+        self.assertEqual([p.text for p in adv.params], ["SB3"])
 
     def test_unknown_play_code(self):
         out = parse("99(1)/FO").event.basics[0]
@@ -174,6 +210,13 @@ class Failure(unittest.TestCase):
     def test_rejects_trailing_input(self):
         with self.assertRaises(ParseError):
             parse("K.3XH(21)qqq")
+
+    def test_rejects_known_source_defects(self):
+        """These are real corpus strings, and must stay rejected."""
+        for event in KNOWN_SOURCE_DEFECTS:
+            with self.subTest(event=event):
+                with self.assertRaises(ParseError):
+                    parse(event)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ carrying an offset, and the caller records the play with a non-ok parse_status
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from . import grammar as G
@@ -129,10 +130,11 @@ def _parse_modifier_text(text: str, c: _Cursor) -> G.Modifier:
         rest = text[2:]
         if rest == "" or (len(rest) == 1 and rest in G.RUNNERS):
             return G.Modifier("throw", base=rest or None)
-    if text.startswith("R") and len(text) > 1:
-        rest = text[1:]
-        if all(ch in "123456789" for ch in rest):
-            return G.Modifier("relay", fielders=rest)
+    # Coverage: one or more `R`/`U` groups, each naming zero or more fielders.
+    # Fielders here are digits only -- accepting `U` as a fielder would make
+    # `R4U6` parse as a single R group with fielders "4U6".
+    if _COVERAGE.fullmatch(text):
+        return G.Modifier("coverage", groups=tuple(_COVERAGE_GROUP.findall(text)))
     trajectory = ""
     for traj in G.TRAJECTORIES:
         if text.startswith(traj):
@@ -144,6 +146,10 @@ def _parse_modifier_text(text: str, c: _Cursor) -> G.Modifier:
             "hit", trajectory=trajectory or None, location=location or None
         )
     raise ParseError(f"unknown modifier {text!r}", c.i, c.text)
+
+
+_COVERAGE = re.compile(r"(?:[RU][1-9]*)+")
+_COVERAGE_GROUP = re.compile(r"([RU])([1-9]*)")
 
 
 def _is_location(text: str) -> bool:
@@ -160,7 +166,7 @@ def _is_location(text: str) -> bool:
 
 def _param(c: _Cursor) -> G.Flag | G.CreditSequence:
     body = _paren_body(c)
-    if body in G.ADV_FLAGS:
+    if body in G.ADV_FLAGS or body in G.ADV_FLAG_STOLEN_BASE:
         return G.Flag(body)
     parts = body.split("/")
     head, tail = parts[0], parts[1:]

@@ -31,20 +31,24 @@ corpus rather than against Retrosheet's documentation alone.
 
 ## Status
 
-**Parser layer built and validated.** The corpus sweep — build step 1 — is
-complete for the seasons on disk:
+**Parser layer built and validated against the complete corpus.** The corpus
+sweep — build step 1 — is done:
 
 | | |
 |---|---|
-| seasons | 57 of 118 (1908–1961, plus 1965, 2000, 2023) |
-| games | 73,131 |
-| plays | **6,240,913** |
-| parse failures | **0** |
+| seasons | 118 (1908–2025, complete) |
+| games | 203,282 |
+| plays | **17,891,790** |
+| parse failures | **7**, all [documented source defects](tests/known-source-defects.json) |
+| unexplained failures | **0** |
 | round-trip failures | **0** |
-| sweep runtime | 3m30s |
+| sweep runtime | ~10 min |
 
-Findings and the eleven grammar gaps the sweep closed are in
-[02-GRAMMAR §9](spec/02-GRAMMAR.md).
+The twelve grammar gaps the sweep closed, and what they imply, are in
+[02-GRAMMAR §9](spec/02-GRAMMAR.md). One finding is left open: the `U` modifier,
+which occurs in only four seasons and is undocumented — RSSE parses and
+preserves it but deliberately asserts no meaning for it
+([02-GRAMMAR §4.1](spec/02-GRAMMAR.md)).
 
 ```
 rsse/parser/grammar.py    AST; every node emits from structured fields
@@ -53,43 +57,50 @@ rsse/parser/parser.py     recursive descent over spec/02-GRAMMAR.md §2
 rsse/parser/records.py    record and play-record reading
 rsse/util/download.py     corpus acquisition, throttled
 rsse/cli.py               rsse fetch | rsse sweep
-tests/                    38 tests; tests/gold/ 4 gold plays
+rsse/database/schema.py   archive + query DDL
+rsse/database/load.py     ingest, provenance, round-trip gate
+rsse/model/state.py       half-inning state, force derivation
+rsse/model/game.py        whole-game replay
+tests/                    85 tests; tests/gold/ 4 gold plays
 ```
 
-Not yet built: state machine, ontology, database, query API.
+**Raw layer built and loaded** (build step 2). 31,115,272 records from 2,646
+files, byte-exact, with provenance and per-game spans; all integrity invariants
+hold (`rsse verify`, <1s). Two findings from the load are written up in the
+specs: Retrosheet game ids are **not unique**
+([01-CORPUS §5.4](spec/01-CORPUS.md)), and the measured size means the original
+<2 GB goal has to be replaced ([05-DATABASE §7](spec/05-DATABASE.md)).
 
-### Corpus download is incomplete
+**State machine built and validated** (build step 3). Inning replay
+reconstructs bases, outs, runs and — the point of the exercise — **force plays,
+which Retrosheet never records**. Across all 203,285 games: **zero
+state-inconsistent plays**, and the only three short half-innings are each
+explained by a known source defect. Seven bugs the invariant caught, and the
+six pre-1947 plays that contradict the rulebook, are written up in
+[03-STATE §8](spec/03-STATE.md).
 
-Seasons **1962–2025 are not downloaded**. A first fetch pass at one second
-between requests pulled 54 archives and then the server stopped responding —
-the whole of retrosheet.org became unreachable from this host, not just the
-archives, so this is a block or a rate limit rather than a bad URL.
-
-`rsse/util/download.py` now waits 5s between requests and backs off
-exponentially on failure. Resume later with:
-
-```
-python3 -m rsse.cli fetch --since 1962
-```
-
-Then re-run the sweep. Expect it to find further grammar gaps in the unswept
-seasons: the 1908–1961 range surfaced four that the 1965/2000/2023 sample did
-not, so era coverage matters more than play count.
+Not yet built: ontology, query API, derived tables.
 
 ### Commands
 
 ```
-python3 -m rsse.cli fetch --since 1962
+python3 -m rsse.cli fetch                   # download the corpus (~118 seasons)
 python3 -m rsse.cli sweep --by-season --progress --report data/sweep-report.json
+python3 -m rsse.cli ingest --progress          # build the raw layer (~11 min)
+python3 -m rsse.cli verify                     # raw-layer integrity checks
+python3 -m rsse.cli replay --progress          # replay every game (~15 min)
 python3 -m unittest discover -s tests -t .
 ```
 
+`sweep` exits non-zero on any round-trip failure or any parse failure not listed
+in [tests/known-source-defects.json](tests/known-source-defects.json).
+
 ## Build order
 
-1. **Corpus sweep first** — *done for 57 of 118 seasons, and to be re-run as
-   the rest arrive.* Run the §2 grammar over every event string before writing
-   any semantic code. Gaps are cheap to fix in the parser and expensive once
-   the ontology depends on it, and the sweep has found eleven so far.
+1. **Corpus sweep first** — *done, all 118 seasons.* Run the §2 grammar over
+   every event string before writing any semantic code. Gaps are cheap to fix
+   in the parser and expensive once the ontology depends on it; the sweep found
+   twelve.
 2. Raw layer and round-trip gate ([02-GRAMMAR](spec/02-GRAMMAR.md) §6) — the
    gate is implemented and green; the persisted raw layer is not built.
 3. State machine, checked against final scores and `data,er`

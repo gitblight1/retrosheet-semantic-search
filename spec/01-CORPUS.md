@@ -186,13 +186,78 @@ this is fixed in [06-QUERY](06-QUERY.md) §6. Rendering "0 results" without it i
 a spec violation, because the honest answer to the motivating question is
 "not in the N games covered", never "never".
 
-### 5.3 Corrections
+### 5.3 Corrections and refresh
 
-Retrosheet data is explicitly subject to revision. The corpus digest (§4) plus
-the ingest timestamp are stored on every game, and results carry the corpus
-version, so a past answer can be re-checked against a later corpus.
+Retrosheet data is explicitly subject to revision, and corrected files are
+reissued in place. The corpus digest (§4) plus the ingest timestamp are stored
+on every file, and results carry the corpus version, so a past answer can be
+re-checked against a later corpus.
 
-### 5.4 Data quality is queryable
+**What exists.** Every source file is recorded with its SHA-256 at ingest.
+Re-running `ingest` skips any file whose digest is unchanged, and *fails* on
+one whose digest differs rather than mixing vintages silently. So local change
+detection is already per-file and already cheap — a re-ingest over an unchanged
+corpus reads and hashes, but writes nothing.
+
+**What is missing**, and is required before the corpus is refreshed in anger:
+
+1. **Upstream change detection without a full download.** The fetcher pulls a
+   season archive unconditionally. It should issue a conditional request
+   (`If-Modified-Since` / `If-None-Match`) against the stored `mtime`/ETag and
+   skip unchanged seasons on a `304`. This matters twice over: Retrosheet is a
+   volunteer nonprofit, and an unconditional refresh of 118 archives is what
+   got this host rate-limited during the first build.
+2. **A refresh path that re-imports only what changed.** Today a changed file
+   is fatal and the remedy is a full rebuild — correct but far too blunt, since
+   a typical correction touches a handful of files. `ingest --refresh` should
+   delete the affected file's records and spans, reload just that file, and
+   record the supersession, leaving the other 2,645 files untouched.
+3. **A record of what changed.** A corrected file may change results a
+   published answer depended on. The supersession should be retained — old
+   digest, new digest, date, record counts — so that "this answer changed
+   because Retrosheet corrected the 1957 Braves file" is a question the
+   database can answer.
+
+Until (2) exists, a correction means a rebuild: ~11 minutes for the archive.
+That is tolerable precisely because it is rare, which is also why this is
+recorded as a requirement rather than built speculatively.
+
+### 5.4 Retrosheet game ids are not unique
+
+The `id` record is documented as identifying the date, home team, and game
+number, which reads as a unique key. It is not one. Three ids appear twice, each
+time **within a single file**, all in Negro League (`.EVR`) files:
+
+| Game id | File | Blocks |
+|---|---|---|
+| `CI2194308030` | `1943NGL.EVR` | 68 plays and 68 plays |
+| `NY6194505230` | `1945NGL.EVR` | 90 plays and 90 plays |
+| `PRG193512012` | `1935NGL.EVR` | 81 plays and **40 plays** |
+
+The first two look like duplicated entries. The third is not a duplicate at all
+— the two blocks differ in length, so at least one is a partial account and
+discarding either would lose data.
+
+Consequences, all of them binding:
+
+1. **`game_id` cannot be a primary key.** `game_spans` keys on a surrogate and
+   numbers repeats with an `occurrence` column; `games` must do the same. A
+   schema that assumes uniqueness fails the ingest outright, which is how this
+   was found.
+2. **Repeats are kept, never dropped.** Principle 2.1 admits no exception for
+   inconvenient records, and the third case shows the two blocks are not
+   interchangeable.
+3. **They must not be silently double-counted.** This is the sharp edge: a
+   duplicated game inflates every play it contains, and the project's central
+   question is a count. Any query answering "how many times has this happened"
+   must either deduplicate by `(game_id, occurrence = 1)` or report the repeat,
+   and the ingest reports repeats explicitly so the decision is never made by
+   accident.
+
+Resolving whether these are true duplicates is a question for Retrosheet, not
+for RSSE to guess at.
+
+### 5.5 Data quality is queryable
 
 Plays whose event string failed to parse, or whose state replay was
 inconsistent, are retained with a `parse_status` other than `ok`

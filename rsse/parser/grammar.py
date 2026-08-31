@@ -14,7 +14,10 @@ RUNNERS = "B123H"
 ADV_BASES = "123H"
 
 #: Advance parameters that are flags rather than fielding credits (§5).
+#: `SB%` joins `WP`/`PB` as an event named in an advance rather than the basic
+#: play, e.g. `BK.2-3(SB3)`.
 ADV_FLAGS = frozenset({"UR", "TUR", "RBI", "NR", "NORBI", "WP", "PB"})
+ADV_FLAG_STOLEN_BASE = tuple(f"SB{b}" for b in "123H")
 
 #: Modifier codes carrying no argument (§4).
 #:
@@ -46,7 +49,7 @@ class Node:
 class Modifier(Node):
     """A `/`-introduced modifier.
 
-    ``kind`` is one of: named, error, throw, relay, hit (trajectory and/or
+    ``kind`` is one of: named, error, throw, coverage, hit (trajectory and/or
     location).
     """
 
@@ -56,6 +59,22 @@ class Modifier(Node):
     base: str | None = None
     trajectory: str | None = None
     location: str | None = None
+    #: For kind "coverage": ordered ``(marker, fielders)`` pairs, marker R or U.
+    groups: tuple[tuple[str, str], ...] = ()
+
+    @property
+    def relay_fielders(self) -> str:
+        """Fielders in ``R`` groups -- the documented relay throw."""
+        return "".join(f for k, f in self.groups if k == "R")
+
+    @property
+    def u_group_fielders(self) -> str:
+        """Fielders in ``U`` groups.
+
+        Deliberately not given a semantic name: ``U`` is undocumented and its
+        meaning is inferred but unconfirmed. See spec/02-GRAMMAR.md §4.1.
+        """
+        return "".join(f for k, f in self.groups if k == "U")
 
     def emit(self) -> str:
         if self.kind == "named":
@@ -64,8 +83,8 @@ class Modifier(Node):
             return "E" + self.fielders
         if self.kind == "throw":
             return "TH" + (self.base or "")
-        if self.kind == "relay":
-            return "R" + self.fielders
+        if self.kind == "coverage":
+            return "".join(k + f for k, f in self.groups)
         if self.kind == "hit":
             return (self.trajectory or "") + (self.location or "")
         raise ValueError(f"unknown modifier kind {self.kind!r}")
@@ -132,12 +151,23 @@ class Advance(Node):
 
     @property
     def is_out(self) -> bool:
-        """The ``X`` as written, minus any error that negates it (§5)."""
+        """The ``X`` as written, minus any error that negates it (§5).
+
+        An error negates the out only when no parameter records a clean putout.
+        `BX2(7E4)` is one sequence containing an error, so the runner is safe;
+        `1X3(E1)(35)` charges an error in one parameter *and* records the
+        putout 3-5 in another, so the runner is out. Treating any error
+        anywhere as negating loses the out and leaves the inning short.
+        """
         if not self.marked_out:
             return False
-        return not any(
-            isinstance(p, CreditSequence) and p.has_error for p in self.params
-        )
+        fielding = [p for p in self.params if isinstance(p, CreditSequence)]
+        if not fielding:
+            return True
+        # A parameter rescues the out only if it names fielders and charges no
+        # error. `(TH)` is a bare throw annotation with no credits, so in
+        # `BXH(TH)(E2/TH)(8E2)` nothing records a putout and the runner scored.
+        return any(p.credits and not p.has_error for p in fielding)
 
     def emit(self) -> str:
         op = "X" if self.marked_out else "-"

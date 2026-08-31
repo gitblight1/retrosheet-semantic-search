@@ -34,11 +34,53 @@ CREATE TABLE raw_records (
   line_no       INTEGER NOT NULL,
   game_id       TEXT,
   record_type   TEXT NOT NULL,
-  raw_line      TEXT NOT NULL,
-  UNIQUE (file_id, line_no)
+  raw_line      TEXT NOT NULL
 );
-CREATE INDEX ix_raw_game ON raw_records (game_id, line_no);
+
+-- A game's records are contiguous in record_id: each file is read once, in
+-- order, and record_id is monotonic. One row per game replaces an index over
+-- every record.
+CREATE TABLE game_spans (
+  game_id         TEXT PRIMARY KEY,
+  file_id         INTEGER NOT NULL REFERENCES source_files,
+  first_record_id INTEGER NOT NULL,
+  last_record_id  INTEGER NOT NULL,
+  record_count    INTEGER NOT NULL
+);
+CREATE INDEX ix_spans_file ON game_spans (file_id);
 ```
+
+### 1.1 Why the raw layer carries almost no indexes
+
+Measured on the 2000 season, the first cut of this schema spent **38% of the
+database on two indexes**, and neither survived scrutiny:
+
+| Index | Share | Verdict |
+|---|---|---|
+| `UNIQUE (file_id, line_no)` | 13% | **Redundant.** `source_files UNIQUE (corpus_id, path)` already prevents loading a file twice, and each file is read once line by line, so the pair is unique by construction. It guarded nothing and served no query. |
+| `ix_raw_game (game_id, …)` | 25% | **Replaced.** ~760 MB over the full corpus, to support a lookup that `game_spans` answers with ~200k rows. |
+
+A game lookup is now a `game_spans` seek plus a range scan on the integer
+primary key:
+
+```sql
+SELECT * FROM raw_records
+ WHERE record_id BETWEEN (SELECT first_record_id FROM game_spans WHERE game_id = ?)
+                     AND (SELECT last_record_id  FROM game_spans WHERE game_id = ?);
+-- SEARCH raw_records USING INTEGER PRIMARY KEY (rowid>? AND rowid<?)
+```
+
+Removing both took the raw layer from **99.8 to 54.0 bytes per record**.
+
+The general rule this establishes: **the raw layer is an archive, not a query
+surface.** Everything worth querying is promoted into a typed table by a later
+stage. Indexes here are paid for on ~30 million rows and should be added only
+against a query that cannot be served from a promoted table.
+
+The contiguity `game_spans` relies on is an invariant of the loader, not an
+assumption about the data, and it is asserted directly: the spans must
+partition `raw_records` exactly, must not overlap, and a span lookup must
+return the same rows as a `game_id` scan.
 
 ## 2. Games and lineups
 
@@ -146,6 +188,7 @@ CREATE TABLE plays (
 
   parse_status   TEXT NOT NULL DEFAULT 'ok'
     CHECK (parse_status IN ('ok','parsed_untagged','unparsed',
+                            'data_contradicts_rules',
                             'state_ambiguous','state_inconsistent')),
   parse_error    TEXT,
   parser_version TEXT NOT NULL,
@@ -278,7 +321,62 @@ CREATE TABLE coverage (
 - Load in one transaction per source file. On failure, roll back that file
   whole so the corpus never contains a partial game.
 - Text ids (`player_id`, `team_id`) are stored directly rather than interned.
-  Integer surrogates would shrink the file but obscure every query; the <2 GB
-  target is met without them, and this should be revisited only if measurement
-  says otherwise.
-- Estimated scale: ~15M plays, ~30M advances, ~50M tag rows.
+  Integer surrogates would shrink the file but obscure every query.
+- Integrity checks must be single ordered passes. The natural formulation of
+  the span-overlap check is a self-join of `game_spans` on range overlap; with
+  203k spans and no usable index that is ~40 billion comparisons and does not
+  finish. Scanning spans in `first_record_id` order settles overlap, gaps and
+  coverage together, in under a second.
+
+## 7. Measured size, and the target that must change
+
+The original performance goals — **database < 2 GB**, **initial import < 10
+minutes** — were set before any data existed. Both are now measured, and the
+raw layer alone consumes essentially the whole budget:
+
+| | |
+|---|---|
+| source event files | 862 MB of text, 2,646 files |
+| raw-layer records | 31,115,272 |
+| raw layer on disk | **1.94 GB** (62.4 bytes/record) |
+| ingest wall clock | **10m50s** |
+
+That is with both candidate indexes already removed (§1.1); the first cut was
+3.0 GB projected. There is little left to trim without giving up either the
+verbatim archive or the legibility of text ids.
+
+The derived layer has not been built, and it is the larger half. Order-of-
+magnitude, against 17.9M plays:
+
+| Table | Rows | Rough size |
+|---|---|---|
+| `plays` | 17.9M | 1.5–2 GB plus indexes |
+| `runner_advances` | ~25M | ~1.5 GB |
+| `fielding_credits`, `credit_sequences` | ~40M | ~2 GB |
+| `play_tags` | ~50M | ~1 GB plus its driving index |
+
+**A realistic total is 8–12 GB, not 2 GB.** The goal was aspirational and is
+not reachable by tuning. It has to be replaced with a measured one, and the
+choice is a design decision rather than a detail:
+
+1. **Raise the target** to ~12 GB and keep one database. Simplest; costs
+   nothing but the assumption that this runs on a small disk.
+2. **Split the archive from the query database.** The raw layer is an archive
+   that no query touches — everything queryable is promoted into a typed table.
+   Holding it in a separate file keeps the working database near 6 GB, lets the
+   archive be detached or rebuilt on demand, and preserves reproducibility
+   because it is regenerable from the event files with a recorded digest.
+3. **Compress the archive**, one blob per game. Event text compresses roughly
+   5:1, taking the raw layer under 500 MB, at the cost of row-level addressing
+   into it.
+
+Option 2 is the recommendation: it follows the distinction §1.1 already
+established between archive and query surface, and it is the only one that
+costs nothing in either information or legibility. **This is not yet decided
+and nothing has been restructured** — the measurement is recorded here so the
+choice is made deliberately rather than discovered when a disk fills.
+
+The 10-minute import goal is likewise already spent on the raw layer. A
+realistic figure for the full pipeline is 30–45 minutes, and the property worth
+preserving is that ingest is resumable per file and re-parses do not re-read
+the source files.

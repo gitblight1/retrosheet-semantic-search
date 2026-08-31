@@ -75,9 +75,12 @@ running_event    ::= "SB" base { "(" adv_param ")" }
 modifier         ::= named_modifier
                    | "E" fielder
                    | "TH" [ base ]
-                   | "R" fielder_seq
+                   | coverage
                    | trajectory [ location ]
                    | location
+
+coverage         ::= coverage_group { coverage_group }
+coverage_group   ::= ( "R" | "U" ) { "1".."9" }
 
 trajectory       ::= "BG" | "BP" | "BL" | "B" | "G" | "L" | "P" | "F"
 location         ::= zone { loc_qualifier }
@@ -90,6 +93,7 @@ advance_section  ::= advance { ";" advance }
 advance          ::= base ( "-" | "X" ) base { "(" adv_param ")" }
 adv_param        ::= adv_flag | fielding_param
 adv_flag         ::= "UR" | "TUR" | "RBI" | "NR" | "NORBI" | "WP" | "PB"
+                   | "SB" base
 fielding_param   ::= credit_seq { "/" modifier }
 credit_seq       ::= credit_atom { credit_atom }
 credit_atom      ::= fielder | "E" fielder
@@ -128,6 +132,12 @@ The parser records the event as `Interference` with the fielder taken from the
 **`U` fielder.** A `U` in a credit sequence means the handling fielder is
 unknown (`8U3`). Present in older files only. Emit the putout to the last atom
 and no assist for the `U`.
+
+**Coverage groups take digits only.** A `coverage_group`'s fielders are `1`–`9`,
+excluding the `U` that `fielder` otherwise allows for an unknown fielder.
+Admitting `U` here would make `R4U6` parse as a single `R` group with fielders
+`4U6`, silently losing the group boundary. This is the same class of mistake as
+reading `HP` as `H` + `P`.
 
 **Bare location modifier.** `D8/78` — a modifier that is only a location, with
 no trajectory letter. Try `trajectory location` first, then bare `location`.
@@ -217,6 +227,65 @@ published list. Both attach only to a strikeout:
 | `BF` | strikeout on a foul bunt with two strikes | 127 in 2000, 129 in 1965; always on `K` |
 | `S` | swinging third strike | 5 in 1965; complement of the documented `C` (called third strike), which appears 4,701 times in the same season. One file carries `com,"MIN scorer: K/S"`, identifying it as a scorer's notation. |
 
+#### `U` — the undocumented half of the coverage notation
+
+`R$` is documented: a relay throw to `$` with no out made. `U$` is not
+documented anywhere, appears **only in 1996 and 1997** (and nine plays in
+1994), and combines freely with `R` into alternating groups — `R4U6`, `U9R6`,
+`R3U4R5`, `R4254U9R4`.
+
+RSSE parses these structurally and **asserts no meaning for `U`**. No fielding
+credit is derived from a `U` group and no semantic tag is emitted for one. The
+accessor is named `u_group_fielders` rather than anything descriptive, on
+purpose.
+
+The evidence, recorded so a future reader can finish the job:
+
+| Observation | Value |
+|---|---|
+| Years using `U` | 1996, 1997 (1,551 plays); 1994 (9 plays); zero in 1993, 1995, 1998–2025 |
+| Error co-occurrence, `U` plays | **21.8%** |
+| Error co-occurrence, `R`-only plays | 1.4% |
+| Error co-occurrence, all other plays | 0.4% |
+| Fielders in `R` groups | 4 and 6 dominate — middle infielders, consistent with the documented relay |
+| Fielders in `U` groups | spread across all nine, with 8, 4, 1, 6 most common |
+
+The per-play geometry is more telling than the aggregate. In the 1994 plays,
+every one is an error, and the `U` fielder is the one positioned to retrieve a
+ball that got past the erring fielder:
+
+```
+E3/G3/U9    error at first  -> right fielder
+E5/G56/U7   error at third  -> left fielder
+E4/G4/U9    error at second -> right fielder
+E7/P78S/U8  error in left   -> center fielder
+E6/G6/U7    error at short  -> left fielder
+```
+
+The same holds in 1996–97: `8/…/U1` and `9/…/U1` (throw home, pitcher covers),
+`2/…/U8` (catcher's throw to second, centre fielder behind the bag).
+
+That reads as the fielder backing up or retrieving the play. It is a strong
+inference, not a fact, and 78% of 1996–97 `U` plays carry no error at all, so
+any rule keyed on "error" would be wrong too.
+
+**Open question — `U` = "unassigned"?** A preliminary lead, not yet verified:
+`U` may stand for *unassigned*, a holdover from Project Scoresheet, marking a
+fielder who took part in the play — typically backing it up — without being
+assigned an assist or putout. That reading is consistent with everything above
+and resolves the one thing the "unknown fielder" reading cannot, namely why `U`
+is followed by a specific fielder at all: the fielder is known; it is the
+*credit* that is unassigned. Project Scoresheet lineage is plausible on its
+face, since Retrosheet's hit-location system is documented as inherited from
+the same source.
+
+**This is recorded as a lead, and nothing in RSSE depends on it.** Before it
+becomes a derivation rule it needs a primary source — Retrosheet's own
+documentation or the RetroList group — and a check of whether `U` groups ever
+coincide with a credit the notation assigns elsewhere. Until then the data is
+preserved and unqueried, which costs nothing: no fielding credit is derived
+from a `U` group under either reading.
+
 Two published statements are also contradicted by the corpus:
 
 - **`DGR` takes no fielder.** The documentation says a ground rule double names
@@ -240,7 +309,7 @@ advance section, carry no marker. See [03-STATE](03-STATE.md) §4.
 
 Advances are listed lead-runner first: third, then second, then first, then the
 batter. Order is a Retrosheet convention, **not** chronological out order — see
-[03-STATE](03-STATE.md) §4.3.
+[03-STATE](03-STATE.md) §4.4.
 
 - `2-3` successful advance; `1X2` out advancing.
 - `3-3` explicit hold. A runner not listed stays put.
@@ -249,6 +318,11 @@ batter. Order is a Retrosheet convention, **not** chronological out order — se
   `X` but the runner is safe, with an assist to 7 and an error on 4. The same
   applies in the basic section: `CS2(2E4)` and `PO1(E3)` are not outs. A parser
   that trusts the `X` will over-count outs.
+- **Negation is per parameter, not per advance.** An error negates the out only
+  when no parameter records a clean putout. `OA.1X3(E1)(35)` charges an error to
+  the pitcher in one parameter *and* records the putout 3-5 in another: the
+  runner is out. Treating an error anywhere in the advance as negating loses a
+  real out and leaves the half-inning one short, which is how this was found.
 - Nested modifier: `1-3(E5/TH)` throwing error on the third baseman;
   `2X3(5/INT)` interference.
 - Flags: `(UR)` unearned, `(TUR)` team unearned, `(RBI)` force an RBI, `(NR)` /
@@ -310,59 +384,86 @@ The parser never guesses and never silently drops a play.
    'parsed_untagged'`.
 3. `parse_status` is exposed to queries and counted in the coverage statement.
 
-Any parse failure is a spec bug. The corpus-wide expectation is zero
-`unparsed` plays; CI fails if the count rises above the recorded baseline.
+### 8.1 Known source defects
+
+Not every parse failure is a spec bug. A small number of corpus records are
+malformed at source, and the grammar **must keep rejecting them**. Accepting a
+typo costs the grammar its value as a validator, and the resulting play would
+carry meaning nobody scored.
+
+As of the full sweep, seven records in 17.9 million:
+
+| Record | Defect |
+|---|---|
+| `S7/L6d` | lowercase location qualifier; every other location is upper case |
+| `E6/G56/R605` | fielder `0` does not exist |
+| `36(1)/FO/G3/R36N` | `N` in a fielder sequence |
+| `SB2/R4US` | `S` in a fielder sequence |
+| `S98/R89M`, `8/R8RM`, `8/R8RD` | location text inside a coverage group |
+
+These are the baseline. CI fails if the `unparsed` count rises above it, and a
+new entry is added here only with the record quoted and the defect named — an
+unexplained increment is a grammar bug until shown otherwise.
 
 ## 9. Validation status
 
 The grammar is not a paper design. It is implemented as a recursive-descent
-parser built directly from §2 and run over the corpus:
+parser built directly from §2 and run over the whole corpus:
 
 | | |
 |---|---|
-| seasons | 57 (1908–1961, plus 1965, 2000, 2023) |
-| files | 998 |
-| games | 73,131 |
-| plays | **6,240,913** |
-| parse failures | **0** |
+| seasons | **118 (1908–2025, complete)** |
+| files | 2,646 |
+| games | 203,282 |
+| plays | **17,891,790** |
+| parse failures | **7**, all documented source defects (§8.1) |
+| unexplained failures | **0** |
 | round-trip failures | **0** |
-
-Seasons 1962–2025 are not yet swept; see the README build order.
 
 ### 9.1 What the sweep found
 
-Three passes were needed. Every failure was a real gap in the grammar as first
-written, and each is fixed above:
+Every failure was a real gap in the grammar as first written, and each is fixed
+above:
 
-| Gap | Found by | Fix |
+| Gap | Found in | Fix |
 |---|---|---|
 | `HP` parsed as `H` + stray `P` | 3-season probe | longest-match ordering, §2.1 |
 | `/BF` unknown modifier | 3-season probe | §4.1 |
 | Location codes ending `W` (`F78XDW`) | 3-season probe | `loc_qualifier` gains `W` |
 | `SBH(UR)` — parameters on a stolen base | 3-season probe | `running_event` accepts `adv_param` |
 | `99(1)/FO` — `99` taking a runner designator | 3-season probe | `unknown_play` accepts runner groups |
-| `R62` — relay naming two fielders | 3-season probe | `"R" fielder_seq` |
-| `/S` swinging third strike | 3 seasons, real parser | §4.1 |
-| Adjacent trivia (`L78+#.`) defeating one-char lookahead | unit test | §3, look past annotation characters |
-| `/B` plain bunt, and `/B6S` with a location | full sweep | `B` added to `trajectory` |
-| `DGR7` — ground rule double naming a fielder | full sweep | `"DGR" [ fielder_seq ]` |
-| `R6524` — relay naming four fielders | full sweep | `"R" fielder_seq` |
+| `/S` swinging third strike | 1965 | §4.1 |
+| Adjacent trivia (`L78+#.`) defeating one-char lookahead | unit test | §3 |
+| `/B` plain bunt, and `/B6S` with a location | 1908–1961 | `B` added to `trajectory` |
+| `DGR7` — ground rule double naming a fielder | 1908–1961 | `"DGR" [ fielder_seq ]` |
+| `R6524` — relay naming four fielders | 1908–1961 | `"R" fielder_seq` |
+| `/U$` and `R`/`U` group sequences | **1994, 1996–97** | `coverage`, §4.1 |
+| `BK.2-3(SB3)` — a stolen base named in an advance | 1970, 2025 | `adv_flag` gains `"SB" base` |
 
 ### 9.2 Conclusions for the implementation
 
-1. **The structure is sound.** Every failure was a missing terminal, an
-   ordering slip, or a lookahead that was one character too short. No
-   production had to change, across 6.2 million plays and 54 seasons of
-   notation drift.
-2. **The published documentation is incomplete and in two places wrong.** Four
-   modifier codes (`B`, `BF`, `S`, and the `W` location suffix) appear nowhere
-   in it, and two of its explicit statements — that `DGR` names no fielder, and
-   that `R$` takes one — are contradicted by the data. The documentation is the
-   starting point for the grammar; **the corpus is the authority.**
-3. **The round-trip gate earned its place.** It passed at every stage, including
-   the passes where hundreds of plays failed to parse, which is what makes it
-   trustworthy as the information-loss detector rather than a proxy for
-   correctness. The two are independent gates and both are needed.
-4. **Failures cluster.** 577 failures across 52 distinct shapes reduced to four
-   underlying causes. Grouping by shape (digits collapsed to `#`) is what makes
-   a sweep actionable rather than a wall of output.
+1. **The structure is sound.** Across 17.9 million plays and 118 seasons of
+   notation drift, every failure was a missing terminal, an ordering slip, or a
+   lookahead one character too short. No production had to change.
+2. **The published documentation is incomplete and in places wrong.** Five
+   modifier codes (`B`, `BF`, `S`, `U`, and the `W` location suffix) appear
+   nowhere in it, and two of its explicit statements — that `DGR` names no
+   fielder, and that `R$` takes one — are contradicted by the data. The
+   documentation is the starting point; **the corpus is the authority.**
+3. **Era coverage matters more than play count.** 582,006 plays from 1965, 2000
+   and 2023 found six gaps. Adding 1908–1961 found three more, and 1994–97
+   found two that no other era contains — `U` exists in exactly four seasons
+   out of 118. A sample drawn by volume rather than by era would have missed
+   them.
+4. **The round-trip gate earned its place.** It stayed green at every stage,
+   including passes where more than a thousand plays failed to parse. That
+   independence is what makes it trustworthy as an information-loss detector
+   rather than a proxy for correctness. Both gates are needed.
+5. **Failures cluster; report them by shape.** 1,568 failures across 1,179
+   distinct shapes reduced to two underlying causes. Grouping by shape (digits
+   collapsed to `#`) is what makes a sweep actionable rather than a wall of
+   output.
+6. **Not every failure is a bug.** Seven records are malformed at source. The
+   grammar rejects them, §8.1 documents them, and the sweep distinguishes them
+   from unexplained failures so that a real regression cannot hide behind a
+   nonzero count.

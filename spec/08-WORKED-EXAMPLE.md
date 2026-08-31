@@ -107,13 +107,13 @@ arithmetic invariant `outs_before + outs_recorded <= 3`
 encodings converge on identical state. That convergence is asserted by the
 `equivalents` list in the gold file ([07-TESTING](07-TESTING.md) §2.1).
 
-**Rulebook cross-check** ([03-STATE](03-STATE.md) §4.2): two outs, so the batter
+**Rulebook cross-check** ([03-STATE](03-STATE.md) §4.3): two outs, so the batter
 was entitled to run. Consistent — no flag.
 
 **Force derivation** ([03-STATE](03-STATE.md) §4.1): batter-runner live, first
 and second occupied, therefore the runner on third is forced at home. One out in
 the advance section, so ordering is unambiguous and
-`force_certainty = 'derived'` (§4.3).
+`force_certainty = 'derived'` (§4.4).
 
 Leaving the play: `outs_after = 3`, `is_inning_ending = 1`, `runs_on_play = 0`
 — no run scores on a force for the third out.

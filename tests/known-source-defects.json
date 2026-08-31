@@ -1,0 +1,20 @@
+{
+  "description": "Event strings that are malformed at source and MUST stay rejected by the grammar. Accepting a typo costs the grammar its value as a validator. See spec/02-GRAMMAR.md §8.1. A new entry is added only with the record quoted and the defect named; an unexplained increment is a grammar bug until shown otherwise.",
+  "corpus": "1908-2025, 17,891,790 plays",
+  "defects": [
+    {"event": "S7/L6d", "game": "CHN197308180",
+     "defect": "lowercase location qualifier; every other location is upper case"},
+    {"event": "E6/G56/R605", "game": "SEA199605030",
+     "defect": "fielder 0 does not exist"},
+    {"event": "36(1)/FO/G3/R36N", "game": "TOR199604130",
+     "defect": "N in a fielder sequence"},
+    {"event": "SB2/R4US", "game": "BAL199704270",
+     "defect": "S in a fielder sequence"},
+    {"event": "S98/R89M", "game": "COL199608060",
+     "defect": "location text inside a coverage group"},
+    {"event": "8/R8RM", "game": "MIN199606081",
+     "defect": "location text inside a coverage group"},
+    {"event": "8/R8RD", "game": "SDN199607050",
+     "defect": "location text inside a coverage group"}
+  ]
+}

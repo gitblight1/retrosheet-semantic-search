@@ -17,7 +17,7 @@ point of this layer: `.dropped_third()` cannot be implemented from a name.
    version they were computed under.
 4. **Confidence.** A tag is `certain` or `uncertain`. `uncertain` arises only
    from a stated ambiguity — `force_certainty = 'ambiguous'`
-   ([03-STATE](03-STATE.md) §4.3), a `#` annotation, or a `99` unknown play.
+   ([03-STATE](03-STATE.md) §4.4), a `#` annotation, or a `99` unknown play.
    Default queries return `certain` only.
 5. **Additive.** A play carries every tag whose rule fires. Tags are not
    mutually exclusive.
