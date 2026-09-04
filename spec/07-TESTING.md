@@ -259,6 +259,8 @@ only move downward.
 |---|---|
 | `plays_unparsed == 0` | grammar gaps |
 | round-trip failures `== 0` | information loss |
+| `runs_on_play <= runners_on_base + 1` | runs credited to nobody |
+| `runs_on_play ==` count of scoring advances | a run counted twice |
 | reconstructed final score `==` game `info` score | state machine drift |
 | reconstructed earned runs `==` `data,er` records | responsibility and error logic |
 | every half-inning ends with 3 outs, or is the game's last | out accounting |
@@ -269,6 +271,24 @@ only move downward.
 Score and earned-run reconciliation are the strongest checks available, because
 they compare against numbers Retrosheet published independently of the event
 strings. They will catch classes of bug no unit test is shaped to find.
+
+The two **run** invariants are the cheap stand-in for them, and they are listed
+because until the derived tables existed *nothing whatsoever checked a run
+count*. The out-accounting invariant cannot see runs, score reconciliation
+needs game logs the project does not hold, and the unit tests asserted whatever
+the code produced — one of them asserted `runs_on_play == 3` on a play with a
+single runner on base, which is arithmetically impossible, because it was
+written against the observed value while a double-count was live. Every home
+run written with an explicit `B-H` advance had been scoring one run too many
+([03-STATE](03-STATE.md) §3.1).
+
+The general lesson is worth stating, because this project has now hit it three
+times. A gate detects the class of error it is shaped for and nothing else:
+the round-trip gate proves nothing was discarded but not that it was filed
+correctly ([02-GRAMMAR](02-GRAMMAR.md) §4); the out-accounting invariant proves
+outs balance but says nothing about runs; and a unit test asserting current
+behaviour proves only that behaviour has not changed. **Adding a gate for a
+quantity nobody had checked found a bug every single time.**
 
 ## 5. Performance suite
 

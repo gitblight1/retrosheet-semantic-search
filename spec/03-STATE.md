@@ -94,10 +94,22 @@ An explicit advance for a runner always overrides the implicit movement, so
 2. Apply every explicit advance in the advance section. `X` moves the runner off
    the bases and adds an out — **unless** the credit sequence contains an `E`,
    which negates the out ([02-GRAMMAR](02-GRAMMAR.md) §5).
-3. Apply the batter destination from §2. A batter who **ran and was retired**
-   gets an advance row of his own, `B` → `1`, `is_force = 1`: the batter-runner
-   is always forced at first (§4.1), and this is the commonest force play in
-   baseball. A caught fly produces no row, because nobody ran.
+3. Apply the batter destination from §2. **The batter's movement is an advance
+   like any other and always gets a row**, whether or not the scorer wrote
+   one — `D9` and `S9.B-2` both put the batter on second, and storing only the
+   explicit form makes the same physical fact present or absent depending on
+   notation. In the 2000 season alone, 69,938 plays had a batter who reached
+   with no advance row against 2,425 that had one, and every implicitly scored
+   run — a home run above all — was credited to nobody.
+
+   A batter who **ran and was retired** gets a row too, `B` → `1` with
+   `is_force = 1`: the batter-runner is always forced at first (§4.1), and this
+   is the commonest force play in baseball. A caught fly produces no row,
+   because nobody ran.
+
+   The row is written **once**. The advance section and the batter placement
+   are two paths to the same movement, and both counting it is what produced
+   the double-counted run above.
 4. Runners not mentioned hold. `3-3` is an explicit hold and behaves the same.
 5. Runners reaching `H` score. Determine earned/unearned from `(UR)` / `(TUR)`
    flags when present; otherwise apply the standard rules against the
@@ -112,6 +124,9 @@ These are validation, not inference. A failure sets
 results ([01-CORPUS](01-CORPUS.md) §5.5).
 
 - `outs_before + outs_recorded <= 3`.
+- **`runs_on_play <= runners_on_base + 1`.** A run needs a runner.
+- **`runs_on_play == the number of advances marked `scored`.`** Every run is
+  attributable to exactly one runner.
 - No two runners occupy the same base in `bases_after`.
 - A runner cannot advance to a base behind them, except via the `PASS` modifier.
 - `outs_after == 3` implies the half-inning ends at this play.
@@ -122,6 +137,23 @@ results ([01-CORPUS](01-CORPUS.md) §5.5).
 The last two are the strongest available end-to-end check on the whole state
 machine and MUST run over the entire corpus in CI ([07-TESTING](07-TESTING.md)
 §4).
+
+The two run checks were added late and immediately earned it. **Nothing had
+ever checked a run count.** The out-accounting invariant of §8 cannot see runs;
+score reconciliation needs game logs the project does not hold; and the unit
+tests asserted whatever the code produced. So a double-count sat in the batter
+placement undetected: an explicit `B-H` advance was counted once by the advance
+loop and again when the batter was placed, which meant **every home run written
+with an explicit `B-H` scored one run too many** — `HR/F7D+.B-H(UR)`, a solo
+shot, scored two. Retrosheet uses that form and the bare `HR` form
+interchangeably, so the error was scattered through the corpus rather than
+confined to anything.
+
+It surfaced only once the derived tables made `runs_on_play` comparable against
+`bases_before` in SQL, and it is worth being explicit about why a *unit* test
+could not have found it: one of them had asserted `runs_on_play == 3` on a play
+with a single runner on base, a figure that is arithmetically impossible. The
+test was written against the observed value while the bug was live.
 
 ## 4. Force plays — the derivation
 
@@ -375,11 +407,52 @@ An extra-inning half begins with a placed runner (2020+). Initialize `bases`
 with that runner instead of empty. The runner is not charged to the pitcher for
 earned-run purposes; `info,tiebreaker` states the placement base.
 
+**`radj` is not reliably the first record of its half-inning.** It commonly
+follows the leading `NP`/`sub` block, so by the time it arrives the replay has
+already crossed the boundary:
+
+```
+play,10,0,biggc002,00,,NP     <- boundary crossed here
+radj,shawt001,2               <- placed runner declared only now
+play,10,0,biggc002,31,...,W
+```
+
+A replay that applies pending placements *only* at the boundary therefore
+places nobody in that half-inning, and then leaks the runner into the next one.
+The rule: apply the placement immediately if the current half-inning has not
+yet had a state-changing play, and defer it to the boundary otherwise. `NP`
+changes no state (§6.1), so applying it mid-`NP`-block is exact rather than an
+approximation.
+
+Getting this wrong is nearly invisible. The out accounting still balances —
+a missing runner records no outs — so §8's invariant passes, and the only
+symptom is a run scored from a base the state calls empty. That is what the run
+invariants of §3.1 detect, and they found **91 plays** doing exactly it, every
+one of them a 2020s extra-inning home run.
+
 ### 6.5 `htbf`
 
 When the home team bats first, `start` records and plays for team `1` precede
 those for team `0`. The replay MUST key half-innings off the `team` field of
-each play, never off an assumption that the visitor bats in the top half.
+each play **and the game's own `info,htbf`**, never off an assumption that the
+visitor bats in the top half.
+
+`info,htbf,true` appears in **51 games**. Deriving `half` from the team alone —
+`bottom` if team 1, else `top` — gets every one of them backwards, and nothing
+else in the replay notices, because the out and base accounting keys off the
+team and never reads `half`. It is only wrong in the output.
+
+### 6.6 `info,innings`
+
+`scheduled_innings` comes from `info,innings`, and the key exists **only from
+2020** — which is exactly when it started to matter. **518 games in the corpus
+are scheduled for seven innings** (plus 6 at eight, 6 at six, 6 at five and one
+at ten), so assuming nine misreports the eighth inning of every one of them as
+regulation and `ExtraInnings` ([04-ONTOLOGY](04-ONTOLOGY.md) §7) with it.
+
+Where the key is absent the value is stored as NULL rather than 9, so "we were
+told nine" stays distinguishable from "we assumed nine". The replay still
+applies 9 as its default, which is right for every season that does not say.
 
 ## 7. Context derived per play
 
@@ -389,6 +462,7 @@ query filter:
 | Field | Definition |
 |---|---|
 | `bases_state` | 3-bit code of `bases_before`, `000`–`111` |
+| `runners_before` | the player ids on 1st, 2nd, 3rd — occupancy says *whether*, this says *who* |
 | `batter_ran` | `yes` / `no` / `unknown` — whether the batter left the box (§4.2) |
 | `bases_loaded` | `bases_state == '111'` |
 | `outs_before` | 0, 1, 2 |

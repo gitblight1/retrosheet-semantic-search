@@ -194,10 +194,18 @@ class OutAccounting(unittest.TestCase):
         self.assertEqual(outcome.bases_after, "001")
 
     def test_a_bare_throw_parameter_does_not_preserve_an_out(self):
-        """`BXH(TH)(E2/TH)(8E2)` names no putout: the runner scored."""
+        """`BXH(TH)(E2/TH)(8E2)` names no putout: the runner scored.
+
+        Two runs, not three. This assertion read `3` until the run accounting
+        was checked against the base state -- a runner on second plus the
+        batter cannot produce three runs, and the third was the batter being
+        counted once by the advance loop and again by the batter placement.
+        The test had been written against the observed value while the bug was
+        live, which is the whole hazard of asserting what the code prints.
+        """
         outcome = run("S6/L6D.2-H;BXH(TH)(E2/TH)(8E2)(NR)(UR)", "2", 2)
         self.assertEqual(outcome.outs_recorded, 0)
-        self.assertEqual(outcome.runs_on_play, 3)
+        self.assertEqual(outcome.runs_on_play, 2)
 
     def test_rulebook_contradiction_is_not_a_state_error(self):
         """Six pre-1947 plays contradict the uncaught-third-strike rule.
@@ -387,3 +395,235 @@ class UnresolvedForceIsRecordedNotEscalated(unittest.TestCase):
             with self.subTest(event=event):
                 self.assertIn(run(event, "12").batter_ran,
                               ("yes", "no", "unknown"))
+
+
+class GameShapeFromInfoRecords(unittest.TestCase):
+    """§6.5 and §7: two facts that come from `info`, not from the plays."""
+
+    def replay(self, *lines):
+        from rsse.model.game import replay_game
+        from rsse.parser.records import parse_line
+        records = [parse_line(i, line) for i, line in enumerate(lines, 1)]
+        return replay_game([r for r in records if r], "TST190001010")
+
+    PLAY = "play,{inning},{team},bat{team}{inning}0,,,63/G6"
+
+    def half_innings(self, *info):
+        lines = ["id,TST190001010", *info]
+        for inning in (1, 8):
+            for team in (0, 1):
+                for _ in range(3):
+                    lines.append(self.PLAY.format(inning=inning, team=team))
+        replay = self.replay(*lines)
+        return replay, {(p.team, p.context.half) for p in replay.plays}
+
+    def test_visitor_bats_top_by_default(self):
+        _replay, halves = self.half_innings()
+        self.assertEqual(halves, {(0, "top"), (1, "bottom")})
+
+    def test_htbf_puts_the_home_team_in_the_top_half(self):
+        """51 games in the corpus. Keying `half` off the team alone gets these
+        backwards, which §6.5 forbids in as many words."""
+        _replay, halves = self.half_innings("info,htbf,true")
+        self.assertEqual(halves, {(1, "top"), (0, "bottom")})
+
+    def test_scheduled_innings_defaults_to_nine(self):
+        replay, _halves = self.half_innings()
+        self.assertEqual(replay.scheduled_innings, 9)
+        eighth = [p for p in replay.plays if p.inning == 8]
+        self.assertTrue(eighth)
+        self.assertFalse(any(p.context.extra_innings for p in eighth))
+
+    def test_a_seven_inning_game_makes_the_eighth_extra(self):
+        """518 games in the corpus are scheduled for 7 innings, and `info`
+        says so on every one -- the key exists from 2020, which is exactly
+        when the short doubleheader did."""
+        replay, _halves = self.half_innings("info,innings,7")
+        self.assertEqual(replay.scheduled_innings, 7)
+        eighth = [p for p in replay.plays if p.inning == 8]
+        self.assertTrue(eighth)
+        self.assertTrue(all(p.context.extra_innings for p in eighth))
+
+    def test_info_records_do_not_become_plays(self):
+        replay, _halves = self.half_innings("info,innings,7", "info,htbf,true")
+        self.assertEqual(len(replay.plays), 12)
+
+
+class RunnersHaveIdentity(unittest.TestCase):
+    """A batter who reaches goes onto the bases as himself.
+
+    Without it the base *state* is still correct, so nothing fails -- but
+    `runner_advances.runner_id` and `plays.runner_N_before` are NULL forever
+    and "who was forced" is unanswerable.
+    """
+
+    def test_the_batter_reaches_as_himself(self):
+        from rsse.model.state import HalfInningState, apply_play
+        state = HalfInningState()
+        after, _out = apply_play(state, parse("S7").event, batter_id="ortih001")
+        self.assertEqual(after.bases["1"].player_id, "ortih001")
+
+    def test_the_2000_anchor_names_its_runners(self):
+        """The record 07-TESTING §2.2 walks through: Ortiz on third from a
+        double plus a single, Damon on first, Ortiz retired at the plate."""
+        from rsse.model.game import replay_game
+        from rsse.parser.records import parse_line
+
+        lines = ["id,KCA200009270",
+                 "play,3,1,ortih001,22,BCCBX,D7/L78S+",
+                 "play,3,1,feblc001,12,FFBS,K",
+                 "play,3,1,damoj001,22,BFFBX,S9/L34D.2-3",
+                 "play,3,1,sancr001,12,CBFS,K/NDP.3XH(21)"]
+        replay = replay_game(
+            [parse_line(i, line) for i, line in enumerate(lines, 1)],
+            "KCA200009270")
+        final = replay.plays[-1].outcome
+        self.assertEqual(final.runners_before, ("damoj001", None, "ortih001"))
+        out_at_home = [a for a in final.advances
+                       if a.dest == "H" and a.is_out]
+        self.assertEqual(len(out_at_home), 1)
+        self.assertEqual(out_at_home[0].runner.player_id, "ortih001")
+        self.assertFalse(out_at_home[0].is_force)
+
+    def test_a_placed_runner_keeps_its_own_id(self):
+        from rsse.model.game import replay_game
+        from rsse.parser.records import parse_line
+
+        lines = ["id,TST202004010", "info,innings,9",
+                 "radj,speedy001,2",
+                 "play,10,1,bat001,,,63/G6"]
+        replay = replay_game(
+            [parse_line(i, line) for i, line in enumerate(lines, 1)],
+            "TST202004010")
+        outcome = replay.plays[0].outcome
+        self.assertEqual(outcome.runners_before, (None, "speedy001", None))
+        self.assertTrue(replay.plays[0].context.has_placed_runner)
+
+
+class RunAccounting(unittest.TestCase):
+    """A run needs a runner, and every run needs exactly one.
+
+    Nothing checked this until the derived tables made it a SQL query: the
+    out-accounting invariant of §8 does not see runs, and final-score
+    reconciliation needs game logs the project does not hold. It found the
+    batter being double-counted on every home run written with an explicit
+    `B-H` advance -- a solo shot scoring two.
+    """
+
+    def outcome(self, event, bases="", outs=0):
+        return run(event, bases, outs)
+
+    def test_runs_never_exceed_runners_on_base_plus_the_batter(self):
+        for event, bases in (
+                ("HR/F9", ""),
+                ("HR/F7D+.B-H(UR)", ""),
+                ("HR/F7D+.3-H;B-H", "3"),
+                ("HR/F78XD.3-H;2-H;1-H", "123"),
+                ("HR/F78XD.3-H;2-H;1-H;B-H", "123"),
+                ("S6/L6D.2-H;BXH(TH)(E2/TH)(8E2)(NR)(UR)", "2"),
+                ("D9.2-H;1-H", "12"),
+                ("T9.1-H", "1")):
+            with self.subTest(event=event, bases=bases):
+                outcome = self.outcome(event, bases)
+                self.assertLessEqual(outcome.runs_on_play, len(bases) + 1)
+
+    def test_every_run_has_exactly_one_scoring_advance(self):
+        for event, bases in (
+                ("HR/F9", ""),
+                ("HR/F7D+.B-H(UR)", ""),
+                ("HR/F7D+.3-H;B-H", "3"),
+                ("HR/F78XD.3-H;2-H;1-H", "123"),
+                ("SBH", "3"),
+                ("WP.3-H", "3"),
+                ("D9.2-H", "2")):
+            with self.subTest(event=event, bases=bases):
+                outcome = self.outcome(event, bases)
+                scored = [a for a in outcome.advances if a.scored]
+                self.assertEqual(outcome.runs_on_play, len(scored))
+
+    def test_a_solo_home_run_scores_one_however_it_is_written(self):
+        """Retrosheet writes both forms; they must agree."""
+        for event in ("HR/F9", "HR/F7D+.B-H", "HR/F7D+.B-H(UR)"):
+            with self.subTest(event=event):
+                self.assertEqual(self.outcome(event).runs_on_play, 1)
+
+    def test_a_grand_slam_scores_four_however_it_is_written(self):
+        for event in ("HR/F78XD.3-H;2-H;1-H", "HR/F78XD.3-H;2-H;1-H;B-H"):
+            with self.subTest(event=event):
+                self.assertEqual(self.outcome(event, "123").runs_on_play, 4)
+
+
+class PlacedRunnerTiming(unittest.TestCase):
+    """`radj` is not reliably the first record of its half-inning (§6.4).
+
+    It commonly follows the leading `NP`/`sub` block, so a replay that applies
+    it only at the half-inning boundary has already crossed that boundary and
+    places nobody -- then leaks the runner into the next half. 91 plays in the
+    2020s scored a run from a base the state called empty because of it.
+    """
+
+    def replay(self, *lines):
+        from rsse.model.game import replay_game
+        from rsse.parser.records import parse_line
+        records = [parse_line(i, line) for i, line in enumerate(lines, 1)]
+        return replay_game([r for r in records if r], "TST202009030")
+
+    def first_real(self, replay, team):
+        return next(p for p in replay.plays
+                    if p.team == team and p.event != "NP")
+
+    def test_radj_after_the_leading_no_plays(self):
+        """The shape the corpus actually uses."""
+        replay = self.replay(
+            "id,TST202009030", "info,innings,9",
+            "play,10,0,bat001,00,,NP",
+            "radj,shawt001,2",
+            "play,10,0,bat001,00,,NP",
+            "play,10,0,bat001,,,S7",
+        )
+        play = self.first_real(replay, 0)
+        self.assertEqual(play.outcome.bases_before, "010")
+        self.assertEqual(play.outcome.runners_before, (None, "shawt001", None))
+
+    def test_radj_before_the_boundary(self):
+        """The other ordering must keep working."""
+        replay = self.replay(
+            "id,TST202009030", "info,innings,9",
+            "play,9,1,prev001,,,63/G6",
+            "play,9,1,prev002,,,63/G6",
+            "play,9,1,prev003,,,63/G6",
+            "radj,shawt001,2",
+            "play,10,0,bat001,,,S7",
+        )
+        play = self.first_real(replay, 0)
+        self.assertEqual(play.outcome.bases_before, "010")
+
+    def test_each_half_gets_its_own_runner(self):
+        """The leak: one half's runner must not reappear in the next."""
+        replay = self.replay(
+            "id,TST202009030", "info,innings,9",
+            "play,10,0,bat001,00,,NP", "radj,shawt001,2",
+            "play,10,0,bat001,,,63/G6", "play,10,0,bat002,,,63/G6",
+            "play,10,0,bat003,,,63/G6",
+            "play,10,1,bat004,00,,NP", "radj,bogax001,2",
+            "play,10,1,bat004,,,S7",
+        )
+        self.assertEqual(self.first_real(replay, 0).outcome.runners_before,
+                         (None, "shawt001", None))
+        self.assertEqual(self.first_real(replay, 1).outcome.runners_before,
+                         (None, "bogax001", None))
+
+    def test_the_grand_slam_that_exposed_it_reconciles(self):
+        """BOS202009030, top of the 10th: placed runner, walk, advance, homer."""
+        replay = self.replay(
+            "id,TST202009030", "info,innings,9",
+            "play,10,0,biggc002,00,,NP", "radj,shawt001,2",
+            "play,10,0,biggc002,31,BBFBB,W",
+            "play,10,0,gricr001,00,X,3/G4-.2-3;1-2",
+            "play,10,0,hernt002,01,CX,HR/L89XD.3-H(UR);2-H",
+        )
+        homer = replay.plays[-1].outcome
+        self.assertEqual(homer.bases_before, "011")
+        self.assertEqual(homer.runs_on_play, 3)
+        self.assertEqual(homer.parse_status, "ok")
+        self.assertEqual(replay.inconsistent, 0)

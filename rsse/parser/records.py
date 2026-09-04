@@ -58,6 +58,30 @@ class PlayRecord:
         )
 
 
+def parse_line(line_no: int, raw: str) -> Record | None:
+    """Split one record line into its type and fields.
+
+    Returned as a function rather than inlined into :func:`read_records`
+    because the derived layer re-reads the same lines out of the archive
+    (spec/05-DATABASE.md §1) and must split them identically. Two
+    implementations of this would be two definitions of the corpus.
+
+    csv parsing is only needed when a field is quoted, and quoted fields are a
+    small minority of records. Constructing a reader per line dominates the
+    runtime of a corpus sweep, so take the fast path when the line provably
+    has no quoting to interpret.
+    """
+    if not raw:
+        return None
+    if '"' in raw:
+        row = next(csv.reader(io.StringIO(raw)), None)
+        if not row:
+            return None
+    else:
+        row = raw.split(",")
+    return Record(line_no, row[0], tuple(row[1:]), raw)
+
+
 def read_records(path: Path) -> Iterator[Record]:
     """Yield every record in an event file, verbatim.
 
@@ -66,20 +90,9 @@ def read_records(path: Path) -> Iterator[Record]:
     """
     with open(path, encoding="latin-1", newline="") as fh:
         for n, line in enumerate(fh, start=1):
-            raw = line.rstrip("\r\n")
-            if not raw:
-                continue
-            # csv parsing is only needed when a field is quoted, and quoted
-            # fields are a small minority of records. Constructing a reader per
-            # line dominates the runtime of a corpus sweep, so take the fast
-            # path when the line provably has no quoting to interpret.
-            if '"' in raw:
-                row = next(csv.reader(io.StringIO(raw)), None)
-                if not row:
-                    continue
-            else:
-                row = raw.split(",")
-            yield Record(n, row[0], tuple(row[1:]), raw)
+            record = parse_line(n, line.rstrip("\r\n"))
+            if record is not None:
+                yield record
 
 
 def detect_line_ending(path: Path) -> str:

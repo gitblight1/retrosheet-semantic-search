@@ -13,6 +13,7 @@ import collections
 import json
 import re
 import sys
+import time
 from pathlib import Path
 
 from .model.game import replay_game
@@ -31,6 +32,8 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 EVENTS = DATA / "events"
 KNOWN_DEFECTS = ROOT / "tests" / "known-source-defects.json"
+ARCHIVE = DATA / "database" / ARCHIVE_DEFAULT
+QUERY_DB = DATA / "database" / QUERY_DEFAULT
 
 
 def load_known_defects() -> set[str]:
@@ -417,6 +420,113 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0 if bad_games == 0 else 1
 
 
+def cmd_derive(args: argparse.Namespace) -> int:
+    """Build the derived tables from the archive (spec/05-DATABASE.md §2-§4).
+
+    Reads the archive, never the event files: the archive is the byte-exact
+    record of what was ingested, and Retrosheet reissues corrected files, so a
+    re-derive against the source tree is not the same operation.
+
+    Nothing written here is a source of truth, so `--rebuild` is safe by
+    construction -- it drops every derived table and starts over.
+    """
+    from .database import derived
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    query_path = Path(args.database) if args.database else QUERY_DB
+    if not archive_path.exists():
+        print(f"no archive at {archive_path}; run `rsse ingest` first",
+              file=sys.stderr)
+        return 2
+
+    query_path.parent.mkdir(parents=True, exist_ok=True)
+    conn = dbschema.connect(str(query_path))
+    for pragma in dbschema.LOAD_PRAGMAS:
+        conn.execute(pragma)
+    dbschema.create_query_db(conn)
+    if args.rebuild:
+        dbschema.drop_derived(conn)
+    dbschema.create_derived(conn)
+
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+
+    seasons = None
+    if args.season:
+        seasons = [int(y) for y in args.season.split(",")]
+    elif args.seasons:
+        available = [r[0] for r in archive.execute(
+            "SELECT DISTINCT season FROM source_files"
+            " WHERE season IS NOT NULL ORDER BY season")]
+        seasons = _spread(available, args.seasons)
+        print(f"deriving {len(seasons)} seasons: "
+              f"{', '.join(str(s) for s in seasons)}", file=sys.stderr)
+
+    def progress(season, stats):
+        print(f"  {season} ... ({stats.plays:,} plays)", file=sys.stderr,
+              flush=True)
+
+    started = time.time()
+    stats = derived.build(
+        conn, archive, parser_version=PARSER_VERSION, seasons=seasons,
+        limit=args.limit, progress=progress if args.progress else None)
+
+    if not args.no_indexes:
+        print("building indexes ...", file=sys.stderr, flush=True)
+        dbschema.create_derived_indexes(conn)
+        conn.execute("ANALYZE")
+        conn.commit()
+
+    # Checkpoint before measuring: in WAL mode the rows just written live in
+    # the -wal file, and the main database reads as ~0 bytes. The first run
+    # reported 1.0 bytes per play.
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.commit()
+    elapsed = time.time() - started
+    size = query_path.stat().st_size
+
+    print(f"games                {stats.games:,}")
+    print(f"plays                {stats.plays:,}")
+    print(f"  unparsed           {stats.unparsed:,}")
+    print(f"runner_advances      {stats.advances:,}")
+    print(f"fielding_credits     {stats.credits:,}")
+    print(f"credit_sequences     {stats.sequences:,}")
+    print(f"play_tags            {stats.tags:,}   (curated {stats.curated:,})")
+    print(f"parse status         {dict(sorted(stats.status.items()))}")
+    print(f"database             {size / 1e9:.2f} GB  ({query_path})")
+    if stats.plays:
+        print(f"bytes per play       {size / stats.plays:.1f}")
+    print(f"wall clock           {elapsed / 60:.1f} min")
+
+    if args.report:
+        Path(args.report).write_text(json.dumps({
+            "games": stats.games, "plays": stats.plays,
+            "unparsed": stats.unparsed, "advances": stats.advances,
+            "credits": stats.credits, "sequences": stats.sequences,
+            "tags": stats.tags, "curated": stats.curated,
+            "status": stats.status,
+            "bytes": size, "seconds": round(elapsed, 1),
+            "seasons": seasons, "limit": args.limit,
+        }, indent=2))
+        print(f"\nreport written to {args.report}")
+
+    print(f"\n{ATTRIBUTION}")
+    return 0
+
+
+def _spread(values: list, n: int) -> list:
+    """``n`` values spread end to end across ``values``, inclusive of both.
+
+    A `[::step]` slice drops the tail, and the tail is where the newest
+    encodings live -- see cmd_tags.
+    """
+    if n >= len(values):
+        return list(values)
+    if n == 1:
+        return values[-1:]
+    last = len(values) - 1
+    return sorted({values[round(i * last / (n - 1))] for i in range(n)})
+
+
 def cmd_tags(args: argparse.Namespace) -> int:
     """Derive tags over the corpus and report a census (spec/04-ONTOLOGY.md).
 
@@ -610,6 +720,22 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--progress", action="store_true")
     r.add_argument("--report", help="write failing games to this JSON path")
     r.set_defaults(func=cmd_replay)
+
+    d = sub.add_parser("derive", help="build the derived tables from the archive")
+    d.add_argument("--archive", help=f"archive path (default {ARCHIVE})")
+    d.add_argument("--database", help=f"query database path (default {QUERY_DB})")
+    d.add_argument("--seasons", type=int,
+                   help="sample N seasons spread across the corpus")
+    d.add_argument("--season", help="explicit season(s), comma separated")
+    d.add_argument("--limit", type=int, help="first N games")
+    d.add_argument("--rebuild", action="store_true",
+                   help="drop the derived tables first; safe, nothing here is "
+                        "a source of truth")
+    d.add_argument("--no-indexes", action="store_true",
+                   help="skip index creation, for a timing run")
+    d.add_argument("--progress", action="store_true")
+    d.add_argument("--report", help="write a JSON report to this path")
+    d.set_defaults(func=cmd_derive)
 
     t = sub.add_parser("tags", help="derive tags over the corpus and "
                                     "report a census")

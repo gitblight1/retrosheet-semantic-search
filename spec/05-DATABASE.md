@@ -41,13 +41,18 @@ CREATE TABLE raw_records (
 -- order, and record_id is monotonic. One row per game replaces an index over
 -- every record.
 CREATE TABLE game_spans (
-  game_id         TEXT PRIMARY KEY,
+  -- Surrogate: game_id repeats three times in the corpus (01-CORPUS §5.4).
+  game_key        INTEGER PRIMARY KEY,
+  game_id         TEXT NOT NULL,
+  occurrence      INTEGER NOT NULL DEFAULT 1,
   file_id         INTEGER NOT NULL REFERENCES source_files,
   first_record_id INTEGER NOT NULL,
   last_record_id  INTEGER NOT NULL,
-  record_count    INTEGER NOT NULL
+  record_count    INTEGER NOT NULL,
+  UNIQUE (game_id, occurrence)
 );
 CREATE INDEX ix_spans_file ON game_spans (file_id);
+CREATE INDEX ix_spans_game ON game_spans (game_id);
 ```
 
 ### 1.1 Why the raw layer carries almost no indexes
@@ -84,9 +89,21 @@ return the same rows as a `game_id` scan.
 
 ## 2. Games and lineups
 
+`game_id` is **not** a primary key here, for exactly the reason §1 gave it up in
+`game_spans`: three ids repeat in the corpus
+([01-CORPUS](01-CORPUS.md) §5.4), so the archive holds 203,285 spans under
+203,282 distinct ids. The first cut of this section declared
+`game_id TEXT PRIMARY KEY` anyway — the derived layer would have failed on the
+same UNIQUE constraint that stopped the ingest, one layer later and after a
+much longer run. `games` is keyed on a surrogate with an `occurrence` column,
+and `plays` carries `game_key` alongside `game_id`.
+
 ```sql
 CREATE TABLE games (
-  game_id            TEXT PRIMARY KEY,
+  -- Surrogate, for the same reason game_spans has one: game_id is NOT unique.
+  game_key           INTEGER PRIMARY KEY,
+  game_id            TEXT NOT NULL,
+  occurrence         INTEGER NOT NULL DEFAULT 1,
   file_id            INTEGER NOT NULL REFERENCES source_files,
   date               TEXT NOT NULL,          -- ISO yyyy-mm-dd
   season             INTEGER NOT NULL,
@@ -103,22 +120,24 @@ CREATE TABLE games (
   tiebreaker_base    INTEGER,
   final_home         INTEGER,
   final_away         INTEGER,
-  parse_status       TEXT NOT NULL DEFAULT 'ok'
+  parse_status       TEXT NOT NULL DEFAULT 'ok',
+  UNIQUE (game_id, occurrence)
 );
 CREATE INDEX ix_games_date ON games (date);
 CREATE INDEX ix_games_season_type ON games (season, game_type);
+CREATE INDEX ix_games_id ON games (game_id);
 
 -- lossless: every info record, including ones the model ignores
 CREATE TABLE game_info (
-  game_id  TEXT NOT NULL REFERENCES games,
+  game_key INTEGER NOT NULL REFERENCES games,
   key      TEXT NOT NULL,
   value    TEXT,
   seq      INTEGER NOT NULL,
-  PRIMARY KEY (game_id, seq)
+  PRIMARY KEY (game_key, seq)
 );
 
 CREATE TABLE lineup_entries (
-  game_id      TEXT NOT NULL REFERENCES games,
+  game_key     INTEGER NOT NULL REFERENCES games,
   seq          INTEGER NOT NULL,       -- 0 for start records, then sub order
   is_sub       INTEGER NOT NULL,
   player_id    TEXT NOT NULL,
@@ -126,7 +145,7 @@ CREATE TABLE lineup_entries (
   team         INTEGER NOT NULL CHECK (team IN (0,1)),
   batting_order INTEGER NOT NULL,      -- 0 = pitcher in a DH game
   position     INTEGER NOT NULL,       -- 10 DH, 11 PH, 12 PR
-  PRIMARY KEY (game_id, seq, player_id, position)
+  PRIMARY KEY (game_key, seq, player_id, position)
 );
 
 CREATE TABLE players (
@@ -144,9 +163,13 @@ CREATE TABLE parks (park_id TEXT PRIMARY KEY, name TEXT, city TEXT,
 ```sql
 CREATE TABLE plays (
   play_id        INTEGER PRIMARY KEY,
-  game_id        TEXT NOT NULL REFERENCES games,
+  game_key       INTEGER NOT NULL REFERENCES games,
+  -- Denormalised beside the key: every query orders and reports by it, and
+  -- §6's preference for legible ids over surrogates applies to output even
+  -- where correctness needs the surrogate.
+  game_id        TEXT NOT NULL,
   seq            INTEGER NOT NULL,          -- play order within the game
-  record_id      INTEGER NOT NULL REFERENCES raw_records,
+  record_id      INTEGER NOT NULL,          -- raw_records.record_id, in the archive
 
   inning         INTEGER NOT NULL,
   half           TEXT NOT NULL CHECK (half IN ('top','bottom')),
@@ -195,12 +218,15 @@ CREATE TABLE plays (
   parse_error    TEXT,
   parser_version TEXT NOT NULL,
 
-  UNIQUE (game_id, seq)
+  UNIQUE (game_key, seq)
 );
 CREATE INDEX ix_plays_ctx  ON plays (bases_before, outs_before);
 CREATE INDEX ix_plays_batter_ran ON plays (batter_ran)
   WHERE batter_ran = 'unknown';
 CREATE INDEX ix_plays_game ON plays (game_id, seq);
+-- record_id is a reference into the *archive*, which is a separate database
+-- (§7 option 2), so it carries no REFERENCES clause. It is provenance: every
+-- derived row can name the verbatim line it came from.
 CREATE INDEX ix_plays_status ON plays (parse_status) WHERE parse_status <> 'ok';
 ```
 
@@ -372,12 +398,12 @@ re-derive; `source='curated'` rows are preserved ([04-ONTOLOGY](04-ONTOLOGY.md)
 
 ```sql
 CREATE TABLE comments (
-  game_id TEXT NOT NULL REFERENCES games, seq INTEGER NOT NULL,
+  game_key INTEGER NOT NULL REFERENCES games, seq INTEGER NOT NULL,
   play_id INTEGER REFERENCES plays,
   kind TEXT NOT NULL CHECK (kind IN ('text','replay','ejection','umpchange',
                                      'protest','suspend')),
   text TEXT NOT NULL, payload TEXT,          -- JSON for structured kinds
-  PRIMARY KEY (game_id, seq)
+  PRIMARY KEY (game_key, seq)
 );
 
 CREATE TABLE coverage (
@@ -425,8 +451,22 @@ That is with both candidate indexes already removed (§1.1); the first cut was
 3.0 GB projected. There is little left to trim without giving up either the
 verbatim archive or the legibility of text ids.
 
-The derived layer has not been built, and it is the larger half. Order-of-
-magnitude, against 17.9M plays:
+The derived layer is now **measured**, on the full 2000 season (2,429 games,
+222,509 plays, all indexes built):
+
+| | |
+|---|---|
+| `plays` | 222,509 |
+| `runner_advances` | ~180,000 |
+| `fielding_credits` | 147,254 |
+| `credit_sequences` | 102,392 |
+| `play_tags` | 893,211 |
+| on disk | **567 bytes per play** |
+| wall clock | ~1.0 min per season |
+
+At 567 bytes per play the full corpus projects to **~10.1 GB** and roughly 80
+minutes, which lands inside the estimate below rather than overturning it. The
+original order-of-magnitude guess was:
 
 | Table | Rows | Rough size |
 |---|---|---|
@@ -435,7 +475,7 @@ magnitude, against 17.9M plays:
 | `fielding_credits`, `credit_sequences` | ~40M | ~2 GB |
 | `play_tags` | ~50M | ~1 GB plus its driving index |
 
-**A realistic total is 8–12 GB, not 2 GB.** The goal was aspirational and is
+**A realistic total is 8–12 GB, not 2 GB**, and 10.1 GB measured is inside it. The goal was aspirational and is
 not reachable by tuning. It has to be replaced with a measured one, and the
 choice is a design decision rather than a detail:
 

@@ -77,6 +77,10 @@ class PlayOutcome:
     bases_before: str
     outs_before: int
     bases_after: str = "000"
+    #: Player ids on 1st, 2nd, 3rd entering the play. `bases_before` gives
+    #: occupancy; these give who, which `plays.runner_N_before` needs and an
+    #: advance row can only supply for runners that moved.
+    runners_before: tuple[str | None, str | None, str | None] = (None, None, None)
     outs_after: int = 0
     outs_recorded: int = 0
     batter_dest: str | None = None
@@ -540,16 +544,29 @@ def runner_designator_outs(event: G.Event) -> list[str]:
 # ---------------------------------------------------------------------------
 
 def apply_play(state: HalfInningState, event: G.Event, *,
+               batter_id: str | None = None,
                batter_reached_on_strikes: bool = False
                ) -> tuple[HalfInningState, PlayOutcome]:
     """Apply one parsed event to the state, returning the new state and outcome.
+
+    ``batter_id`` names the batter, so that a batter who reaches goes onto the
+    bases as himself. Without it every runner is anonymous the moment he stops
+    being the batter, and `runner_advances.runner_id` and
+    `plays.runner_N_before` ([05-DATABASE](../../spec/05-DATABASE.md) §3) can
+    never be filled -- so "who was forced" and "who scored" become
+    unanswerable while the base *state* looks perfectly correct.
 
     ``batter_reached_on_strikes`` is set only by the retry described in §4.5
     step 1 and is not part of the public contract; callers pass one event and
     one state.
     """
     before = state.copy()
-    out = PlayOutcome(bases_before=before.code(), outs_before=before.outs)
+    out = PlayOutcome(
+        bases_before=before.code(), outs_before=before.outs,
+        runners_before=tuple(
+            before.bases[b].player_id if before.bases[b] else None
+            for b in BASES),
+    )
 
     if any(isinstance(b, G.NoPlay) for b in event.basics) and len(event.basics) == 1:
         # `NP` is a marker only (§6.1). Nothing happened, so the batter did not
@@ -708,15 +725,31 @@ def apply_play(state: HalfInningState, event: G.Event, *,
                 raw="(B)",
             ))
     elif batter_live and b_adv is None:
+        # The batter's movement is an advance like any other, and it gets a row
+        # whether or not the scorer wrote one. `D9` and `S9.B-2` put the batter
+        # on second by different routes; storing only the explicit form makes
+        # the same physical fact present or absent depending on notation, and
+        # leaves every implicit run -- a home run above all -- scored by
+        # nobody, so `runs_on_play` disagreed with the advances on 5,725 plays
+        # of the 2000 season alone.
         if batter_dest == "H":
             runs += 1
         else:
-            after.bases[batter_dest] = Runner()
+            after.bases[batter_dest] = Runner(batter_id)
+        out.advances.append(ResolvedAdvance(
+            origin="B", dest=batter_dest, marked_out=False, is_out=False,
+            is_explicit=False, force_certainty=FORCE_NA,
+            scored=(batter_dest == "H"), runner=Runner(batter_id),
+            raw=f"B-{batter_dest}",
+        ))
     elif b_adv is not None and batter_live:
-        if batter_dest == "H":
-            runs += 1
-        else:
-            after.bases[batter_dest] = Runner()
+        # The advance loop above already counted this movement and, if it ended
+        # at the plate, its run. Counting it again here double-counted the
+        # batter on every home run written with an explicit `B-H` -- a solo
+        # shot recorded as `HR/F7D+.B-H(UR)` scored two. Only the placement is
+        # left to do, because the loop deliberately does not place the batter.
+        if batter_dest != "H":
+            after.bases[batter_dest] = Runner(batter_id)
 
     after.outs = before.outs + outs_recorded
     out.outs_recorded = outs_recorded
@@ -736,7 +769,7 @@ def apply_play(state: HalfInningState, event: G.Event, *,
         # alternative reading is *impossible*, and only when adopting it makes
         # the play consistent. If the retry is inconsistent too, the original
         # reading is kept so the inconsistency is reported rather than moved.
-        retry_after, retry = apply_play(state, event,
+        retry_after, retry = apply_play(state, event, batter_id=batter_id,
                                         batter_reached_on_strikes=True)
         if retry.outs_after <= 3:
             retry.notes.append(
@@ -784,6 +817,22 @@ def _check(out: PlayOutcome, before: HalfInningState, after: HalfInningState,
         out.flag(ParseStatus.INCONSISTENT,
                  f"{before.outs} outs before + {out.outs_recorded} recorded = "
                  f"{out.outs_after}")
+
+    # A run needs a runner. Nothing checked this until the derived tables made
+    # it expressible, and it found the batter being counted twice on every home
+    # run written with an explicit `B-H` -- a solo shot scoring two. The
+    # out-accounting invariant cannot see runs, and score reconciliation needs
+    # game logs the project does not hold, so this is the only run check
+    # available from event files alone.
+    runners_on = before.code().count("1")
+    if out.runs_on_play > runners_on + 1:
+        out.flag(ParseStatus.INCONSISTENT,
+                 f"{out.runs_on_play} runs with {runners_on} on base and one "
+                 "batter")
+    scored = sum(1 for a in out.advances if a.scored)
+    if out.runs_on_play != scored:
+        out.flag(ParseStatus.INCONSISTENT,
+                 f"{out.runs_on_play} runs but {scored} scoring advances")
     if out.batter_dest is None and any(
             isinstance(b, (G.Hit, G.Strikeout, G.Out, G.Walk)) for b in event.basics):
         out.flag(ParseStatus.AMBIGUOUS, "batter destination undetermined")

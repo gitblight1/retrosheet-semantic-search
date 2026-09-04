@@ -69,7 +69,8 @@ rsse/model/state.py       half-inning state, force derivation, credits
 rsse/model/game.py        whole-game replay, per-play context
 rsse/semantic/ontology.py 84 tags, one derivation rule each
 rsse/semantic/derive.py   implication, confidence, curated tags
-tests/                    146 tests; tests/gold/ 5 gold plays
+rsse/database/derived.py  archive -> typed tables
+tests/                    162 tests; tests/gold/ 5 gold plays
 ```
 
 **Raw layer built and loaded** (build step 2). 31,115,272 records from 2,646
@@ -126,7 +127,26 @@ That in turn led to reworking the force certainty scale — see
 situation* (derivable) from *was the out executed by a touch or a tag* (never
 recorded, in any era).
 
-Not yet built: query API, derived tables.
+**Derived tables built** (build step 5). `rsse derive` promotes the archive
+into the typed tables searches run against — `games`, `plays`,
+`runner_advances`, `fielding_credits`, `credit_sequences`, `tags`, `play_tags`
+— and the [06-QUERY §1](spec/06-QUERY.md) SQL runs against them. Measured on
+the full 2000 season: 222,509 plays, **567 bytes per play**, ~1.0 min/season,
+projecting to ~10.1 GB for the corpus. The full-corpus build has not been run.
+
+Building it found five defects in the layers below, the worst of which is that
+**every home run written with an explicit `B-H` advance scored one run too
+many** — a solo shot recorded as `HR/F7D+.B-H(UR)` scored two. Nothing had ever
+checked a run count: the out-accounting invariant cannot see runs, score
+reconciliation needs game logs we do not hold, and a unit test had asserted
+`runs_on_play == 3` on a play with one runner on base, which is arithmetically
+impossible. Adding the two run invariants of
+[03-STATE §3.1](spec/03-STATE.md) then found 91 more plays, all traced to
+`radj` not being the first record of its half-inning — so half the 2020+
+extra-inning half-innings had no placed runner at all.
+
+Not yet built: query API, and the §2 tables the motivating query does not need
+(`lineup_entries`, `players`, `teams`, `parks`, `comments`, `coverage`).
 
 ### Commands
 
@@ -136,6 +156,8 @@ python3 -m rsse.cli sweep --by-season --progress --report data/sweep-report.json
 python3 -m rsse.cli ingest --progress          # build the raw layer (~11 min)
 python3 -m rsse.cli verify                     # raw-layer integrity checks
 python3 -m rsse.cli replay --progress          # replay every game (~15 min)
+python3 -m rsse.cli derive --season 2000        # derived tables, one season (~1 min)
+python3 -m rsse.cli derive --progress          # full derived layer (~80 min, ~10 GB)
 python3 -m rsse.cli tags --seasons 12          # era-spread census (~20 min)
 python3 -m rsse.cli tags --progress            # full corpus; hours, and the real gate
 python3 -m unittest discover -s tests -t .
@@ -160,8 +182,10 @@ in [tests/known-source-defects.json](tests/known-source-defects.json).
 4. **Ontology** — *done, 84 tags.* Tags with derivation rules
    ([04-ONTOLOGY](spec/04-ONTOLOGY.md)), validated per tag by a positive and a
    negative case and corpus-wide by `rsse tags`.
-5. Derived tables ([05-DATABASE](spec/05-DATABASE.md) §3–4) and the query API
-   ([06-QUERY](spec/06-QUERY.md)). Then the motivating query.
+5. **Derived tables** ([05-DATABASE](spec/05-DATABASE.md) §2–4) — *done,
+   validated on a full season.* `rsse derive`, reading the archive rather than
+   the event files so a rebuild reproduces the ingested bytes.
+6. Query API ([06-QUERY](spec/06-QUERY.md)), then the motivating query.
 
 ## Licensing and attribution
 

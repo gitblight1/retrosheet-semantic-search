@@ -10,6 +10,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 
 from ..parser.parser import ParseError, ParsedEvent, parse
+from ..parser.grammar import NoPlay
 from ..parser.records import PlayRecord, Record
 from .state import (HalfInningState, ParseStatus, PlayContext, PlayOutcome,
                     Runner, apply_play)
@@ -24,6 +25,12 @@ class ReplayedPlay:
     event: str
     outcome: PlayOutcome | None
     error: str | None = None
+    #: Line in the source file, which is how a derived row finds the archive
+    #: record it came from.
+    line_no: int = 0
+    balls: int | None = None
+    strikes: int | None = None
+    pitches: str = ""
     #: Game context (§7). None for a play that could not be parsed.
     context: PlayContext | None = None
     #: The parse tree and its trivia. Retained so a consumer -- the tag
@@ -37,6 +44,13 @@ class GameReplay:
     game_id: str
     plays: list[ReplayedPlay] = field(default_factory=list)
     runs: dict[int, int] = field(default_factory=lambda: {0: 0, 1: 0})
+    #: From `info,innings`, present only from 2020 on. 518 games in the corpus
+    #: are scheduled for 7 innings, so defaulting to 9 misreports every one of
+    #: their 8th innings as regulation.
+    scheduled_innings: int = 9
+    #: From `info,htbf`. 51 games in the corpus; in them the home team bats in
+    #: the *top* half (§6.5).
+    home_bats_first: bool = False
     #: Half-innings that ended with other than three outs, and were not last.
     short_innings: list[tuple[int, int, int]] = field(default_factory=list)
     parse_errors: int = 0
@@ -56,12 +70,39 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
     current: tuple[int, int] | None = None
     pending_runners: list[tuple[str, str]] = []   # (runner_id, base) from radj
     after_ladj = False
+    #: Whether the current half-inning has had a play that changed state. A
+    #: `radj` arriving before that can be applied straight away; one arriving
+    #: before the boundary has to wait for it.
+    half_started = False
     seq = 0
     half_history: list[tuple[int, int, int]] = []   # inning, team, outs at close
 
     for rec in records:
+        if rec.type == "info" and len(rec.fields) >= 2:
+            # `info` records precede the plays, so one forward pass suffices.
+            if rec.fields[0] == "innings" and rec.fields[1].isdigit():
+                out.scheduled_innings = int(rec.fields[1])
+            elif rec.fields[0] == "htbf" and rec.fields[1].lower() == "true":
+                out.home_bats_first = True
+            continue
         if rec.type == "radj" and len(rec.fields) >= 2:
-            pending_runners.append((rec.fields[0], rec.fields[1]))
+            runner_id, base = rec.fields[0], rec.fields[1]
+            if current is not None and not half_started and base in state.bases:
+                # `radj` is *not* reliably the first record of the half-inning:
+                # it commonly follows the leading `NP`/`sub` block, so the
+                # boundary has already been crossed by the time it arrives.
+                #
+                #   play,10,0,biggc002,00,,NP     <- boundary here
+                #   radj,shawt001,2               <- runner declared only now
+                #   play,10,0,biggc002,31,...,W
+                #
+                # Deferring this to the *next* boundary left 2020+ extra
+                # innings with no placed runner at all, and then leaked him
+                # into the following half-inning. `NP` changes no state, so
+                # applying it here is exact rather than a nudge.
+                state.bases[base] = Runner(runner_id, placed=True)
+            else:
+                pending_runners.append((runner_id, base))
             continue
         if rec.type == "ladj":
             # The team batted out of order; the next plate appearance carries
@@ -87,15 +128,17 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
                     state.bases[base] = Runner(runner_id, placed=True)
             pending_runners.clear()
             current = half
+            half_started = False
 
         seq += 1
         try:
             parsed = parse(play.event)
         except ParseError as exc:
             out.parse_errors += 1
-            out.plays.append(ReplayedPlay(seq, play.inning, play.team,
-                                          play.batter_id, play.event, None,
-                                          exc.message))
+            out.plays.append(ReplayedPlay(
+                seq, play.inning, play.team, play.batter_id, play.event, None,
+                exc.message, line_no=play.line_no, balls=play.balls,
+                strikes=play.strikes, pitches=play.pitches))
             continue
 
         # Built before the play is applied: the context is the situation the
@@ -104,13 +147,22 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
         fielding_before = out.runs.get(1 - play.team, 0)
         placed = any(r is not None and r.placed for r in state.bases.values())
 
-        state, outcome = apply_play(state, parsed.event)
+        is_no_play = (len(parsed.event.basics) == 1
+                      and isinstance(parsed.event.basics[0], NoPlay))
+        state, outcome = apply_play(state, parsed.event,
+                                    batter_id=play.batter_id)
+        if not is_no_play:
+            half_started = True
         out.runs[play.team] = out.runs.get(play.team, 0) + outcome.runs_on_play
 
         context = PlayContext(
             inning=play.inning,
-            half=("bottom" if play.team == 1 else "top"),
+            # Keyed off the `team` field and the game's own `htbf`, never off an
+            # assumption that the visitor bats first (§6.5). In an `htbf` game
+            # team 1 -- the home team -- bats in the top half.
+            half=_half_for(play.team, out.home_bats_first),
             team=play.team,
+            scheduled_innings=out.scheduled_innings,
             score_batting_before=batting_before,
             score_fielding_before=fielding_before,
             is_go_ahead=(batting_before <= fielding_before
@@ -125,9 +177,10 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
             out.ambiguous += 1
         elif outcome.parse_status == ParseStatus.CONTRADICTS_RULES:
             out.contradicts_rules += 1
-        out.plays.append(ReplayedPlay(seq, play.inning, play.team,
-                                      play.batter_id, play.event, outcome,
-                                      context=context, parsed=parsed))
+        out.plays.append(ReplayedPlay(
+            seq, play.inning, play.team, play.batter_id, play.event, outcome,
+            line_no=play.line_no, balls=play.balls, strikes=play.strikes,
+            pitches=play.pitches, context=context, parsed=parsed))
 
     if current is not None:
         half_history.append((current[0], current[1], state.outs))
@@ -141,6 +194,16 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
 
     _stamp_final_play(out)
     return out
+
+
+def _half_for(team: int, home_bats_first: bool) -> str:
+    """Which half of the inning ``team`` bats in (§6.5).
+
+    Normally the visitor (team 0) bats in the top. `info,htbf,true` reverses
+    it, and 51 games in the corpus say so.
+    """
+    bats_first = 1 if home_bats_first else 0
+    return "top" if team == bats_first else "bottom"
 
 
 def _stamp_final_play(out: GameReplay) -> None:
