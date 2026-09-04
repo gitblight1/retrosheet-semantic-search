@@ -1,0 +1,17 @@
+{
+  "_comment": [
+    "Curated tags (spec/04-ONTOLOGY.md 8). Plays that are interesting for",
+    "reasons no grammar can see. Loaded into play_tags with source='curated',",
+    "never produced by the deriver and never overwritten by a re-derive.",
+    "",
+    "Every name here must already exist in the ontology: this file records",
+    "human judgement about which plays qualify, not about what the vocabulary",
+    "is. An unknown name is a load error, so a typo cannot invent a tag that",
+    "no query will ever match.",
+    "",
+    "Each entry carries a citation, because a curated tag is an assertion",
+    "someone has to be able to check."
+  ],
+  "version": "1",
+  "entries": []
+}

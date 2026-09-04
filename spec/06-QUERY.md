@@ -71,9 +71,10 @@ motivating play the two differ (2 before, 3 after).
 | `.uncaught_third_strike()` | tag `UncaughtThirdStrike` |
 | `.dropped_third()` | alias of the above |
 | `.batter_reached_on_k()` | tag `BatterReachedOnK` |
-| `.force_play(at=None, include_tag_outs=False)` | `EXISTS` a `runner_advances` row with `is_out=1` and `is_force=1`, optionally `destination = at`. With `include_tag_outs=True` the `is_force` condition is dropped, widening to any out at that base. |
+| `.force_play(at=None, include_tag_outs=False, certainty=None)` | `EXISTS` a `runner_advances` row with `is_out=1` and `is_force=1`, optionally `destination = at`. With `include_tag_outs=True` the `is_force` condition is dropped, widening to any out at that base. `certainty='derived'` narrows to force determinations a trajectory or modifier settled; the default admits `derived` and `likely` both. |
 | `.out_at(base)` | `EXISTS` a `runner_advances` row with `is_out=1` and `destination = base`, regardless of force status |
 | `.tag_out(at=None)` | `EXISTS` an out with `is_force=0` — the complement of `.force_play()` |
+| `.batter_ran(value)` | `plays.batter_ran`, one of `'yes'`, `'no'`, `'unknown'` ([03-STATE](03-STATE.md) §4.2) |
 | `.double_play()` / `.triple_play()` | tags |
 | `.stolen_base(base=None)` / `.caught_stealing(base=None)` | tags, optional base |
 | `.error(fielder=None)` | `fielding_credits.credit='error'`, optional position |
@@ -87,7 +88,7 @@ ambiguous in the original spec:
 
 | Method | Matches | SQL |
 |---|---|---|
-| `.putout_sequence([2,1])` | a credit sequence that **is** exactly 2 then 1 | `credit_sequences.seq_text = '21'` |
+| `.putout_sequence([2,1])` | one throw sequence that **is** exactly 2 then 1 | `credit_sequences.seq_text = '21'` |
 | `.contains_sequence([2,1])` | 2 then 1 contiguously **within** a longer sequence | `seq_text LIKE '%21%'` — unindexed, documented as slower |
 | `.putout_by(1, assist_by=[2])` | putout to the pitcher with an assist from the catcher, regardless of the rest | join on `fielding_credits` |
 
@@ -95,6 +96,14 @@ Scope defaults to **either** the basic section or an advance, since Retrosheet
 places the same physical play in different sections depending on where the out
 occurred — `K23` in the basic section, `K.3XH(21)` in an advance.
 `.putout_sequence([2,1], scope='advance')` narrows it.
+
+A sequence is **one throw sequence, not the whole play**
+([05-DATABASE](05-DATABASE.md) §3.1). A 6-4-3 double play is written `64(1)3`
+and holds two of them, `64` and `3`, so `.putout_sequence([6,4,3])` matches
+nothing — correctly, since no single throw sequence 6-4-3 occurred. Asking for
+the fielders who took part in a play is `.putout_by()` or a `fielding_credits`
+join; asking for a specific relay is `.putout_sequence()`. The motivating query
+wants the latter: `[2,1]` is one throw, catcher to pitcher.
 
 ### 3.2 Force and tag outs must both be expressible
 
@@ -111,6 +120,34 @@ query with and without it over the same population. A search API offering only
 with an `X` whose credit sequence contains an error is **not** an out
 ([02-GRAMMAR](02-GRAMMAR.md) §5). Predicates that match on the `X` as written
 over-count.
+
+### 3.3 Force certainty is a query parameter, not a filter applied for you
+
+`.force_play()` admits both `derived` and `likely` force determinations
+([03-STATE](03-STATE.md) §4.2 rule 5). This is deliberate and it is the one
+place where the "default queries return `certain` only" rule of §4 would give
+the wrong answer if applied naively: `likely` is how the pre-1970s corpus
+records an ordinary ground out, so a strict default would omit roughly half the
+force outs at first and report it as a smaller number rather than as missing
+coverage.
+
+`certainty='derived'` gives the strict population, and the two run together are
+the control pair that §3.2 argues for — the same reason `.tag_out()` exists
+alongside `.force_play()`. A `CoverageReport` on any force query states the
+`derived`/`likely` split, so a count is never quoted without it.
+
+A force query's `CoverageReport` MUST also state how many plays in the
+population have `batter_ran = 'unknown'`. Those plays claim no force and are
+**not** excluded from the query — the doubt is about the force, not about the
+play — so without the report a force count would quietly omit them. 2.97% of
+the corpus is `unknown`, and the rate is 7.70% in 1920 against 0.00% in 2020,
+which is exactly the shape of error that makes an era comparison wrong while
+looking fine.
+
+What no parameter can offer is a filter on whether the out was executed by
+touching the base or by tagging the runner. That is not recorded for any play
+([03-STATE](03-STATE.md) §4.2.1), and a predicate implying otherwise would be
+the most misleading thing in this API.
 
 The concrete use is in [08-WORKED-EXAMPLE](08-WORKED-EXAMPLE.md): the same
 plays, queried with `.force_play(at="H")` and with

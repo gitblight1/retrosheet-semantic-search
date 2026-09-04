@@ -417,6 +417,145 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0 if bad_games == 0 else 1
 
 
+def cmd_tags(args: argparse.Namespace) -> int:
+    """Derive tags over the corpus and report a census (spec/04-ONTOLOGY.md).
+
+    Unit tests prove each rule fires on the play it was written for. They
+    cannot show that a rule fires on the *right number* of plays, and the
+    project has already learned that lesson twice: the seven state-machine
+    bugs were all invisible to tests written from the documentation, and the
+    undocumented `U` modifier exists in four seasons out of 118.
+
+    So this is the ontology's corpus-wide gate. Two findings fail it:
+
+    * **A derivable tag that never fires.** Either the rule is wrong or the
+      encoding does not exist; both need to be known, and neither shows up in
+      a suite of positives.
+    * **A tag that fires on everything.** A rule matching most of the corpus
+      is not selecting anything, whatever its name says.
+
+    Era coverage beats volume here for the same reason it did for the grammar,
+    so `--seasons` samples across the range rather than taking a prefix.
+    """
+    from .semantic import ontology as O
+    from .semantic.derive import derive
+
+    root = Path(args.path) if args.path else EVENTS
+    files = _event_files(root)
+    if args.seasons:
+        # Spread the sample across the corpus: a tag confined to four seasons
+        # is invisible to any prefix, however many plays it contains.
+        by_season: dict[str, list[Path]] = collections.defaultdict(list)
+        for path in files:
+            by_season[path.parent.name].append(path)
+        seasons = sorted(by_season)
+        # Span the range end to end. A `[::step]` slice silently drops the
+        # tail -- 12 of 118 seasons steps by 9 and stops at 2007, missing
+        # replay review (2014+) and placed runners (2020+) entirely, and then
+        # reports their tags as "never fired". The newest seasons are where
+        # the newest encodings are, so the last season is not optional.
+        if args.seasons >= len(seasons):
+            picked = seasons
+        elif args.seasons == 1:
+            picked = seasons[-1:]
+        else:
+            last = len(seasons) - 1
+            picked = sorted({seasons[round(i * last / (args.seasons - 1))]
+                             for i in range(args.seasons)})
+        files = [f for s in picked for f in by_season[s]]
+        if args.progress:
+            print(f"sampling {len(picked)} seasons: {', '.join(picked)}",
+                  file=sys.stderr)
+    if args.limit:
+        files = files[: args.limit]
+    if not files:
+        print(f"no event files under {root}", file=sys.stderr)
+        return 2
+
+    counts: collections.Counter[str] = collections.Counter()
+    uncertain: collections.Counter[str] = collections.Counter()
+    first_seen: dict[str, str] = {}
+    seasons_with: dict[str, set[str]] = collections.defaultdict(set)
+    games = plays = tagged = skipped = 0
+    seasons_seen: set[str] = set()
+
+    for path in files:
+        season = path.parent.name
+        if args.progress and season not in seasons_seen:
+            seasons_seen.add(season)
+            print(f"  {season} ...", file=sys.stderr, flush=True)
+        for game_id, records in _games_in(path):
+            games += 1
+            replay = replay_game(records, game_id)
+            for play in replay.plays:
+                plays += 1
+                if play.outcome is None:
+                    skipped += 1
+                    continue
+                tags = derive(play.parsed.event, play.outcome, play.context,
+                              play.parsed.trivia)
+                tagged += 1
+                for tag in tags:
+                    counts[tag.name] += 1
+                    if tag.confidence != "certain":
+                        uncertain[tag.name] += 1
+                    seasons_with[tag.name].add(season)
+                    first_seen.setdefault(
+                        tag.name, f"{game_id} {play.inning} {play.event}")
+
+    print(f"ontology version     {O.ONTOLOGY_VERSION}  ({O.ontology_hash()})")
+    print(f"registered tags      {len(O.REGISTRY)}")
+    print(f"games                {games:,}")
+    print(f"plays                {plays:,}")
+    print(f"plays tagged         {tagged:,}")
+    print(f"plays skipped        {skipped:,}   (unparsed)")
+    print(f"tag rows             {sum(counts.values()):,}")
+    print(f"  uncertain          {sum(uncertain.values()):,}")
+
+    print("\ntag census, by category:")
+    for category, tag_names in O.categories().items():
+        print(f"\n  {category}")
+        for name in tag_names:
+            n = counts[name]
+            share = 100 * n / max(tagged, 1)
+            unc = uncertain[name]
+            note = f"  {unc:,} uncertain" if unc else ""
+            print(f"    {name:28} {n:11,}  {share:6.2f}%  "
+                  f"{len(seasons_with[name]):3d} seasons{note}")
+
+    silent = [td.name for td in O.derivable() if not counts[td.name]]
+    saturated = [n for n, c in counts.items() if c > 0.90 * max(tagged, 1)]
+
+    if silent:
+        print(f"\nnever fired ({len(silent)}):")
+        for name in sorted(silent):
+            print(f"  {name:28} {O.REGISTRY[name].spec}")
+    if saturated:
+        print(f"\nfired on over 90% of plays ({len(saturated)}) -- "
+              "a rule this broad selects nothing:")
+        for name in sorted(saturated):
+            print(f"  {name:28} {100 * counts[name] / max(tagged, 1):.2f}%")
+
+    if args.report:
+        Path(args.report).write_text(json.dumps({
+            "ontology_version": O.ONTOLOGY_VERSION,
+            "ontology_hash": O.ontology_hash(),
+            "games": games, "plays": plays, "tagged": tagged,
+            "skipped": skipped,
+            "tags": {name: {"count": counts[name],
+                            "uncertain": uncertain[name],
+                            "seasons": len(seasons_with[name]),
+                            "first_seen": first_seen.get(name),
+                            "rule_hash": O.REGISTRY[name].rule_hash}
+                     for name in sorted(O.REGISTRY)},
+            "never_fired": sorted(silent),
+        }, indent=2))
+        print(f"\nreport written to {args.report}")
+
+    print(f"\n{ATTRIBUTION}")
+    return 0 if not silent else 1
+
+
 def _games_in(path: Path):
     """Yield (game_id, records) for each game in an event file."""
     from .parser.records import read_records
@@ -471,6 +610,18 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--progress", action="store_true")
     r.add_argument("--report", help="write failing games to this JSON path")
     r.set_defaults(func=cmd_replay)
+
+    t = sub.add_parser("tags", help="derive tags over the corpus and "
+                                    "report a census")
+    t.add_argument("--path")
+    t.add_argument("--limit", type=int, help="first N event files")
+    t.add_argument("--seasons", type=int,
+                   help="sample N seasons spread across the corpus, rather "
+                        "than a prefix: a tag confined to a few seasons is "
+                        "invisible to any prefix")
+    t.add_argument("--progress", action="store_true")
+    t.add_argument("--report", help="write a JSON census to this path")
+    t.set_defaults(func=cmd_tags)
 
     v = sub.add_parser("verify", help="check raw-layer integrity")
     v.add_argument("--archive")

@@ -25,6 +25,12 @@ Normative, in reading order:
 | [07-TESTING](spec/07-TESTING.md) | Gold corpus format and corpus-wide gates |
 | [08-WORKED-EXAMPLE](spec/08-WORKED-EXAMPLE.md) | The motivating play through every layer |
 
+Two documents the original discussion called for are **not** in the set: a
+roadmap, and a record of the future extensions and non-goals it listed
+(Statcast and Baseball Savant integration, WPA/RE24, custom ontologies; and the
+non-goals bounding the project). Those are scope commitments rather than
+build contracts, and they currently live only in the untracked build log.
+
 The specs are the contract: they are written to be built from without
 consulting anything else, and `spec/02-GRAMMAR.md` is validated against the
 corpus rather than against Retrosheet's documentation alone.
@@ -59,9 +65,11 @@ rsse/util/download.py     corpus acquisition, throttled
 rsse/cli.py               rsse fetch | rsse sweep
 rsse/database/schema.py   archive + query DDL
 rsse/database/load.py     ingest, provenance, round-trip gate
-rsse/model/state.py       half-inning state, force derivation
-rsse/model/game.py        whole-game replay
-tests/                    85 tests; tests/gold/ 4 gold plays
+rsse/model/state.py       half-inning state, force derivation, credits
+rsse/model/game.py        whole-game replay, per-play context
+rsse/semantic/ontology.py 84 tags, one derivation rule each
+rsse/semantic/derive.py   implication, confidence, curated tags
+tests/                    146 tests; tests/gold/ 5 gold plays
 ```
 
 **Raw layer built and loaded** (build step 2). 31,115,272 records from 2,646
@@ -79,7 +87,46 @@ explained by a known source defect. Seven bugs the invariant caught, and the
 six pre-1947 plays that contradict the rulebook, are written up in
 [03-STATE §8](spec/03-STATE.md).
 
-Not yet built: ontology, query API, derived tables.
+**Ontology built** (build step 4). 84 tags, each with a derivation rule over
+the parse tree and the replayed state, in
+[rsse/semantic/](rsse/semantic/). A tag exists only as a registered rule, so a
+name cannot be added without a derivation; a tag added without both a positive
+**and** a negative test case fails the suite. `rsse tags` derives the corpus
+and reports a census, failing on any tag that never fires.
+
+Building it found two defects in the layers below, both on the project's own
+motivating play and both invisible to every corpus-wide invariant, because no
+play of that shape occurs in 1908–2025:
+
+- the out-count inference of [03-STATE §4.5](spec/03-STATE.md) was never
+  implemented, so the bare form `K.3XH(21)` totalled four outs and came back
+  tagged `TagOut` where its equivalents were tagged `ForceOut`;
+- the batter's own out at first — the commonest force play in baseball — was
+  producing no runner-advance row at all.
+
+Both were caught by the gold corpus's `equivalents` assertion
+([07-TESTING §2.1](spec/07-TESTING.md)), from an entry for a game that has not
+been released yet.
+
+The corpus census over a 12-season era-spread sample (1908–2025, 20,796 games,
+1,821,286 plays): 7,050,409 tag rows, 0 plays skipped, 0.9% uncertain, no tag
+firing on more than 54% of plays.
+
+Running it found a **parser** bug three layers down. `G`, `F`, `L`, `P`, `BG`,
+`BP` and `BL` were classified as no-argument modifier codes, so `/G6` parsed as
+a trajectory and bare `/G` did not — and every consumer reading
+`Modifier.trajectory` missed the bare form. `LineOut` had been under-firing by
+**145%**, `GroundOut` by 51%, and the force derivation was falling back on its
+one inference across a third of the corpus. The round-trip gate passes either
+way, since a bare `G` emits as `G` from either node type: it proves nothing was
+discarded, not that anything was filed correctly.
+
+That in turn led to reworking the force certainty scale — see
+[03-STATE §4.2](spec/03-STATE.md), which now separates *was there a force
+situation* (derivable) from *was the out executed by a touch or a tag* (never
+recorded, in any era).
+
+Not yet built: query API, derived tables.
 
 ### Commands
 
@@ -89,6 +136,8 @@ python3 -m rsse.cli sweep --by-season --progress --report data/sweep-report.json
 python3 -m rsse.cli ingest --progress          # build the raw layer (~11 min)
 python3 -m rsse.cli verify                     # raw-layer integrity checks
 python3 -m rsse.cli replay --progress          # replay every game (~15 min)
+python3 -m rsse.cli tags --seasons 12          # era-spread census (~20 min)
+python3 -m rsse.cli tags --progress            # full corpus; hours, and the real gate
 python3 -m unittest discover -s tests -t .
 ```
 
@@ -101,12 +150,18 @@ in [tests/known-source-defects.json](tests/known-source-defects.json).
    every event string before writing any semantic code. Gaps are cheap to fix
    in the parser and expensive once the ontology depends on it; the sweep found
    twelve.
-2. Raw layer and round-trip gate ([02-GRAMMAR](spec/02-GRAMMAR.md) §6) — the
-   gate is implemented and green; the persisted raw layer is not built.
-3. State machine, checked against final scores and `data,er`
-   ([07-TESTING](spec/07-TESTING.md) §4) — the strongest available signal that
-   the replay is right.
-4. Ontology, database, query API.
+2. **Raw layer and round-trip gate** ([02-GRAMMAR](spec/02-GRAMMAR.md) §6) —
+   *done.* 31,115,272 records, byte-exact, 0 round-trip failures over the whole
+   corpus on every run.
+3. **State machine**, checked against the out-accounting invariant — *done,
+   0 state-inconsistent plays.* Final-score and `data,er` reconciliation
+   ([07-TESTING](spec/07-TESTING.md) §4) is the stronger check and still needs
+   Retrosheet's game logs, which are a separate download.
+4. **Ontology** — *done, 84 tags.* Tags with derivation rules
+   ([04-ONTOLOGY](spec/04-ONTOLOGY.md)), validated per tag by a positive and a
+   negative case and corpus-wide by `rsse tags`.
+5. Derived tables ([05-DATABASE](spec/05-DATABASE.md) §3–4) and the query API
+   ([06-QUERY](spec/06-QUERY.md)). Then the motivating query.
 
 ## Licensing and attribution
 

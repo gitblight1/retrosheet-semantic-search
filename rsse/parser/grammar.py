@@ -24,9 +24,22 @@ ADV_FLAG_STOLEN_BASE = tuple(f"SB{b}" for b in "123H")
 #: `BF` and `S` are absent from Retrosheet's published list but occur in the
 #: corpus, always on a strikeout: `BF` a foul bunt, `S` a swinging third strike
 #: (the complement of the documented `C`). See spec/02-GRAMMAR.md §4.1.
+#:
+#: **Trajectories are deliberately not here.** `G`, `F`, `L`, `P`, `BG`, `BP`
+#: and `BL` look like no-argument codes when they appear bare, but the EBNF
+#: production is `trajectory [ location ]` -- the location is *optional*, and
+#: `/G` and `/G6` state the same fact. Listing them here matched the bare form
+#: as a named code and only the located form as a trajectory, so every
+#: consumer reading `Modifier.trajectory` silently missed `/G`: ground outs
+#: went untagged and the force derivation fell back on its one inference
+#: (spec/03-STATE.md §4.2 rule 5) on a third of the corpus.
+#:
+#: The longer codes that *start* with a trajectory letter -- `FL`, `FO`, `FDP`,
+#: `GDP`, `GTP`, `LDP`, `LTP`, `PASS`, `BGDP`, `BPDP` -- must stay, and are
+#: matched here before the trajectory production is tried.
 NAMED_MODIFIERS = frozenset(
-    """AP BF BG BGDP BINT BL BOOT BP BPDP BR C COUB COUF COUR DP F FDP FINT FL
-    FO G GDP GTP IF INT IPHR L LDP LTP MREV NDP OBS P PASS RINT S SF SH TP UINT
+    """AP BF BGDP BINT BOOT BPDP BR C COUB COUF COUR DP FDP FINT FL
+    FO GDP GTP IF INT IPHR LDP LTP MREV NDP OBS PASS RINT S SF SH TP UINT
     UREV""".split()
 )
 

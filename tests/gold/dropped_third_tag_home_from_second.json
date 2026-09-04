@@ -1,0 +1,55 @@
+{
+  "name": "dropped_third_tag_home_from_second",
+  "description": "Runner on second only, one out. Uncaught third strike; the batter reaches first and the runner from second tries for home and is retired 2-1. First base was empty, so nothing behind the runner was occupied and the out is a TAG -- the same putout sequence, the same base, the same uncaught third strike as the motivating play, and the opposite answer.",
+  "source": {
+    "citation": "constructed",
+    "note": "Defeats a force chain that ignores whether the bases behind the runner are occupied. Required by spec/07-TESTING.md 2.2.",
+    "status": "CONSTRUCTED -- not observed. The event string and the derivation are the assertion; no game is claimed. To be replaced when a real instance is located."
+  },
+  "input": {
+    "subject": "K.2XH(21);B-1",
+    "state_before": {
+      "inning": 5, "half": "top", "outs": 1,
+      "bases": {"1": null, "2": "runner_b", "3": null}
+    }
+  },
+  "expected_parse": {
+    "basic": [{"type": "Strikeout", "groups": []}],
+    "modifiers": [],
+    "advances": [
+      {"origin": "2", "dest": "H", "marked_out": true, "is_out": true,
+       "credits": [{"fielder": "2", "is_error": false},
+                   {"fielder": "1", "is_error": false}]},
+      {"origin": "B", "dest": "1", "marked_out": false, "is_out": false,
+       "credits": []}
+    ],
+    "trivia": []
+  },
+  "expected_state": {
+    "batter_dest": "1",
+    "batter_is_out": false,
+    "outs_recorded": 1,
+    "outs_after": 2,
+    "runs_on_play": 0,
+    "advances": [
+      {"origin": "2", "dest": "H", "is_out": true, "is_force": false}
+    ]
+  },
+  "expected_tags": [
+    "Strikeout", "UncaughtThirdStrike", "BatterReachedOnK", "TagOut",
+    "OneOut", "ScoringPosition"
+  ],
+  "forbidden_tags": [
+    "ForceOut", "ForceOutAtHome", "ForceOutAtSecond", "BasesLoaded",
+    "InningEnding", "DoublePlay"
+  ],
+  "expected_sql_fields": {
+    "bases_before": "010", "outs_before": 1, "outs_after": 2,
+    "is_inning_ending": 0
+  },
+  "roundtrip": "K.2XH(21);B-1",
+  "notes": [
+    "The batter-runner is live, so first base is forced -- but there is no runner on first to force, and the runner on second has an empty base behind him. forced_bases({2}, live) is {1}, and the runner from second is not in it.",
+    "BatterReachedOnK fires here and not in strikeout_tag_home_2000: the difference is whether first base was occupied, which is what the rulebook keys the uncaught-third-strike rule on."
+  ]
+}

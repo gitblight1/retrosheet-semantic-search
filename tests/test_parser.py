@@ -221,3 +221,63 @@ class Failure(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BareTrajectoryModifiers(unittest.TestCase):
+    """A trajectory is a trajectory with or without a location (§4).
+
+    Regression: `G`, `F`, `L`, `P`, `BG`, `BP` and `BL` were in
+    NAMED_MODIFIERS, so `/G6` parsed as a trajectory and bare `/G` parsed as a
+    named code -- the same fact in two node types. Every consumer reading
+    `Modifier.trajectory` missed the bare form.
+
+    The round-trip gate cannot catch this: a bare `G` emits as `G` from either
+    node type, so all 17.9M plays round-tripped before the fix and after. These
+    assertions are on the *classification*, which is what round-tripping does
+    not test.
+    """
+
+    def modifier(self, event):
+        mods = parse(event).event.modifiers
+        self.assertEqual(len(mods), 1, event)
+        return mods[0]
+
+    def test_bare_trajectory_is_a_trajectory(self):
+        for event, trajectory in (("63/G", "G"), ("8/F", "F"), ("7/L", "L"),
+                                  ("3/P", "P"), ("13/BG", "BG"),
+                                  ("13/BP", "BP"), ("13/BL", "BL"),
+                                  ("13/B", "B")):
+            with self.subTest(event=event):
+                mod = self.modifier(event)
+                self.assertEqual(mod.kind, "hit")
+                self.assertEqual(mod.trajectory, trajectory)
+                self.assertIsNone(mod.location)
+
+    def test_located_trajectory_agrees_with_the_bare_form(self):
+        """`/G` and `/G6` must differ only in the location."""
+        for bare, located, location in (("63/G", "63/G6", "6"),
+                                        ("8/F", "8/F78", "78"),
+                                        ("13/B", "13/B1", "1")):
+            with self.subTest(event=located):
+                a, b = self.modifier(bare), self.modifier(located)
+                self.assertEqual(a.kind, b.kind)
+                self.assertEqual(a.trajectory, b.trajectory)
+                self.assertEqual(b.location, location)
+
+    def test_longer_codes_starting_with_a_trajectory_stay_named(self):
+        """`GDP` must not parse as a ground ball to a location `DP`."""
+        for event, code in (("S7/FL", "FL"), ("8/FDP", "FDP"),
+                            ("63/GDP", "GDP"), ("63/GTP", "GTP"),
+                            ("7/LDP", "LDP"), ("7/LTP", "LTP"),
+                            ("8/PASS", "PASS"), ("13/BGDP", "BGDP"),
+                            ("13/BPDP", "BPDP")):
+            with self.subTest(event=event):
+                mod = self.modifier(event)
+                self.assertEqual(mod.kind, "named")
+                self.assertEqual(mod.code, code)
+
+    def test_bare_trajectory_round_trips(self):
+        """True before the fix too -- which is the point of the class above."""
+        for event in ("63/G", "8/F", "7/L", "3/P", "13/BG", "63/GDP", "S7/FL"):
+            with self.subTest(event=event):
+                self.assertEqual(parse(event).emit(), event)

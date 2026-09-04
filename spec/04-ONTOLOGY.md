@@ -7,6 +7,18 @@ gives each one a **derivation rule** over the parse tree
 A tag without a derivation rule is not part of the ontology. That is the whole
 point of this layer: `.dropped_third()` cannot be implemented from a name.
 
+**Status: built.** 84 tags, in
+[rsse/semantic/ontology.py](../rsse/semantic/ontology.py) (the rules) and
+[derive.py](../rsse/semantic/derive.py) (implication, confidence, curated
+tags). The rule requiring a rule is enforced structurally: a tag exists only
+as a registered `TagDef`, and a `TagDef` cannot be constructed without a
+callable, so a name alone cannot be registered. `rsse tags` derives the whole
+corpus and reports a census, which is the ontology's corpus-wide gate; the
+per-tag positive **and negative** cases required by
+[07-TESTING](07-TESTING.md) §1 are in
+[tests/test_ontology.py](../tests/test_ontology.py) and a tag added without
+both fails the suite.
+
 ## 1. Rules for tags
 
 1. **Total and deterministic.** Same inputs, same tags, always.
@@ -19,6 +31,35 @@ point of this layer: `.dropped_third()` cannot be implemented from a name.
    from a stated ambiguity — `force_certainty = 'ambiguous'`
    ([03-STATE](03-STATE.md) §4.4), a `#` annotation, or a `99` unknown play.
    Default queries return `certain` only.
+
+   A `#` or a `99` makes every tag *about that play* uncertain: Retrosheet is
+   saying the record itself is questionable, which is not a statement about one
+   reading of it.
+
+   It does **not** reach the context tags of §7 that describe the state
+   entering the play — `BasesLoaded`, `TwoOuts`, `RunnerOnThird`,
+   `ScoringPosition`, `ExtraInnings`, `LateAndClose`, `FinalPlay`. Earlier
+   plays established that state; a questionable record of what the batter then
+   did says nothing about it. `InningEnding`, `GoAheadRun` and `WalkOff` *are*
+   affected, because they depend on this play's own outcome. Applying
+   play-wide uncertainty to all of them marked ~35,000 `BasesEmpty` tags
+   uncertain in a 12-season sample, every one of them for no reason, and
+   `uncertain` tags are excluded from default results
+   ([06-QUERY](06-QUERY.md) §4).
+
+   Tag confidence is deliberately **binary**, so the four-valued
+   `runner_advances.force_certainty` ([05-DATABASE](05-DATABASE.md) §3) does
+   not map onto it one-for-one: `derived` and `likely` are both `certain` here,
+   and only `ambiguous` is `uncertain`. `likely` is how the pre-1970s corpus
+   records an ordinary ground out ([03-STATE](03-STATE.md) §4.2 rule 5), so
+   calling it `uncertain` would drop about half the force outs at first out of
+   default results. A query that needs the strict population reads the column.
+
+   `force_certainty` is narrower still, and applies only to the force family
+   and `TagOut`: a tag there is uncertain only when it actually
+   *turns* on the one inference in the chain ([03-STATE](03-STATE.md) §4.2
+   rule 5). A runner with an empty base behind them is unforced however the
+   batter was retired, so that `TagOut` is `certain`.
 5. **Additive.** A play carries every tag whose rule fires. Tags are not
    mutually exclusive.
 
@@ -39,8 +80,15 @@ point of this layer: `.dropped_third()` cannot be implemented from a name.
 | `SacrificeFly` | `/SF` |
 | `SacrificeHit` | `/SH` |
 | `GroundOut` / `FlyOut` / `LineOut` / `PopOut` | out on ball with `/G` / `/F` / `/L` / `/P` |
-| `Bunt` | trajectory `BG`, `BP`, or `BL` |
+| `Bunt` | trajectory `BG`, `BP`, `BL`, or plain `B` |
 | `InfieldFly` | `/IF` |
+
+`Bunt` includes the undocumented plain `/B`
+([02-GRAMMAR](02-GRAMMAR.md) §4.1), which was omitted from the first draft of
+this table. It generalises `BG`/`BP`/`BL` and is the *only* bunt marker across
+much of the pre-1961 corpus, so excluding it would have made `Bunt` silently
+under-fire on the older half of the data — the same era-coverage failure the
+grammar validation ran into.
 
 ## 3. Strikeout family
 
@@ -58,7 +106,7 @@ is `K` and any of:
 |---|---|---|
 | a | fielder digits follow the `K` | `K23`, `K13` |
 | b | compounded with `WP`, `PB`, or `E$` | `K+WP`, `K+PB`, `K+E2` |
-| c | an explicit `B-%` advance exists | `K.B-1` |
+| c | the batter-runner is live per [03-STATE](03-STATE.md) §2 | `K.B-1`, `K.3XH(21)` |
 | d | an advance carries a `(WP)` or `(PB)` parameter | `K.1-2(WP)` |
 
 `BatterReachedOnK` — `UncaughtThirdStrike` **and** the batter-runner is live per
@@ -77,6 +125,23 @@ The distinction matters and is the reason two tags exist rather than one:
 `DroppedThirdStrike` is retained as a deprecated alias of
 `UncaughtThirdStrike`; the builder method `.dropped_third()` maps to it. New
 code uses the precise names.
+
+**Trigger (c) is keyed on the derived state, not on the written form.** The
+first draft of this table read "an explicit `B-%` advance exists", and that is
+wrong for the one play this project exists to find. `K.3XH(21)` — the bare form
+of the motivating play — gives the batter no advance at all; that he reached is
+derived from the out count ([03-STATE](03-STATE.md) §4.5 step 1). Keyed on the
+written form, the three encodings of that single play carry *different* tag
+sets, and a researcher asking the question would find one and miss two. The
+gold corpus's `equivalents` list ([07-TESTING](07-TESTING.md) §2.1) exists
+precisely to catch this, and it did.
+
+This is **not** the widening §3.1.1 forbids. A live batter-runner on a
+strikeout is the rulebook's own definition of an uncaught third strike — on a
+caught third strike the batter is out, with no exception — so the tag still
+asserts only what the record supports. §3.1.1 forbids inferring the *miscue*
+from the shape of the fielding; this infers nothing, it reads a state the
+state machine already determined by arithmetic.
 
 ### 3.1.1 When an uncaught third strike is not recoverable
 
@@ -116,15 +181,22 @@ event string cannot.
 
 | Tag | Rule |
 |---|---|
-| `StrikeoutDoublePlay` | `Strikeout` with `/DP` or two outs on the play |
+| `StrikeoutDoublePlay` | `Strikeout` with `/DP` or two outs on the play — **unless `/NDP` is present** |
 | `CalledThirdStrike` | `/C` modifier |
 | `StrikeoutThrowOut` | `Strikeout` and a runner retired in the advance section |
+
+The `/NDP` exception applies here for the same reason it applies to
+`DoublePlay` (§5), and was missing from the first draft of this table. `/NDP`
+states that no double play was credited, and it appears precisely *because*
+two outs were recorded — so a rule keyed on the out count needs the exception
+wherever it counts outs, not only in one of the two places. `K/NDP.3XH(21)`
+records two outs and is neither a double play nor a strikeout double play.
 
 ## 4. Base running
 
 | Tag | Rule |
 |---|---|
-| `StolenBase` | basic event `SB%`; one tag per steal in a `SB3;SB2` list |
+| `StolenBase` | basic event `SB%` |
 | `DoubleSteal` | two or more `SB` in one play |
 | `CaughtStealing` | `CS%` **with the out not negated** by an `E` in the credit sequence |
 | `CaughtStealingSafeOnError` | `CS%` whose credit sequence contains `E` (e.g. `CS2(2E4)`) |
@@ -139,6 +211,13 @@ event string cannot.
 | `RunnerPassedRunner` | `/PASS` |
 | `RunnerHitByBattedBall` | `/BR` |
 
+**One `StolenBase` per play, not per steal.** The first draft said "one tag per
+steal in a `SB3;SB2` list", which `play_tags` cannot represent: its primary key
+is `(play_id, tag_id)` ([05-DATABASE](05-DATABASE.md) §4), so a play either
+carries a tag or does not. `SB3;SB2` is one `StolenBase` plus `DoubleSteal`,
+and *which* bases were taken is a `runner_advances` question — the right place
+for it, since that table is per movement by construction.
+
 ## 5. Outs and force plays
 
 | Tag | Rule |
@@ -149,7 +228,7 @@ event string cannot.
 | `TagOut` | an out that is not a `ForceOut` and not a strikeout or caught fly |
 | `AppealOut` | `/AP` |
 | `DoublePlay` | two outs on the play, or `/DP` `/GDP` `/LDP` `/FDP` `/BGDP` `/BPDP` — **unless `/NDP` is present**, which suppresses it |
-| `TriplePlay` | three outs on the play, or `/TP` `/GTP` `/LTP` |
+| `TriplePlay` | three outs on the play, or `/TP` `/GTP` `/LTP`; also implies `DoublePlay` |
 | `UnassistedOut` | a putout with an empty assist list |
 | `Rundown` | three or more credit atoms with at least one fielder repeated |
 | `RelayThrow` | `/R$` modifier |
@@ -157,6 +236,27 @@ event string cannot.
 `ForceOut` deliberately does **not** key on the `/FO` modifier. `/FO` marks only
 batted-ball force outs; a rule keyed on it misses `K.3XH(21)` entirely, which is
 the play that motivated this project.
+
+A `TriplePlay` is also a `DoublePlay`, since three outs satisfies "two outs on
+the play". That follows from the rule rather than being an exception to it, and
+is stated as an implication so it is visible instead of emergent from an
+inequality. A query wanting double plays and not triple plays writes
+`.double_play().none_of(triple_play=True)`.
+
+`UnassistedOut` means literally what it says — a putout with an empty assist
+list — so it fires on every caught fly ball as well as on the unassisted double
+play. That is correct and is not the same as useful: the interesting queries
+pair it with `DoublePlay` or `TriplePlay`. The same is true of
+`ForceOutAtFirst`, which fires on most ground outs, because the batter-runner
+is always forced at first (§4.1). Neither is selective on its own, and neither
+should be made selective by narrowing its rule — selectivity is the query's
+job, and a tag that quietly excluded the common case would make
+`.force_play()` disagree with §4.1.
+
+Recording the batter's own out at first as a runner advance is what lets
+`ForceOutAtFirst` and `runner_advances` see the commonest force play in
+baseball; before this layer was built, the state machine emitted no advance row
+for it at all ([03-STATE](03-STATE.md) §3).
 
 ## 6. Special
 
@@ -197,15 +297,114 @@ context is a tag join like any other predicate:
 `WalkOff` composes: a walk-off sacrifice fly is `WalkOff` + `SacrificeFly`, not
 a separate tag. Composition is why tags are additive.
 
+Two of these needed definitions the earlier specs did not give:
+
+| Tag | Rule |
+|---|---|
+| `ExtraInnings` | `inning > games.scheduled_innings` (9 unless stated) |
+| `LateAndClose` | `inning >= 7` **and** the batting team is tied, ahead by one, or trailing by no more than `runners_on + 1` — that is, the tying run is on base or at the plate |
+
+`LateAndClose` was a name with no rule, and "close" has no single conventional
+meaning, so the rule above **is** the definition rather than an approximation
+of one. It is stated here so a result can be audited instead of guessed at; if
+it is the wrong definition, that is a version bump, not a mystery.
+
+`WalkOff` is stamped in a second pass, since it needs to know the game ended.
+Once the final play is known a walk-off is just a go-ahead run on it: the team
+batting on the last play is by definition the team that bats last, so no test
+on the half is made — and none may be, because the home team bats in the *top*
+half of an `htbf` game ([03-STATE](03-STATE.md) §6.5).
+
 ## 8. Curated tags
 
 Some plays are interesting for reasons no grammar can see — a hidden ball trick,
 the pine tar game, an unassisted triple play whose significance is historical.
 
-Curated tags live in a version-controlled file keyed by `(game_id, play_seq)`,
-are loaded into the same `play_tags` table with `source = 'curated'`, and are
+Curated tags live in a version-controlled file keyed by `(game_id, play_seq)` —
+[rsse/semantic/curated_tags.json](../rsse/semantic/curated_tags.json) — are
+loaded into the same `play_tags` table with `source = 'curated'`, and are
 distinguishable from derived tags in every result. They are never produced by
 the deriver and are never overwritten by a re-derive.
 
+Every name in that file **must already be a registered tag**, and the loader
+raises if it is not. §8 quarantines human judgement about *which plays
+qualify*, not about what the vocabulary is: without the check, a typo would
+invent a tag silently and no query would ever match it. Each entry also carries
+a citation, because a curated tag is an assertion someone has to be able to
+check.
+
+A tag that no rule can derive is registered with `curated_only`, so it has a
+name to attach to and a test asserting the deriver never produces it.
+`HiddenBallTrick` is the one such tag today.
+
+`rsse.semantic.derive.tags_for_play()` is what a `play_tags` load writes, and
+it exists so this section's two guarantees are executable rather than
+described. A curated tag survives a re-derive because derivation is a pure
+function of the play — re-running it can only reproduce the derived set, and
+the curated entries are merged in afterwards from the file.
+
+**On a collision, the curated row wins.** `play_tags` is keyed
+`(play_id, tag_id)` and holds one row, so a name that is both derived and
+curated must resolve one way. It resolves to the curated one, because the
+collision is not a mistake: §3.1.1 names it as the intended escape hatch. The
+2000 record is an uncaught third strike the event string cannot show, so a
+curator may assert `UncaughtThirdStrike` there. Letting the derived row win
+would silently discard exactly the judgement this section exists to preserve.
+
+**The shipped file is empty**, and that is a content gap rather than a
+mechanism gap. Every entry must carry a citation, and no curated play has been
+researched to that standard yet — `hidden_ball_trick`
+([07-TESTING](07-TESTING.md) §2.3) is the obvious first one and needs a game id
+and a `com` record to cite. The path itself is exercised by tests.
+
 This keeps principle 2.2 intact: the parser stays free of heuristics, and human
 judgement is quarantined in a place where it can be reviewed.
+
+## 9. Vocabulary reconciliation
+
+The original discussion listed tag names before any of them had rules. Six were
+renamed once they did, and two turned out not to be tags at all. The mapping is
+recorded because the discussion is the document of record and its vocabulary
+has to remain traceable:
+
+| Original name | Now | Why |
+|---|---|---|
+| `Steal` | `StolenBase` | matches the `SB` event and the `.stolen_base()` predicate |
+| `AdvanceOnWildPitch` | `WildPitch` | the tag marks the *pitch*, which is what Retrosheet records; whether anyone advanced is a `runner_advances` question, and `WP` occurs with no advance at all |
+| `AdvanceOnPassedBall` | `PassedBall` | as above |
+| `Unassisted` | `UnassistedOut` | it qualifies an out, and the bare adjective read as a property of the play |
+| `ForcePlay` | `ForceOut` | a force *play* is the situation; the tag marks an out. The query method stays `.force_play()`, which reads better in a predicate chain |
+| `DroppedThirdStrike` | `UncaughtThirdStrike` | "dropped" names one way the ball can get away; `K23` and `K+WP` are not drops. Kept as a live deprecated alias (§3.1), unlike the five above, because [06-QUERY](06-QUERY.md) commits to `.dropped_third()` |
+
+Only `DroppedThirdStrike` is retained as an alias in the registry. The other
+five are renames, not aliases: no code uses the old names, and an alias costs a
+duplicate `play_tags` row on every matching play — for `ForcePlay` that would
+be millions of rows to support a name that has never been called.
+
+**`PitcherPutout` and `CatcherAssist` are not tags.** The discussion listed
+them beside `ForcePlay` and `InningEnding` as stage-4 output. They are fielding
+*credits* ([03-STATE](03-STATE.md) §5), stored per fielder per position in the
+sequence, and that is strictly more queryable than a tag: `.putout_by(1,
+assist_by=[2])` and `.putout_sequence([2, 1])` both fall out of it, where a
+`PitcherPutout` tag could express neither. A tag per position per credit type
+would also be 18 tags carrying no more information than one table.
+
+**`Interference` did not survive as a single tag.** Retrosheet distinguishes
+who interfered — `C/E2` is the catcher, `C/E1` the pitcher, `/BINT` the batter,
+`/RINT` a runner, `/UINT` the umpire, `/FINT` a fan — and collapsing those
+loses the only thing that makes an interference call interesting. Seven tags,
+not one, and a query wanting the union writes `.any_of(...)`.
+
+### 9.1 Extensibility
+
+"Custom ontologies" and "user-defined tags" were listed as future extensions,
+and the registry is shaped for them: a tag is a `TagDef` in a dict, so another
+module can register its own without touching this one, and `ontology_hash()`
+covers whatever is registered at derive time — so a result computed under an
+extended ontology is distinguishable from one that was not. The curated set
+(§8) is the other half: a user-defined tag that no rule can compute already has
+a home.
+
+Two rules bind any extension, and both are enforced rather than requested: a
+tag needs a callable to exist at all, and it needs a positive **and** a
+negative test case or the suite fails ([07-TESTING](07-TESTING.md) §1).

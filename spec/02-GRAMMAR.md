@@ -142,6 +142,28 @@ reading `HP` as `H` + `P`.
 **Bare location modifier.** `D8/78` — a modifier that is only a location, with
 no trajectory letter. Try `trajectory location` first, then bare `location`.
 
+**Bare trajectory modifier.** The mirror case: `63/G`, `8/F`, `7/L`, `3/P`,
+`13/BG` — a trajectory with the location omitted. The production above already
+covers it (`trajectory [ location ]`, the location optional), but an
+implementation must not let it fall into the `named_modifier` alternative
+first. `G`, `F`, `L`, `P`, `BG`, `BP` and `BL` look exactly like no-argument
+codes when bare, and classifying them that way makes `/G` and `/G6` two
+different kinds of modifier while they state the same fact. The longer codes
+that *begin* with a trajectory letter — `FL`, `FO`, `FDP`, `GDP`, `GTP`,
+`LDP`, `LTP`, `PASS`, `BGDP`, `BPDP` — must still be matched as named codes
+before the trajectory production is tried, or `GDP` parses as a ground ball to
+a location `DP`.
+
+This was got wrong, and the cost was entirely in later layers rather than in
+the parse: the round-trip gate passed on all 17.9M plays either way, because a
+bare `G` emits as `G` from either node type. What broke was every consumer
+reading `Modifier.trajectory`. `GroundOut`, `FlyOut`, `LineOut`, `PopOut` and
+`Bunt` ([04-ONTOLOGY](04-ONTOLOGY.md) §2) did not fire on a bare trajectory,
+and the force derivation lost rule 3 of [03-STATE](03-STATE.md) §4.2 and fell
+back on rule 5 — its one inference — for a large share of the corpus. A
+round-trip gate proves nothing was *discarded*; it cannot prove a construct was
+filed under the right node.
+
 **Location codes are retained verbatim.** Retrosheet publishes the zone
 semantics only as a diagram image, so RSSE stores the raw location string plus
 the structural decomposition above. Mapping zones to field regions is out of

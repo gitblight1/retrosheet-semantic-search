@@ -9,6 +9,7 @@ import unittest
 
 from rsse.model.state import (HalfInningState, ParseStatus, Runner, apply_play,
                               batter_became_runner, batter_destination,
+                              credit_sequences,
                               forced_bases)
 from rsse.parser.parser import parse
 
@@ -75,20 +76,53 @@ class BatterDestination(unittest.TestCase):
 class BatterBecameRunner(unittest.TestCase):
     """Not the same as reaching safely -- this is what decides a force."""
 
+    def ran(self, event):
+        return batter_became_runner(parse(event).event, "out")
+
     def test_ground_out_batter_ran(self):
-        self.assertEqual(batter_became_runner(parse("64(1)3/GDP/G6").event, "out"),
-                         (True, True))
+        self.assertEqual(self.ran("64(1)3/GDP/G6"), (True, "derived"))
 
     def test_caught_liner_batter_did_not_run(self):
-        self.assertEqual(batter_became_runner(parse("8(B)84(2)/LDP/L8").event, "out"),
-                         (False, True))
+        self.assertEqual(self.ran("8(B)84(2)/LDP/L8"), (False, "derived"))
 
     def test_strikeout_batter_did_not_run(self):
-        self.assertEqual(batter_became_runner(parse("K").event, "out"), (False, True))
+        self.assertEqual(self.ran("K"), (False, "derived"))
 
-    def test_no_trajectory_falls_back_and_is_uncertain(self):
-        self.assertEqual(batter_became_runner(parse("63").event, "out"), (True, False))
-        self.assertEqual(batter_became_runner(parse("8").event, "out"), (False, False))
+    def test_a_throw_makes_it_likely_he_ran(self):
+        """§4.2 rule 5. A throw is only necessary if the batter was running."""
+        for event in ("63", "43", "53", "13", "31", "23", "143"):
+            with self.subTest(event=event):
+                self.assertEqual(self.ran(event), (True, "likely"))
+
+    def test_an_unassisted_putout_away_from_first_is_deductively_a_catch(self):
+        """Retiring a batter at first needs the ball at first.
+
+        A shortstop who fields a grounder has to throw it, so an unassisted
+        putout by 4-9 is a catch. This is geometry, not a tendency: of bare
+        single-fielder putouts that do carry a trajectory, zero of 20,494 by an
+        outfielder are ground balls.
+        """
+        for event in ("4", "5", "6", "7", "8", "9"):
+            with self.subTest(event=event):
+                self.assertEqual(self.ran(event), (False, "derived"))
+
+    def test_unassisted_by_pitcher_catcher_or_first_base_is_unresolved(self):
+        """The one case the fielding cannot settle.
+
+        He either fielded a grounder and beat the batter to the bag, or caught
+        it in the air, and the record does not say. 53% of bare first-baseman
+        putouts carrying a trajectory are grounders, and 45% of the pitcher's.
+        """
+        for event in ("1", "2", "3"):
+            with self.subTest(event=event):
+                self.assertEqual(self.ran(event), (False, "unresolved"))
+
+    def test_a_throw_elsewhere_on_the_play_settles_it(self):
+        """`64(1)3`: the batter's own putout is unassisted, the `64` is not."""
+        self.assertEqual(self.ran("64(1)3"), (True, "likely"))
+
+    def test_an_unknown_play_resolves_nothing(self):
+        self.assertEqual(self.ran("99"), (False, "unresolved"))
 
 
 class ForceDerivation(unittest.TestCase):
@@ -202,3 +236,154 @@ class Advances(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FieldingCredits(unittest.TestCase):
+    """spec/03-STATE.md §5, and the key it has to be safe to store under."""
+
+    def seqs(self, event):
+        return credit_sequences(parse(event).event)
+
+    def test_scope_seq_is_unique_per_scope(self):
+        """`credit_sequences` is keyed (play_id, scope, scope_seq) in §3.1 of
+        spec/05-DATABASE.md, so the index must not be the advance index.
+
+        `BXH(TH)(E2/TH)(8E2)` hangs three parameters off one advance, two of
+        which carry credits. Numbering by advance gives both `(advance, 0)`
+        and the load fails on a constraint -- or worse, silently keeps one.
+        """
+        for event in ("S9.BXH(TH)(E2/TH)(8E2)", "64(1)3/GDP/G6",
+                      "1(B)16(2)63(1)/LTP/L1", "OA.1X3(E1)(35)"):
+            with self.subTest(event=event):
+                keys = [(s.scope, s.scope_seq) for s in self.seqs(event)]
+                self.assertEqual(len(keys), len(set(keys)), keys)
+
+    def test_one_sequence_per_putout_group(self):
+        """`64(1)3` is two throws and two putouts, not one sequence `643`."""
+        seqs = self.seqs("64(1)3/GDP/G6")
+        self.assertEqual([s.seq_text for s in seqs], ["64", "3"])
+        self.assertEqual([s.putout for s in seqs], ["4", "3"])
+        self.assertEqual([list(s.assists) for s in seqs], [["6"], []])
+
+    def test_credits_are_collected_from_either_section(self):
+        """`K23` and `K.3XH(21)` are the same kind of play, written apart."""
+        self.assertEqual([(s.scope, s.seq_text) for s in self.seqs("K23")],
+                         [("basic", "23")])
+        self.assertEqual([(s.scope, s.seq_text) for s in self.seqs("K.3XH(21)")],
+                         [("advance", "21")])
+
+    def test_an_error_takes_the_putout_and_negates_the_out(self):
+        seq = self.seqs("CS2(2E6)")[0]
+        self.assertTrue(seq.has_error)
+        self.assertIsNone(seq.putout)
+        self.assertFalse(seq.records_out)
+
+    def test_99_earns_no_credit(self):
+        """`99` is an unknown play, not the right fielder twice (§2.1)."""
+        seq = self.seqs("99")[0]
+        self.assertEqual(seq.credited, ())
+        self.assertIsNone(seq.putout)
+
+    def test_u_earns_no_credit(self):
+        """`U` is undocumented; RSSE derives no credit from it (02-GRAMMAR §4.1)."""
+        seqs = self.seqs("CS2(U6)")
+        self.assertEqual([f for f, _e in seqs[0].credited], ["6"])
+
+
+class BareTrajectorySettlesTheForce(unittest.TestCase):
+    """§4.2 rule 3 must see a bare `/G` as well as a located `/G6`.
+
+    When it did not, the force determination fell through to rule 5 -- the
+    one inference in the chain -- and came back `ambiguous` on plays where
+    the event string says plainly that the ball was on the ground.
+    """
+
+    def force_at_first(self, event, bases=""):
+        outcome = run(event, bases)
+        at_first = [a for a in outcome.advances
+                    if a.origin == "B" and a.dest == "1" and a.is_out]
+        self.assertEqual(len(at_first), 1, event)
+        return at_first[0]
+
+    def test_bare_g_gives_a_derived_force(self):
+        for event in ("63/G", "43/G", "3/G"):
+            with self.subTest(event=event):
+                advance = self.force_at_first(event)
+                self.assertTrue(advance.is_force)
+                self.assertEqual(advance.force_certainty, "derived")
+
+    def test_bare_and_located_agree(self):
+        for bare, located in (("63/G", "63/G6"), ("43/G", "43/G4")):
+            with self.subTest(event=bare):
+                self.assertEqual(self.force_at_first(bare).force_certainty,
+                                 self.force_at_first(located).force_certainty)
+
+    def test_no_modifier_at_all_is_likely_not_derived(self):
+        """The rule 5 case: a throw, but no trajectory to confirm it."""
+        advance = self.force_at_first("63")
+        self.assertTrue(advance.is_force)
+        self.assertEqual(advance.force_certainty, "likely")
+
+    def test_bare_caught_trajectory_makes_no_force(self):
+        outcome = run("8/F", "1")
+        self.assertEqual([a for a in outcome.advances if a.is_force], [])
+
+
+class UnresolvedForceIsRecordedNotEscalated(unittest.TestCase):
+    """§4.2 rule 5, the unresolved branch: claim nothing, record the doubt.
+
+    The doubt is a queryable fact on the play, not a `parse_status`. Escalating
+    would exclude the play from every default query (spec/06-QUERY.md §4) --
+    3% of the corpus, 7.7% of 1920 -- so a count of home runs would come back
+    short for reasons about ground balls.
+    """
+
+    def test_no_force_is_claimed(self):
+        for event in ("3", "1", "2", "99"):
+            with self.subTest(event=event):
+                outcome = run(event, "12")
+                self.assertEqual([a for a in outcome.advances if a.is_force], [])
+
+    def test_batter_ran_is_unknown_and_the_reason_is_recorded(self):
+        for event in ("3", "1", "2", "99"):
+            with self.subTest(event=event):
+                outcome = run(event, "12")
+                self.assertEqual(outcome.batter_ran, "unknown")
+                self.assertTrue(outcome.notes)
+
+    def test_the_play_stays_in_default_results(self):
+        """The whole point of the field: nothing else about the play is in doubt."""
+        for event in ("3", "1", "2"):
+            with self.subTest(event=event):
+                self.assertEqual(run(event, "12").parse_status, "ok")
+
+    def test_settled_plays_say_so(self):
+        for event, ran in (("3/G", "yes"), ("8", "no"), ("63", "yes"),
+                           ("63/G", "yes"), ("K", "no"), ("S7", "yes")):
+            with self.subTest(event=event):
+                outcome = run(event, "12")
+                self.assertEqual(outcome.batter_ran, ran)
+                self.assertEqual(outcome.parse_status, "ok")
+
+    def test_outs_are_still_counted(self):
+        """The doubt is about the force, not about the out."""
+        for event in ("3", "1", "2", "99"):
+            with self.subTest(event=event):
+                self.assertEqual(run(event, "12").outs_recorded, 1)
+
+    def test_a_no_play_is_not_unknown(self):
+        """`NP` precedes every substitution, so it must not default to unknown.
+
+        Left at the dataclass default it would file tens of thousands of
+        substitution markers under 'unknown' and swamp the one population the
+        field exists to count.
+        """
+        self.assertEqual(run("NP").batter_ran, "no")
+
+    def test_every_replayed_play_states_batter_ran(self):
+        """No path may leave the field at its default by omission."""
+        for event in ("NP", "S7", "K", "63", "8/F", "SB2", "WP.2-3", "BK",
+                      "W", "HR", "C/E2", "DI.1-2", "OA.1-2", "PB", "99"):
+            with self.subTest(event=event):
+                self.assertIn(run(event, "12").batter_ran,
+                              ("yes", "no", "unknown"))

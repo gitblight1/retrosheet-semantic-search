@@ -11,13 +11,31 @@ corpus-wide gates, which were missing.
 |---|---|
 | Lexer / grammar | unit tests per production; byte-exact round-trip (§3) |
 | State machine | inning replay fixtures; box-score reconciliation (§4) |
-| Ontology | one positive and one **negative** case per tag |
+| Ontology | one positive and one **negative** case per tag; corpus census |
 | Database | schema migration tests, index-plan assertions |
 | Query | golden SQL per predicate; end-to-end result assertions |
 
 The negative case per tag is not optional. `K.1X2(26)` must not be tagged
 `UncaughtThirdStrike` ([04-ONTOLOGY](04-ONTOLOGY.md) §3.1) — a rule that only
 ever sees positives will happily over-fire.
+
+**Status.** The ontology layer is built and this requirement is enforced
+mechanically: [tests/test_ontology.py](../tests/test_ontology.py) carries both
+kinds of case for all 84 tags, and a coverage test fails if a tag is registered
+without them. The corpus-wide counterpart is `rsse tags`, which derives every
+play and fails on two findings: a derivable tag that **never fires** (either
+the rule is wrong or the encoding does not exist, and a suite full of positives
+cannot tell you which), and a tag that fires on **over 90% of plays** (a rule
+that broad is not selecting anything, whatever its name says).
+
+`--seasons N` samples N seasons spread end to end across the corpus, which is
+the cheap routine check. On a sample the never-fired finding is **advisory**: a
+tag can be absent because it is rare rather than because its rule is wrong, and
+`CourtesyFielder` and `PitcherInterference` each appear in one 12-season sample
+and not another. The full-corpus run is the gate; the sample is the smoke test.
+Sampling must span to the **most recent** season — new encodings live at the
+end of the range, and a stride that stops short reports replay review and
+placed runners as never firing.
 
 ## 2. Gold corpus
 
@@ -96,7 +114,29 @@ K+WP.3XH(21);B-1
 ```
 
 These differ in whether the batter advance is explicit and whether a wild pitch
-was charged. A researcher asking "has this happened before" must find all of
+was charged.
+
+**The comparison excludes `WildPitch` and `PassedBall`.** The third encoding
+charges a wild pitch and the others do not, so it must carry `WildPitch` and
+they must not — an encoding that records something more is not the same as one
+that records it wrongly. Everything else must agree exactly. Keeping the
+exclusion list to those two tags is deliberate: widen it and the assertion
+stops assuring anything.
+
+**This assertion has already earned its place.** Run for the first time against
+the built ontology, it failed on `K.3XH(21)` in two independent ways:
+
+1. The out-count inference of [03-STATE](03-STATE.md) §4.5 step 1 was never
+   implemented, so the bare form read the batter as retired on strikes, totalled
+   four outs, and came back `state_inconsistent` — tagged `TagOut` where the
+   other two encodings were tagged `ForceOut`. Wrong, and wrong in the
+   direction that answers the motivating question incorrectly.
+2. `UncaughtThirdStrike`'s trigger (c) was keyed on a *written* `B-%` advance,
+   so even with the state fixed the bare form still carried a different tag set.
+
+Neither was reachable from a corpus-wide invariant: no play of that shape
+occurs in 1908–2025, and the corpus replay reported zero inconsistent plays.
+A gold entry for a game that has not been released yet found both. A researcher asking "has this happened before" must find all of
 them. This is the concrete reason the query API targets derived tags rather than
 event-string patterns ([06-QUERY](06-QUERY.md) §3), and the reason the ontology
 lists four independent triggers for `UncaughtThirdStrike`.
@@ -156,7 +196,14 @@ This entry is worth more than the other gold files combined, for three reasons:
   force derivation.
 
 The second case is constructed rather than observed, and is marked as such until
-a real instance is located.
+a real instance is located. Both now exist as gold files, and both pass:
+`dropped_third_tag_home_from_second` derives `TagOut` and not `ForceOut`,
+because `forced_bases({2}, live)` is `{1}` — the runner on second has an empty
+base behind them, and the batter-runner being live does not change that.
+
+A note on the name `dropped_third_tag_home_batter_out` in §2.3: it refers to
+the same record as `strikeout_tag_home_2000`, which is the file that exists.
+Only two near-miss files are required, and there are two.
 
 These two entries plus `dropped_third_force_home` are the minimal set that
 distinguishes a real force derivation from a pattern match on `K` + `XH` +
@@ -164,6 +211,15 @@ distinguishes a real force derivation from a pattern match on `K` + `XH` +
 [08-WORKED-EXAMPLE](08-WORKED-EXAMPLE.md).
 
 ### 2.3 Initial contents
+
+Of the list below, five files exist:
+`dropped_third_force_home`, `strikeout_tag_home_2000`,
+`dropped_third_tag_home_from_second`, `dropped_third_putout_at_first` and
+`strikeout_throw_out` — the two mandatory near-misses of §2.2 among them. Each
+asserts its parse, its state, and its tags; `expected_sql_fields` is reported
+as pending until the derived tables exist. The rest are outstanding, and the
+historical ones (`pine_tar_game`, `harpers_obstruction`, `grand_slam_single`)
+need a game id and a released file before they can assert anything.
 
 Carried over from the original spec, plus the ones needed to cover the grammar's
 sharp edges:
