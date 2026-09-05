@@ -70,7 +70,9 @@ rsse/model/game.py        whole-game replay, per-play context
 rsse/semantic/ontology.py 84 tags, one derivation rule each
 rsse/semantic/derive.py   implication, confidence, curated tags
 rsse/database/derived.py  archive -> typed tables
-tests/                    162 tests; tests/gold/ 5 gold plays
+rsse/database/coverage.py what the corpus actually covers
+rsse/query/               Search builder, compiler, coverage reporting
+tests/                    196 tests; tests/gold/ 5 gold plays
 ```
 
 **Raw layer built and loaded** (build step 2). 31,115,272 records from 2,646
@@ -160,6 +162,10 @@ python3 -m rsse.cli derive --season 2000        # derived tables, one season (~1
 python3 -m rsse.cli derive --progress          # full derived layer (~80 min, ~10 GB)
 python3 -m rsse.cli tags --seasons 12          # era-spread census (~20 min)
 python3 -m rsse.cli tags --progress            # full corpus; hours, and the real gate
+python3 -m rsse.cli verify --derived           # derived-table integrity (20 checks)
+python3 -m rsse.cli coverage --rebuild         # coverage table (~10 s)
+python3 -m rsse.cli query --bases-loaded --outs 2 --dropped-third \
+                          --force-play-at H --putout-sequence 2,1
 python3 -m unittest discover -s tests -t .
 ```
 
@@ -185,7 +191,9 @@ in [tests/known-source-defects.json](tests/known-source-defects.json).
 5. **Derived tables** ([05-DATABASE](spec/05-DATABASE.md) §2–4) — *done,
    validated on a full season.* `rsse derive`, reading the archive rather than
    the event files so a rebuild reproduces the ingested bytes.
-6. Query API ([06-QUERY](spec/06-QUERY.md)), then the motivating query.
+6. **Query API** ([06-QUERY](spec/06-QUERY.md)) — *done.* `Search`, the
+   `CoverageReport` that makes an empty result readable, and
+   `rsse query` / `explain` / `coverage`.
 
 ## Licensing and attribution
 

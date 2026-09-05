@@ -9,6 +9,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from rsse.database import load as dbload
 from rsse.database import schema as dbschema
@@ -157,6 +158,84 @@ class RawLayer(unittest.TestCase):
             " AND b.first_record_id <= a.last_record_id").fetchone()[0]
         self.assertEqual(overlaps, 0)
 
+
+
+class UntrustedState(unittest.TestCase):
+    """An unparsed play poisons the rest of its half-inning (03-STATE §7.1).
+
+    The state machine cannot see this: it is handed one play at a time and each
+    of these parses perfectly. Only the loader, which holds the whole
+    half-inning, can tell that the state was already wrong -- so this is where
+    the flag has to be tested.
+    """
+
+    #: `S7/L6d` is one of the seven records malformed at source: a lowercase
+    #: location qualifier. It is a single, so the batter belongs on first, and
+    #: the play after it advances a runner from a base the state thinks is
+    #: empty. Everything else here is ordinary.
+    GAME = [
+        "id,TST200004070",
+        "version,2",
+        "info,visteam,MIN",
+        "info,hometeam,KCA",
+        "info,date,2000/04/07",
+        "play,1,0,aaaaa001,00,,S8/L8",          # clean, before the defect
+        "play,1,0,bbbbb001,00,,S7/L6d",         # unparseable
+        "play,1,0,ccccc001,00,,D9/L9LD.1-3",    # advances a runner not there
+        "play,1,0,ddddd001,00,,8/F8",
+        "play,1,0,eeeee001,00,,8/F8",
+        "play,1,0,fffff001,00,,8/F8",
+        "play,1,1,ggggg001,00,,8/F8",           # next half: state has reset
+        "play,1,1,hhhhh001,00,,8/F8",
+        "play,1,1,iiiii001,00,,8/F8",
+    ]
+
+    def derive(self):
+        from rsse.database.derived import _PLAY_COLUMNS, derive_game
+        from rsse.parser.records import parse_line
+        from rsse.semantic.derive import load_curated, tag_rows
+
+        records = [parse_line(i, line) for i, line in enumerate(self.GAME, 1)]
+        records = [r for r in records if r is not None]
+        tag_ids = {t["name"]: i for i, t in enumerate(tag_rows(), 1)}
+        stats = SimpleNamespace(games=0, plays=0, advances=0, credits=0,
+                                sequences=0, tags=0, curated=0, unparsed=0,
+                                status={})
+        span = {"game_key": 1, "game_id": "TST200004070", "occurrence": 1,
+                "file_id": 1, "path": "test", "season": 2000}
+        out = derive_game(span, records, list(range(1, len(records) + 1)),
+                          0, "test", load_curated(), tag_ids, stats)
+        return [dict(zip(_PLAY_COLUMNS, row))
+                for row in out["rows"]["plays"]]
+
+    def test_unparsed_row_stores_no_state(self):
+        rows = self.derive()
+        bad = [r for r in rows if r["parse_status"] == "unparsed"]
+        self.assertEqual(len(bad), 1)
+        for column in ("outs_before", "outs_recorded", "outs_after",
+                       "bases_before", "bases_after"):
+            self.assertIsNone(bad[0][column],
+                              f"{column} must be NULL, not an invented zero")
+
+    def test_later_plays_in_the_half_are_untrusted(self):
+        rows = self.derive()
+        after = [r for r in rows if r["batting_team"] == 0][2:]
+        self.assertTrue(after)
+        for row in after:
+            self.assertEqual(row["parse_status"], "state_untrusted",
+                             f"{row['event_raw']} inherited a poisoned state")
+
+    def test_the_play_before_the_defect_is_untouched(self):
+        rows = self.derive()
+        self.assertEqual(rows[0]["parse_status"], "ok")
+
+    def test_contamination_stops_at_the_half_inning(self):
+        rows = self.derive()
+        other = [r for r in rows if r["batting_team"] == 1]
+        self.assertEqual(len(other), 3)
+        for row in other:
+            self.assertEqual(row["parse_status"], "ok",
+                             "state resets at the boundary; doubt must not cross")
 
 if __name__ == "__main__":
     unittest.main()

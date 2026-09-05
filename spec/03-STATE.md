@@ -477,6 +477,46 @@ query filter:
 `is_walkoff` requires knowing the game ended, so it is stamped in a second pass
 after the game is fully replayed.
 
+### 7.1 When the state itself cannot be trusted
+
+Every field above is derived from the base-out state carried into the play. If
+that state is wrong, the fields are wrong — and nothing about *this* play looks
+wrong, so nothing flags it.
+
+That happens for exactly one reason: **an earlier play in the same half-inning
+could not be parsed.** Its effect was never applied, so every later play in
+that half inherits a state that is missing it. The later plays parse cleanly
+and are internally consistent; they are simply built on a false premise.
+
+Such a play carries `parse_status = 'state_untrusted'`.
+
+Three properties of the flag matter:
+
+- **It is about the context, not the event.** `state_ambiguous` says this play
+  is underdetermined; `state_untrusted` says this play is fine and its
+  surroundings are not. Collapsing them would lose which is which.
+- **It is assigned by the loader, not by `apply_play`.** The state machine sees
+  one play at a time and has nothing to be suspicious of. Only something
+  holding the whole half-inning can see that an unparsed play preceded this
+  one, so the flag is set where the plays are assembled into rows.
+- **It ranks just above `ok`.** A finding about the play itself is the more
+  specific statement, so a play that is *also* `state_ambiguous` or
+  `state_inconsistent` keeps that status.
+
+The blast radius is bounded by the half-inning: state resets at the boundary,
+so contamination never crosses it.
+
+The unparsed play itself is a separate case. Its base-out state is not wrong,
+it is **unknown** — the effects of the play were never computed. Those columns
+are therefore `NULL`, and `plays.outs_before`, `outs_recorded`, `outs_after`,
+`bases_before` and `bases_after` are nullable for this reason alone. A stored
+`'000'` would be indistinguishable from bases genuinely empty, and would be
+counted as such by every aggregate.
+
+Corpus-wide this is 7 unparsed plays and 15 downstream, out of 17.9 million —
+but they are precisely the plays a force query would answer wrongly and
+confidently, which is the failure mode this project exists to avoid.
+
 ## 8. Validation status
 
 The replay is implemented and run over the whole corpus. Final-score
@@ -536,6 +576,10 @@ first basic event describes the batter.
 malformed at source ([02-GRAMMAR](02-GRAMMAR.md) §8.1). A play that cannot be
 parsed cannot record its out, so the inning is one short. `rsse replay`
 attributes these and exits zero; an unexplained short inning fails.
+
+The same seven records have a second consequence, which the out-accounting
+invariant cannot see: the plays *after* them run on a stale base state. Those
+plays are flagged `state_untrusted` (§7.1) rather than left reading `ok`.
 
 **Six plays flagged `data_contradicts_rules`**, every one of them pre-1947:
 

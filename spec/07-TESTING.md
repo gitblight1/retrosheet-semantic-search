@@ -12,8 +12,8 @@ corpus-wide gates, which were missing.
 | Lexer / grammar | unit tests per production; byte-exact round-trip (§3) |
 | State machine | inning replay fixtures; box-score reconciliation (§4) |
 | Ontology | one positive and one **negative** case per tag; corpus census |
-| Database | schema migration tests, index-plan assertions |
-| Query | golden SQL per predicate; end-to-end result assertions |
+| Database | schema migration tests, index-plan assertions; `rsse verify --derived` (§4.1) |
+| Query | compiled-SQL assertions per predicate; end-to-end result assertions |
 
 The negative case per tag is not optional. `K.1X2(26)` must not be tagged
 `UncaughtThirdStrike` ([04-ONTOLOGY](04-ONTOLOGY.md) §3.1) — a rule that only
@@ -289,6 +289,55 @@ correctly ([02-GRAMMAR](02-GRAMMAR.md) §4); the out-accounting invariant proves
 outs balance but says nothing about runs; and a unit test asserting current
 behaviour proves only that behaviour has not changed. **Adding a gate for a
 quantity nobody had checked found a bug every single time.**
+
+### 4.1 `rsse verify --derived`
+
+The invariants above run against the archive and the replay. The derived tables
+need their own gate, because the load is a separate opportunity to be wrong:
+`verify` proves nothing was lost in ingest, `verify --derived` proves it was
+filed correctly. Twenty checks, each a query that must return zero rows —
+referential integrity across the six derived tables, out accounting including
+continuity of `outs_before` against the previous play's `outs_after`, the two
+run invariants, base-state agreement between `plays` and `runner_advances`, and
+`NULL`-state discipline on unparsed rows.
+
+It runs after every `derive`. The first time it ran it failed three checks, and
+all three traced to one omission: **a play's `parse_status` described its own
+event string and said nothing about whether the state it inherited was
+trustworthy** ([03-STATE](03-STATE.md) §7.1). Fifteen plays across 17.9 million
+had been reading `ok` while sitting on a base state known to be wrong, and the
+unparsed rows they descended from stored a fabricated `outs 0 / bases '000'`
+because the columns were `NOT NULL`.
+
+Two checks are filtered to exclude `state_untrusted` and `unparsed` plays,
+since on those the state really is wrong and the check would fire correctly and
+uselessly. **The excluded count is printed at the top of every run**, so the
+exclusion is a visible number rather than a silent whitelist that could grow
+without anyone noticing.
+
+### 4.2 The query API's two invariants
+
+Two assertions in [tests/test_query.py](../tests/test_query.py) carry more
+weight than the rest, because each names a way the API can be wrong while
+looking right.
+
+**The trio must partition.** For every base, `.out_at(b)` must equal
+`.force_play(at=b)` plus `.tag_out(at=b)`. The force/tag distinction is derived
+([03-STATE](03-STATE.md) §4) and is therefore the part of the pipeline most
+likely to be wrong; the partition is the only check available that does not
+assume the derivation is correct. This is what [06-QUERY](06-QUERY.md) §3.2
+means by an API that can express its own control case.
+
+**Coverage must not depend on results.** A rare tag and a common one must
+report the *same* `CoverageReport`. Coverage computed from matched rows says
+"we looked exactly where we found something" — which reads as diligence and is
+the failure the report exists to prevent. The first implementation did this,
+and this assertion is what caught it.
+
+A third is smaller but was a real bug: quality flags must be order-independent,
+so `.strikeout().include_uncertain()` and `.include_uncertain().strikeout()`
+must compile identically. A builder documented as immutable, whose answer
+changes with call order, gives no signal that anything is wrong.
 
 ## 5. Performance suite
 

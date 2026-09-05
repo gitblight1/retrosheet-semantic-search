@@ -144,6 +144,29 @@ the corpus is `unknown`, and the rate is 7.70% in 1920 against 0.00% in 2020,
 which is exactly the shape of error that makes an era comparison wrong while
 looking fine.
 
+The report MUST likewise state the `state_untrusted` count in the population
+([03-STATE](03-STATE.md) §7.1) — plays that parsed cleanly on a base-out state
+known to be wrong, because an unparsed play earlier in the half-inning was
+never applied. These are excluded by default, since the default is
+`parse_status = 'ok'`, and that is the right default: a force derivation reads
+the base state, so on these plays it is reading fiction.
+
+The two counts are reported together but mean opposite things, and the report
+must not blur them:
+
+| | `batter_ran = 'unknown'` | `state_untrusted` |
+|---|---|---|
+| What is doubted | one field of this play | the state this play inherited |
+| In default results | **yes** | **no** |
+| Why | the play is sound; only the force claim is withheld | every derived field may be wrong |
+| Corpus scale | 530,888 (2.97%) | 15 (0.0001%) |
+
+The scale difference is the point of keeping them apart. `unknown` is a
+structural property of early-era scoring and must stay in results or a home-run
+count comes back 3% short; `state_untrusted` is a handful of plays downstream
+of seven malformed records and must stay out or a force count is quietly
+wrong.
+
 What no parameter can offer is a filter on whether the out was executed by
 touching the base or by tagging the runner. That is not recorded for any play
 ([03-STATE](03-STATE.md) §4.2.1), and a predicate implying otherwise would be
@@ -160,7 +183,8 @@ tag-out cases.
 |---|---|
 | *(default)* | `parse_status = 'ok'` and `confidence = 'certain'` |
 | `.include_uncertain()` | also `confidence = 'uncertain'` — ambiguous force ordering, `#`-annotated plays, `99` |
-| `.include_unparsed()` | also non-`ok` plays; a research affordance for finding grammar gaps |
+| `.include_untrusted()` | also `parse_status = 'state_untrusted'` — plays on a base state known to be wrong ([03-STATE](03-STATE.md) §7.1) |
+| `.include_unparsed()` | also the remaining non-`ok` plays; a research affordance for finding grammar gaps |
 | `.curated_only()` / `.exclude_curated()` | filter on `play_tags.source` |
 
 Defaults exclude uncertain rows so that a result set is defensible. The
@@ -172,10 +196,32 @@ Default scope is `game_type IN ('regular','playoff','worldseries','lcs',
 'divisionseries','wildcard','championship')` — i.e. games that count, with
 `playoff` included as the tiebreaker subset of `regular`.
 
-`.include_exhibition()`, `.include_allstar()`, `.only_postseason()` adjust it.
-Pre-2023 games have no `gametype` record and are treated as `regular` unless
-the game id or schedule says otherwise; that inference is recorded on the game
-row rather than applied at query time.
+`.include_exhibition()`, `.include_allstar()`, `.only_postseason()` adjust it,
+and `.all_game_types()` removes the filter.
+
+**The inference for games with no `gametype` record is applied at query time,
+not stored.** `info,gametype` only appears from 2023: 9,476 games in the corpus
+state one and 193,809 do not, so `games.game_type` is NULL for 95% of it. An
+earlier draft of this section said the inference belonged on the game row. It
+does not, for the same reason `scheduled_innings` is NULL below 2020
+([05-DATABASE](05-DATABASE.md) §3): backfilling `'regular'` would erase the
+distinction between *the file told us this was a regular-season game* and
+*nothing said otherwise*, which is a distinction this project keeps everywhere
+else. The default therefore compiles to `coalesce(game_type,'regular') IN
+(...)`, and a query wanting the strict population can ask for
+`game_type IS NOT NULL` through the raw column.
+
+Getting this wrong is not a subtle failure: without the `coalesce` the default
+scope excludes everything before 2023 and reports it as zero matches rather
+than as missing coverage.
+
+**The corpus holds no postseason event files.** Every file is a regular-season
+team file (`####TEAM.EVA/EVN/EVF/EVR`); there are no `.EVE` files. So
+`.only_postseason()` can match only the games labelled `playoff`,
+`championship`, `lcs` or `divisionseries` *inside* team files — the tiebreakers
+and the Negro Leagues championship games — and never a World Series. A
+`CoverageReport` on a postseason-scoped query states this, because otherwise an
+empty result reads as "it never happened in the postseason".
 
 ## 6. Results
 
@@ -205,6 +251,24 @@ table. An empty `rows` with a coverage report reads "no such play in the
 N games from YYYY to YYYY"; without one it reads "never happened", which the
 data does not support ([01-CORPUS](01-CORPUS.md) §5.2).
 
+### 6.1 Coverage describes what was searched, never what matched
+
+`CoverageReport` is built from the query's own **game-level** predicates —
+season, league, team, park, game type — evaluated against `games`, and never
+from the rows the query returned.
+
+The distinction is the whole value of the report. Coverage derived from results
+says "we looked exactly where we found something": a query matching in two
+seasons of a 118-season corpus would report a two-season search and a reader
+would conclude the other 116 were checked and clean. The first implementation
+here did exactly that, and it is caught by a test asserting that a rare tag and
+a common one report the *same* coverage.
+
+Predicates on `plays` never narrow coverage — narrowing results is their job.
+A team or park filter does narrow the games matched but cannot be expressed in
+the `(season, league)` key the `coverage` table uses, so a query carrying one
+gets a note saying the totals are for the whole seasons and leagues searched.
+
 ## 7. Performance
 
 Target: <100 ms for a typical query on a warm cache.
@@ -229,3 +293,32 @@ rsse coverage --season-range 1901 2026
 `--format` is `table`, `json`, or `csv`. Every non-`table` export carries the
 Retrosheet attribution notice ([01-CORPUS](01-CORPUS.md) §1) and the corpus
 version.
+
+`rsse coverage --rebuild` populates the `coverage` table
+([05-DATABASE](05-DATABASE.md) §5) from `games` and `plays`. It is a GROUP BY,
+so it is rebuilt in seconds after a derive rather than carried through the load.
+
+## 9. Validation status
+
+Built and tested. `Search`, the compiler, `CoverageReport`, `ExcludedCounts`,
+`ForceReport`, and the `query` / `explain` / `coverage` commands.
+
+Two predicates are **not** implemented and raise `NotImplementedError` naming
+the missing table rather than returning nothing: `.pitcher()` and `.fielder()`
+both need `lineup_entries` ([05-DATABASE](05-DATABASE.md) §2), which is
+specified and not yet built. Silently matching zero rows is the one behaviour
+this API must never have, since zero is a meaningful answer everywhere else in
+it.
+
+Building it found two defects in the API's own contract:
+
+- **Quality flags were order-dependent.** `.tag()` read `_include_uncertain`
+  when the predicate was built, so `.strikeout().include_uncertain()` compiled
+  strictly and `.include_uncertain().strikeout()` did not — same methods, same
+  arguments, different answer, no error. The confidence filter is now resolved
+  at compile time. An immutable builder whose result depends on call order is
+  worse than a mutable one, because nothing about the API suggests it could.
+- **Coverage was derived from the result rows** (§6.1).
+
+Both were found by tests written from this document rather than from the code,
+which is the argument for writing the spec first.

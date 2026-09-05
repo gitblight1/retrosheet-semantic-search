@@ -27,7 +27,27 @@ from rsse.semantic.derive import derive
 GOLD_DIR = Path(__file__).parent / "gold"
 
 #: Layers not yet implemented. Assertions naming these are reported, not run.
-PENDING_LAYERS = ("expected_sql_fields",)
+#: Empty now that `expected_sql_fields` is checked against the derived columns
+#: (`SqlFields` below); the mechanism stays because the next layer will need it.
+PENDING_LAYERS = ()
+
+#: How a gold file's `expected_sql_fields` maps onto what the replay produces.
+#: The gold files name `plays` columns (05-DATABASE §3), so this is where the
+#: column names and the state machine's field names are reconciled -- once,
+#: rather than in each file.
+SQL_FIELD_SOURCES = {
+    "bases_before": lambda o: o.bases_before,
+    "bases_after": lambda o: o.bases_after,
+    "outs_before": lambda o: o.outs_before,
+    "outs_recorded": lambda o: o.outs_recorded,
+    "outs_after": lambda o: o.outs_after,
+    "is_inning_ending": lambda o: int(o.is_inning_ending),
+    "runs_on_play": lambda o: o.runs_on_play,
+    "batter_dest": lambda o: o.batter_dest,
+    "batter_is_out": lambda o: int(o.batter_is_out),
+    "batter_ran": lambda o: o.batter_ran,
+    "parse_status": lambda o: o.parse_status,
+}
 
 #: Tags that legitimately differ between encodings of the same play: an
 #: encoding that charges a wild pitch or a passed ball records something the
@@ -226,6 +246,33 @@ class GoldTags(unittest.TestCase):
                     self.assertEqual(actual, baseline,
                                      f"{name}: {event} differs by "
                                      f"{sorted(actual ^ baseline)}")
+
+
+class SqlFields(unittest.TestCase):
+    """The `plays` columns a gold play promotes into (§2).
+
+    These were reported as pending until the derived tables existed. They are
+    the cheapest of the four layers to check and the last to be wired up,
+    which is exactly why they were worth wiring up: `bases_before` and
+    `outs_after` are what every context predicate in the query API filters on.
+    """
+
+    def test_expected_sql_fields(self):
+        checked = 0
+        for name, gold in load_gold():
+            expected = gold.get("expected_sql_fields")
+            if not expected:
+                continue
+            _parsed, outcome, _tags = replay(gold)
+            for column, want in expected.items():
+                source = SQL_FIELD_SOURCES.get(column)
+                self.assertIsNotNone(
+                    source, f"{name}: no source for plays.{column}; add it to "
+                            "SQL_FIELD_SOURCES rather than dropping the check")
+                self.assertEqual(source(outcome), want,
+                                 f"{name}: plays.{column}")
+                checked += 1
+        self.assertGreater(checked, 0, "no gold file asserts SQL fields")
 
 
 class PendingLayers(unittest.TestCase):

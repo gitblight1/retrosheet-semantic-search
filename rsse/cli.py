@@ -331,6 +331,353 @@ def cmd_verify(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Integrity checks on the derived tables (spec/07-TESTING.md §4). Each is a
+#: query that must return zero rows; a name, the SQL, and whether the check is
+#: meaningful on a play whose base-out state is untrustworthy.
+#:
+#: The `trusted_only` flag is the point of `state_untrusted`. A play that
+#: inherited a wrong state from an unparsed play earlier in its half-inning
+#: parses cleanly and then fails the base-state checks -- correctly, because
+#: the state really is wrong. Excluding those rows by *status* keeps the check
+#: honest: the count of what was excluded is printed, so a growing exclusion
+#: is visible rather than a silent whitelist.
+DERIVED_CHECKS = [
+    # --- referential -------------------------------------------------------
+    ("orphan play -> games", False,
+     "SELECT p.play_id FROM plays p LEFT JOIN games g USING (game_key)"
+     " WHERE g.game_key IS NULL"),
+    ("orphan advance -> plays", False,
+     "SELECT a.play_id FROM runner_advances a LEFT JOIN plays p USING (play_id)"
+     " WHERE p.play_id IS NULL"),
+    ("orphan credit -> plays", False,
+     "SELECT f.play_id FROM fielding_credits f LEFT JOIN plays p USING (play_id)"
+     " WHERE p.play_id IS NULL"),
+    ("orphan sequence -> plays", False,
+     "SELECT s.play_id FROM credit_sequences s LEFT JOIN plays p USING (play_id)"
+     " WHERE p.play_id IS NULL"),
+    ("orphan play_tag -> plays", False,
+     "SELECT t.play_id FROM play_tags t LEFT JOIN plays p USING (play_id)"
+     " WHERE p.play_id IS NULL"),
+    ("orphan play_tag -> tags", False,
+     "SELECT t.play_id FROM play_tags t LEFT JOIN tags g USING (tag_id)"
+     " WHERE g.tag_id IS NULL"),
+    ("games.plays disagrees with plays rows", False,
+     "SELECT g.game_key FROM games g WHERE g.plays <>"
+     " (SELECT COUNT(*) FROM plays p WHERE p.game_key = g.game_key)"),
+
+    # --- out accounting ----------------------------------------------------
+    ("outs_before + outs_recorded <> outs_after", False,
+     "SELECT play_id FROM plays"
+     " WHERE outs_before + outs_recorded <> outs_after"),
+    ("outs_after > 3", False,
+     "SELECT play_id FROM plays WHERE outs_after > 3"),
+    ("outs_before <> previous outs_after", False,
+     "SELECT play_id FROM (SELECT play_id, outs_before, inning, half,"
+     "   LAG(outs_after) OVER (PARTITION BY game_key ORDER BY seq) AS prev,"
+     "   LAG(inning) OVER (PARTITION BY game_key ORDER BY seq) AS pi,"
+     "   LAG(half) OVER (PARTITION BY game_key ORDER BY seq) AS ph"
+     "  FROM plays) WHERE pi = inning AND ph = half AND outs_before <> prev"),
+
+    # --- run accounting ----------------------------------------------------
+    ("runs_on_play <> scoring advances", False,
+     "SELECT play_id FROM plays p WHERE p.runs_on_play <>"
+     " (SELECT COUNT(*) FROM runner_advances a"
+     "   WHERE a.play_id = p.play_id AND a.scored = 1)"),
+    # `trusted_only` checks are filtered on `p.parse_status`, so every one of
+    # them must expose the plays row under the alias `p`.
+    ("runs_on_play exceeds runners on base + batter", True,
+     "SELECT p.play_id FROM plays p WHERE p.runs_on_play >"
+     " (LENGTH(p.bases_before) - LENGTH(REPLACE(p.bases_before,'1',''))) + 1"),
+
+    # --- base state --------------------------------------------------------
+    ("advance from an unoccupied base", True,
+     "SELECT a.play_id FROM runner_advances a JOIN plays p USING (play_id)"
+     " WHERE a.origin <> 'B'"
+     "   AND SUBSTR(p.bases_before, CAST(a.origin AS INTEGER), 1) <> '1'"),
+    ("batter reached but has no advance row", False,
+     "SELECT p.play_id FROM plays p WHERE p.batter_ran = 'yes'"
+     "  AND NOT EXISTS (SELECT 1 FROM runner_advances a"
+     "                   WHERE a.play_id = p.play_id AND a.origin = 'B')"),
+    ("non-batter advance with no runner id", True,
+     "SELECT a.play_id FROM runner_advances a JOIN plays p USING (play_id)"
+     " WHERE a.origin <> 'B' AND a.runner_id IS NULL"),
+    ("bad bases string", False,
+     "SELECT play_id FROM plays WHERE LENGTH(bases_before) <> 3"
+     "    OR LENGTH(bases_after) <> 3"),
+    ("state stored for an unparsed play", False,
+     "SELECT play_id FROM plays WHERE parse_status = 'unparsed'"
+     "   AND (outs_before IS NOT NULL OR bases_before IS NOT NULL)"),
+
+    # --- ontology / force --------------------------------------------------
+    ("force flagged but certainty n/a", False,
+     "SELECT play_id FROM runner_advances"
+     " WHERE is_force = 1 AND force_certainty = 'n/a'"),
+    ("advance both out and scored", False,
+     "SELECT play_id FROM runner_advances WHERE is_out = 1 AND scored = 1"),
+    ("tag on an unparsed play", False,
+     "SELECT t.play_id FROM play_tags t JOIN plays p USING (play_id)"
+     " WHERE p.parse_status = 'unparsed'"),
+]
+
+_TRUSTED = "p.parse_status NOT IN ('unparsed','state_untrusted')"
+
+
+def cmd_verify_derived(args: argparse.Namespace) -> int:
+    """Integrity checks on the derived tables (spec/07-TESTING.md §4).
+
+    Complements `verify`, which checks the raw layer. The raw checks prove
+    nothing was lost in ingest; these prove it was filed correctly.
+    """
+    db_path = Path(args.database) if args.database else QUERY_DB
+    if not db_path.exists():
+        print(f"no query database at {db_path}; run `rsse derive` first",
+              file=sys.stderr)
+        return 2
+    conn = dbschema.connect(f"file:{db_path}?mode=ro")
+    conn.execute("PRAGMA cache_size = -400000")
+
+    untrusted = conn.execute(
+        "SELECT COUNT(*) FROM plays WHERE parse_status = 'state_untrusted'"
+    ).fetchone()[0]
+    unparsed = conn.execute(
+        "SELECT COUNT(*) FROM plays WHERE parse_status = 'unparsed'"
+    ).fetchone()[0]
+    print(f"unparsed plays       {unparsed:,}")
+    print(f"untrusted state      {untrusted:,}   (excluded from base-state checks)")
+    print()
+
+    failed = 0
+    for name, trusted_only, sql in DERIVED_CHECKS:
+        query = f"{sql} AND {_TRUSTED}" if trusted_only else sql
+        started = time.time()
+        count = conn.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
+        mark = "ok  " if count == 0 else "FAIL"
+        print(f"{mark} {name:44s} {count:>10,}   ({time.time() - started:5.1f}s)",
+              flush=True)
+        if count:
+            failed += 1
+            for row in conn.execute(query + " LIMIT 3"):
+                print(f"       e.g. play_id {row[0]}")
+    conn.close()
+
+    print(f"\n{len(DERIVED_CHECKS) - failed}/{len(DERIVED_CHECKS)} checks pass")
+    print(f"\n{ATTRIBUTION}")
+    return 1 if failed else 0
+
+
+# ---------------------------------------------------------------------------
+# query (spec/06-QUERY.md §8)
+# ---------------------------------------------------------------------------
+
+#: Flags that map one-to-one onto a `Search` method. Kept as data so `query`
+#: and `explain` cannot drift apart: both build the search through `_search`.
+_QUERY_FLAGS = [
+    ("--bases", "bases", str), ("--outs", "outs", int),
+    ("--outs-after", "outs_after", int), ("--inning", "inning", int),
+    ("--inning-at-least", "inning_at_least", int), ("--half", "half", str),
+    ("--season", "season", int), ("--league", "league", str),
+    ("--team", "team", str), ("--batting-team", "batting_team", str),
+    ("--fielding-team", "fielding_team", str), ("--batter", "batter", str),
+    ("--park", "park", str), ("--runner-on", "runner_on", str),
+    ("--out-at", "out_at", str), ("--batter-ran", "batter_ran", str),
+    ("--error", "error", int), ("--hit-location", "hit_location", str),
+    ("--event-matches", "event_matches", str),
+]
+_QUERY_SWITCHES = [
+    ("--bases-loaded", "bases_loaded"), ("--bases-empty", "bases_empty"),
+    ("--scoring-position", "scoring_position"),
+    ("--inning-ending", "inning_ending"), ("--walkoff", "walkoff"),
+    ("--strikeout", "strikeout"), ("--dropped-third", "dropped_third"),
+    ("--batter-reached-on-k", "batter_reached_on_k"),
+    ("--double-play", "double_play"), ("--triple-play", "triple_play"),
+    ("--include-uncertain", "include_uncertain"),
+    ("--include-untrusted", "include_untrusted"),
+    ("--include-unparsed", "include_unparsed"),
+    ("--curated-only", "curated_only"), ("--exclude-curated", "exclude_curated"),
+    ("--include-exhibition", "include_exhibition"),
+    ("--include-allstar", "include_allstar"),
+    ("--only-postseason", "only_postseason"),
+]
+
+
+def _search_from_args(args) -> "object":
+    from .query import Search
+    s = Search()
+    for flag, method, cast in _QUERY_FLAGS:
+        value = getattr(args, flag.lstrip("-").replace("-", "_"), None)
+        if value is not None:
+            s = getattr(s, method)(cast(value))
+    for flag, method in _QUERY_SWITCHES:
+        if getattr(args, flag.lstrip("-").replace("-", "_"), False):
+            s = getattr(s, method)()
+    if args.seasons:
+        lo, hi = (int(x) for x in args.seasons.split(","))
+        s = s.seasons(lo, hi)
+    if args.tag:
+        for name in args.tag:
+            s = s.tag(name)
+    if args.force_play_at or args.force_play:
+        s = s.force_play(at=args.force_play_at,
+                         include_tag_outs=args.include_tag_outs,
+                         certainty=args.force_certainty)
+    if args.tag_out_at:
+        s = s.tag_out(at=args.tag_out_at)
+    if args.putout_sequence:
+        s = s.putout_sequence(args.putout_sequence.split(","))
+    if args.contains_sequence:
+        s = s.contains_sequence(args.contains_sequence.split(","))
+    if args.putout_by:
+        s = s.putout_by(int(args.putout_by),
+                        assist_by=[int(x) for x in args.assist_by.split(",")]
+                        if args.assist_by else ())
+    return s
+
+
+def _add_query_flags(sub) -> None:
+    for flag, _method, _cast in _QUERY_FLAGS:
+        sub.add_argument(flag)
+    for flag, _method in _QUERY_SWITCHES:
+        sub.add_argument(flag, action="store_true")
+    sub.add_argument("--seasons", help="LO,HI inclusive")
+    sub.add_argument("--tag", action="append", help="repeatable")
+    sub.add_argument("--force-play", action="store_true")
+    sub.add_argument("--force-play-at")
+    sub.add_argument("--force-certainty", choices=["derived", "likely",
+                                                   "ambiguous"])
+    sub.add_argument("--include-tag-outs", action="store_true")
+    sub.add_argument("--tag-out-at")
+    sub.add_argument("--putout-sequence", help="e.g. 2,1")
+    sub.add_argument("--contains-sequence")
+    sub.add_argument("--putout-by")
+    sub.add_argument("--assist-by")
+    sub.add_argument("--database")
+    sub.add_argument("--limit", type=int, default=25)
+
+
+def cmd_query(args: argparse.Namespace) -> int:
+    """Run a search and print it with its coverage (spec/06-QUERY.md §8)."""
+    from .query import QueryError, connect
+
+    db_path = Path(args.database) if args.database else QUERY_DB
+    if not db_path.exists():
+        print(f"no query database at {db_path}; run `rsse derive` first",
+              file=sys.stderr)
+        return 2
+    conn = connect(str(db_path))
+    try:
+        result = _search_from_args(args).run(conn, limit=args.limit)
+    except QueryError as exc:
+        print(f"bad query: {exc}", file=sys.stderr)
+        return 2
+    except NotImplementedError as exc:
+        print(f"not available yet: {exc}", file=sys.stderr)
+        return 2
+
+    if args.format == "json":
+        import dataclasses
+        print(json.dumps({
+            "rows": [dataclasses.asdict(r) for r in result.rows],
+            "total": result.total,
+            "coverage": dataclasses.asdict(result.coverage),
+            "excluded": dataclasses.asdict(result.excluded),
+            "force": dataclasses.asdict(result.force) if result.force else None,
+            "corpus_version": result.corpus_version,
+            "ontology_version": result.ontology_version,
+            "sql": result.sql,
+            "attribution": ATTRIBUTION,
+        }, indent=2, default=str))
+        return 0
+
+    if args.format == "csv":
+        import csv
+        writer = csv.writer(sys.stdout)
+        writer.writerow(["game_id", "date", "inning", "half", "batter_id",
+                         "outs_before", "bases_before", "event_raw", "tags"])
+        for r in result.rows:
+            writer.writerow([r.game_id, r.date, r.inning, r.half, r.batter_id,
+                             r.outs_before, r.bases_before, r.event_raw,
+                             " ".join(r.tags)])
+        print(f"# {ATTRIBUTION}")
+        return 0
+
+    for r in result.rows:
+        print(r.describe())
+    shown = len(result.rows)
+    print(f"\n{result.total:,} matching plays"
+          + (f" ({shown} shown)" if shown < result.total else ""))
+    # Never a bare count: coverage says what was searched, so an empty result
+    # reads "not in these games" rather than "never happened" (§6).
+    print(f"searched: {result.coverage.describe()}")
+    for note in result.coverage.notes:
+        print(f"  note: {note}")
+    print(result.excluded.describe())
+    if result.force:
+        print(result.force.describe())
+    print(f"corpus: {result.corpus_version}; ontology {result.ontology_version}")
+    print(f"\n{ATTRIBUTION}")
+    return 0
+
+
+def cmd_explain(args: argparse.Namespace) -> int:
+    """Print the SQL and query plan without running the search."""
+    from .query import QueryError, connect
+
+    db_path = Path(args.database) if args.database else QUERY_DB
+    if not db_path.exists():
+        print(f"no query database at {db_path}", file=sys.stderr)
+        return 2
+    conn = connect(str(db_path))
+    try:
+        info = _search_from_args(args).explain(conn)
+    except (QueryError, NotImplementedError) as exc:
+        print(f"{exc}", file=sys.stderr)
+        return 2
+    print(info["sql"])
+    print(f"\nparams: {info['params']}")
+    print("\nplan:")
+    for row in info["plan"]:
+        print("  ", row[-1] if isinstance(row, tuple) else row)
+    for warning in info["warnings"]:
+        print(f"\nWARNING: {warning}")
+    return 0
+
+
+def cmd_coverage(args: argparse.Namespace) -> int:
+    """Rebuild or print the coverage table (spec/05-DATABASE.md §5)."""
+    from .database import coverage as cov
+
+    db_path = Path(args.database) if args.database else QUERY_DB
+    if not db_path.exists():
+        print(f"no query database at {db_path}", file=sys.stderr)
+        return 2
+    if args.rebuild:
+        conn = dbschema.connect(str(db_path))
+        rows = cov.build(conn)
+        print(f"coverage rebuilt: {rows} (season, league) rows")
+        conn.close()
+
+    conn = dbschema.connect(f"file:{db_path}?mode=ro")
+    where, params = "", ()
+    if args.season_range:
+        lo, hi = (int(x) for x in args.season_range.split(","))
+        where, params = " WHERE season BETWEEN ? AND ?", (lo, hi)
+    print(f"{'season':>7} {'lg':<4} {'games':>7} {'plays':>10} "
+          f"{'pitches':>8} {'unparsed':>9} {'untrusted':>10}  dates")
+    total_games = total_plays = 0
+    for row in conn.execute(
+            "SELECT season, league, games, plays, games_with_pitches,"
+            " plays_unparsed, plays_inconsistent, first_date, last_date"
+            f" FROM coverage{where} ORDER BY season, league", params):
+        print(f"{row[0]:>7} {row[1]:<4} {row[2]:>7,} {row[3]:>10,} "
+              f"{row[4]:>8,} {row[5]:>9,} {row[6]:>10,}  {row[7]}..{row[8]}")
+        total_games += row[2]
+        total_plays += row[3]
+    print(f"\n{total_games:,} games, {total_plays:,} plays")
+    print(f"\n{ATTRIBUTION}")
+    conn.close()
+    return 0
+
+
 def cmd_replay(args: argparse.Namespace) -> int:
     """Replay every game and check the state machine (spec/07-TESTING.md §4).
 
@@ -462,8 +809,11 @@ def cmd_derive(args: argparse.Namespace) -> int:
               f"{', '.join(str(s) for s in seasons)}", file=sys.stderr)
 
     def progress(season, stats):
-        print(f"  {season} ... ({stats.plays:,} plays)", file=sys.stderr,
-              flush=True)
+        # Fires when a season is first *seen*, so the count is the total
+        # through the previous ones. Reading it as "this season produced N"
+        # makes the last line look ~200k plays short of the final total.
+        print(f"  starting {season}  ({stats.plays:,} plays derived so far)",
+              file=sys.stderr, flush=True)
 
     started = time.time()
     stats = derived.build(
@@ -749,9 +1099,29 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--report", help="write a JSON census to this path")
     t.set_defaults(func=cmd_tags)
 
+    q = sub.add_parser("query", help="search the derived tables")
+    _add_query_flags(q)
+    q.add_argument("--format", choices=["table", "json", "csv"],
+                   default="table")
+    q.set_defaults(func=cmd_query)
+
+    x = sub.add_parser("explain", help="show the SQL and plan for a search")
+    _add_query_flags(x)
+    x.set_defaults(func=cmd_explain)
+
+    cv = sub.add_parser("coverage", help="what the corpus actually covers")
+    cv.add_argument("--database")
+    cv.add_argument("--rebuild", action="store_true")
+    cv.add_argument("--season-range", help="LO,HI inclusive")
+    cv.set_defaults(func=cmd_coverage)
+
     v = sub.add_parser("verify", help="check raw-layer integrity")
     v.add_argument("--archive")
-    v.set_defaults(func=cmd_verify)
+    v.add_argument("--derived", action="store_true",
+                   help="check the derived tables instead of the archive")
+    v.add_argument("--database")
+    v.set_defaults(func=lambda a: (cmd_verify_derived(a) if a.derived
+                                   else cmd_verify(a)))
 
     args = ap.parse_args(argv)
     return args.func(args)

@@ -25,6 +25,13 @@ class ParseStatus:
     #: The replay is self-consistent but the play contradicts the rulebook --
     #: a statement about the data, not about the state machine.
     CONTRADICTS_RULES = "data_contradicts_rules"
+    #: The play parsed cleanly, but it inherited a base-out state known to be
+    #: wrong: an earlier play in the same half-inning could not be parsed, so
+    #: its effect was never applied. A statement about the *context*, not about
+    #: this play's event string -- which is why it needs its own value rather
+    #: than reusing AMBIGUOUS. Assigned by the loader, which can see the whole
+    #: half-inning, not by `apply_play`, which sees one play. See §7.
+    UNTRUSTED = "state_untrusted"
 
 
 @dataclass(frozen=True)
@@ -104,8 +111,11 @@ class PlayOutcome:
         return self.outs_after >= 3
 
     #: Weakest to strongest; a stronger status is never downgraded.
-    _RANK = {"ok": 0, "data_contradicts_rules": 1, "state_ambiguous": 2,
-             "state_inconsistent": 3}
+    #: `state_untrusted` ranks just above `ok`: it says nothing is wrong with
+    #: this play, only with the state it inherited, so any finding about the
+    #: play itself outranks it.
+    _RANK = {"ok": 0, "state_untrusted": 1, "data_contradicts_rules": 2,
+             "state_ambiguous": 3, "state_inconsistent": 4}
 
     def flag(self, status: str, note: str) -> None:
         if self._RANK[status] > self._RANK[self.parse_status]:

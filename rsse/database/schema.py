@@ -184,11 +184,15 @@ CREATE TABLE IF NOT EXISTS plays (
   event_advances TEXT NOT NULL,
   annotations    TEXT NOT NULL,
 
-  outs_before    INTEGER NOT NULL,
-  outs_recorded  INTEGER NOT NULL,
-  outs_after     INTEGER NOT NULL,
-  bases_before   TEXT NOT NULL,
-  bases_after    TEXT NOT NULL,
+  -- Nullable on purpose. An unparsed play's effect cannot be applied, so its
+  -- base-out state is unknown; NOT NULL here forced the loader to write zeros,
+  -- and a stored '000' is indistinguishable from bases genuinely empty. NULL
+  -- is the only honest value. See spec/03-STATE.md §7.
+  outs_before    INTEGER,
+  outs_recorded  INTEGER,
+  outs_after     INTEGER,
+  bases_before   TEXT,
+  bases_after    TEXT,
   runner_1_before TEXT, runner_2_before TEXT, runner_3_before TEXT,
 
   batter_dest    TEXT,
@@ -207,7 +211,8 @@ CREATE TABLE IF NOT EXISTS plays (
   parse_status   TEXT NOT NULL DEFAULT 'ok'
     CHECK (parse_status IN ('ok','parsed_untagged','unparsed',
                             'data_contradicts_rules',
-                            'state_ambiguous','state_inconsistent')),
+                            'state_ambiguous','state_inconsistent',
+                            'state_untrusted')),
   parse_error    TEXT,
   parser_version TEXT NOT NULL,
 

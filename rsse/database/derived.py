@@ -26,8 +26,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator
 
-from ..model.game import GameReplay, replay_game
-from ..model.state import credit_sequences
+from ..model.game import GameReplay, half_for, replay_game
+from ..model.state import ParseStatus, credit_sequences
 from ..parser.records import Record, parse_line
 from ..semantic import ontology as O
 from ..semantic.derive import CuratedEntry, load_curated, tag_rows, tags_for_play
@@ -211,23 +211,44 @@ def derive_game(span: dict, records: list[Record], record_ids: list[int],
     }
     play_id = play_id_start
 
+    # Half-innings holding a play that could not be parsed. Its effect on the
+    # base-out state was never applied, so every *later* play in that half
+    # inherits a state known to be wrong -- and parses perfectly well on it.
+    # Only the loader can see this: `apply_play` sees one play at a time and
+    # has nothing to be suspicious of. See spec/03-STATE.md §7.
+    untrusted: set[tuple[int, str]] = set()
+
     for play in replay.plays:
         play_id += 1
         outcome, context, parsed = play.outcome, play.context, play.parsed
+        # `context` is None for an unparsed play, so the half is recomputed
+        # here -- from `home_bats_first`, not from the team number, which is
+        # backwards for the 51 `htbf` games (§6.5).
+        half = (context.half if context is not None
+                else half_for(play.team, replay.home_bats_first))
         if outcome is None or parsed is None:
             # Unparseable: recorded so the play is not silently absent, with
-            # every derived column left NULL or zero rather than invented.
+            # every derived column left NULL rather than invented. The
+            # base-out columns are nullable precisely for this row: a stored
+            # '000' would be indistinguishable from bases genuinely empty.
             stats.unparsed += 1
+            untrusted.add((play.inning, half))
             rows["plays"].append(_check_row("plays", (
                 play_id, span["game_key"], span["game_id"], play.seq,
                 by_line.get(play.line_no), play.inning,
-                "top" if play.team == 0 else "bottom", play.team,
+                half, play.team,
                 play.batter_id, None, None, "", play.event, "", "[]", "[]", "[]",
-                0, 0, 0, "000", "000", None, None, None,
+                None, None, None, None, None, None, None, None,
                 None, 0, "unknown", 0, 0, 0, 0, 0, 0, 0,
                 "unparsed", play.error, parser_version,
             ), _PLAY_COLUMNS))
             continue
+
+        status = outcome.parse_status
+        if status == ParseStatus.OK and (play.inning, half) in untrusted:
+            # Only an otherwise-clean play is relabelled: a finding about the
+            # play itself is the more specific statement and outranks this.
+            status = ParseStatus.UNTRUSTED
 
         event = parsed.event
         rows["plays"].append(_check_row("plays", (
@@ -248,7 +269,7 @@ def derive_game(span: dict, records: list[Record], record_ids: list[int],
             context.score_batting_before, context.score_fielding_before,
             int(outcome.is_inning_ending), int(context.is_final_play),
             int(context.is_walkoff), int(context.is_go_ahead),
-            outcome.parse_status,
+            status,
             "; ".join(outcome.notes) or None, parser_version,
         ), _PLAY_COLUMNS))
 
@@ -282,10 +303,9 @@ def derive_game(span: dict, records: list[Record], record_ids: list[int],
     stats.credits += len(rows["fielding_credits"])
     stats.sequences += len(rows["credit_sequences"])
     stats.tags += len(rows["play_tags"])
-    for play in replay.plays:
-        if play.outcome is not None:
-            key = play.outcome.parse_status
-            stats.status[key] = stats.status.get(key, 0) + 1
+    for row in rows["plays"]:
+        key = row[_PLAY_COLUMNS.index("parse_status")]
+        stats.status[key] = stats.status.get(key, 0) + 1
 
     return {"rows": rows, "game": game_row(span, records, replay),
             "next_play_id": play_id}

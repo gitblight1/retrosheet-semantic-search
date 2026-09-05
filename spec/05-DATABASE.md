@@ -190,11 +190,13 @@ CREATE TABLE plays (
   event_advances TEXT NOT NULL,             -- JSON array
   annotations    TEXT NOT NULL,             -- JSON [[offset,char],...]
 
-  outs_before    INTEGER NOT NULL,
-  outs_recorded  INTEGER NOT NULL,
-  outs_after     INTEGER NOT NULL,
-  bases_before   TEXT NOT NULL,             -- '000'..'111'
-  bases_after    TEXT NOT NULL,
+  -- Nullable: NULL for an unparsed play, whose state was never computed.
+  -- A stored '000' would read as bases genuinely empty (03-STATE §7.1).
+  outs_before    INTEGER,
+  outs_recorded  INTEGER,
+  outs_after     INTEGER,
+  bases_before   TEXT,                      -- '000'..'111', or NULL
+  bases_after    TEXT,
   runner_1_before TEXT, runner_2_before TEXT, runner_3_before TEXT,
 
   batter_dest    TEXT,                      -- '1','2','3','H','out',NULL
@@ -214,7 +216,8 @@ CREATE TABLE plays (
   parse_status   TEXT NOT NULL DEFAULT 'ok'
     CHECK (parse_status IN ('ok','parsed_untagged','unparsed',
                             'data_contradicts_rules',
-                            'state_ambiguous','state_inconsistent')),
+                            'state_ambiguous','state_inconsistent',
+                            'state_untrusted')),
   parse_error    TEXT,
   parser_version TEXT NOT NULL,
 
@@ -406,6 +409,9 @@ CREATE TABLE comments (
   PRIMARY KEY (game_key, seq)
 );
 
+-- Built by `rsse coverage --rebuild` from `games` and `plays`, not carried
+-- through the load: it is a GROUP BY, so it costs seconds after a derive and
+-- would otherwise be a second thing to keep in step with the data.
 CREATE TABLE coverage (
   corpus_id INTEGER NOT NULL REFERENCES corpus,
   season INTEGER NOT NULL, league TEXT NOT NULL,

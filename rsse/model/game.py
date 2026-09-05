@@ -160,7 +160,7 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
             # Keyed off the `team` field and the game's own `htbf`, never off an
             # assumption that the visitor bats first (§6.5). In an `htbf` game
             # team 1 -- the home team -- bats in the top half.
-            half=_half_for(play.team, out.home_bats_first),
+            half=half_for(play.team, out.home_bats_first),
             team=play.team,
             scheduled_innings=out.scheduled_innings,
             score_batting_before=batting_before,
@@ -196,7 +196,7 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
     return out
 
 
-def _half_for(team: int, home_bats_first: bool) -> str:
+def half_for(team: int, home_bats_first: bool) -> str:
     """Which half of the inning ``team`` bats in (§6.5).
 
     Normally the visitor (team 0) bats in the top. `info,htbf,true` reverses
