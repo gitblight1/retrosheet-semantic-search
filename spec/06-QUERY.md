@@ -55,12 +55,35 @@ Straight column filters on `plays` ([05-DATABASE](05-DATABASE.md) §3).
 | `.score_diff(lo, hi)` | batting-team differential, inclusive |
 | `.season(y)` / `.seasons(lo, hi)` | via `games.season` |
 | `.team(code)` / `.batting_team(code)` / `.fielding_team(code)` | via `games` |
-| `.batter(id)` / `.pitcher(id)` / `.fielder(pos, id)` | ids, never names |
+| `.batter(id)` | `plays.batter_id` — ids, never names |
+| `.pitcher(id)` / `.fielder(pos, id)` | via `lineup_entries`; see §2.1 |
 | `.park(id)` | `games.site` |
 
 Ambiguous names are given both forms rather than a default: `.outs()` /
 `.outs_after()`. The original `.outs(2)` did not say which, and for the
 motivating play the two differ (2 before, 3 after).
+
+### 2.1 The lineup is a timeline, not a mapping
+
+`plays` names the batter and nobody else, so "who was pitching?" has to be
+reconstructed. `lineup_entries` holds one row per `start` and `sub` record with
+`play_id` set to the play a substitute entered *after*, and the holder of a
+position at a given play is **the last entry that had taken effect by then**.
+So `.fielder(pos, id)` compiles to an `EXISTS` with a `NOT EXISTS` over later
+entries, not an equality join — an equality join matches a replaced fielder as
+well as his replacement.
+
+`.pitcher(id)` is `.fielder(1, id)`.
+
+Deliberately **not** answered from `fielding_credits`. Those record who touched
+the ball, which is a different question: a pitcher who faced nine batters
+without a putout or assist would vanish from the results entirely. The
+credits question is `.putout_by()`.
+
+The invariant that makes this testable: summing `.fielder(pos, id)` over every
+player who ever held `pos` must equal the total number of plays, since exactly
+one player holds a position on any given play. It is asserted in
+[tests/test_query.py](../tests/test_query.py).
 
 ## 3. Play predicates
 
@@ -303,12 +326,11 @@ so it is rebuilt in seconds after a derive rather than carried through the load.
 Built and tested. `Search`, the compiler, `CoverageReport`, `ExcludedCounts`,
 `ForceReport`, and the `query` / `explain` / `coverage` commands.
 
-Two predicates are **not** implemented and raise `NotImplementedError` naming
-the missing table rather than returning nothing: `.pitcher()` and `.fielder()`
-both need `lineup_entries` ([05-DATABASE](05-DATABASE.md) §2), which is
-specified and not yet built. Silently matching zero rows is the one behaviour
-this API must never have, since zero is a meaningful answer everywhere else in
-it.
+`.pitcher()` and `.fielder()` are implemented (§2.1) against
+`lineup_entries`, which `rsse secondary` builds. Until that table existed both
+raised `NotImplementedError` naming it rather than returning nothing — silently
+matching zero rows is the one behaviour this API must never have, since zero is
+a meaningful answer everywhere else in it.
 
 Building it found two defects in the API's own contract:
 

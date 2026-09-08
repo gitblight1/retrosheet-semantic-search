@@ -12,6 +12,7 @@ from dataclasses import dataclass, field, replace
 from ..parser.parser import ParseError, ParsedEvent, parse
 from ..parser.grammar import NoPlay
 from ..parser.records import PlayRecord, Record
+from .comments import Comment, classify
 from .state import (HalfInningState, ParseStatus, PlayContext, PlayOutcome,
                     Runner, apply_play)
 
@@ -43,6 +44,10 @@ class ReplayedPlay:
 class GameReplay:
     game_id: str
     plays: list[ReplayedPlay] = field(default_factory=list)
+    #: `(index into plays, line_no, Comment)` for every `com` record, in file
+    #: order. The index is the count of plays seen so far, so 0 means the
+    #: comment precedes the first play -- a game-level note, not a play note.
+    comments: list[tuple[int, int, "Comment"]] = field(default_factory=list)
     runs: dict[int, int] = field(default_factory=lambda: {0: 0, 1: 0})
     #: From `info,innings`, present only from 2020 on. 518 games in the corpus
     #: are scheduled for 7 innings, so defaulting to 9 misreports every one of
@@ -108,6 +113,20 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
             # The team batted out of order; the next plate appearance carries
             # the tag, since the record that says so is a different record.
             after_ladj = True
+            continue
+        if rec.type == "com":
+            # A `com` record describes the play *before* it, so the link is to
+            # the play just appended. Only a structured `replay` record carries
+            # a verdict; prose saying "call was overturned by replay" is not
+            # read, because parsing English into a derived fact is exactly the
+            # guess this project does not make.
+            comment = classify(rec.raw)
+            out.comments.append((len(out.plays), rec.line_no, comment))
+            if (comment.replay_reversed is not None and out.plays
+                    and out.plays[-1].context is not None):
+                last = out.plays[-1]
+                last.context = replace(
+                    last.context, replay_reversed=comment.replay_reversed)
             continue
         if rec.type != "play":
             continue

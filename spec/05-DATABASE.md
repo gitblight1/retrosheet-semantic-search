@@ -138,14 +138,23 @@ CREATE TABLE game_info (
 
 CREATE TABLE lineup_entries (
   game_key     INTEGER NOT NULL REFERENCES games,
-  seq          INTEGER NOT NULL,       -- 0 for start records, then sub order
+  -- A running index in file order, not "0 for every start record". With all
+  -- starters sharing seq 0 the primary key depends on no game listing the
+  -- same player twice at the same position, which is an assumption about
+  -- 203,285 games rather than a key. Running order is unique by construction
+  -- and preserves the same information.
+  seq          INTEGER NOT NULL,
   is_sub       INTEGER NOT NULL,
+  -- The play a substitute entered after; NULL for a starter. This is what
+  -- makes the table a timeline rather than a mapping, and it is what
+  -- `.pitcher()` and `.fielder()` read (06-QUERY §2).
+  play_id      INTEGER REFERENCES plays,
   player_id    TEXT NOT NULL,
   player_name  TEXT NOT NULL,
   team         INTEGER NOT NULL CHECK (team IN (0,1)),
   batting_order INTEGER NOT NULL,      -- 0 = pitcher in a DH game
   position     INTEGER NOT NULL,       -- 10 DH, 11 PH, 12 PR
-  PRIMARY KEY (game_key, seq, player_id, position)
+  PRIMARY KEY (game_key, seq)
 );
 
 CREATE TABLE players (
@@ -402,10 +411,16 @@ re-derive; `source='curated'` rows are preserved ([04-ONTOLOGY](04-ONTOLOGY.md)
 ```sql
 CREATE TABLE comments (
   game_key INTEGER NOT NULL REFERENCES games, seq INTEGER NOT NULL,
-  play_id INTEGER REFERENCES plays,
-  kind TEXT NOT NULL CHECK (kind IN ('text','replay','ejection','umpchange',
-                                     'protest','suspend')),
+  play_id INTEGER REFERENCES plays,          -- the play *before* the comment
+  record_id INTEGER NOT NULL,                -- archive raw_records.record_id
+  -- `protest` is not here: no `com` record carries a structured protest
+  -- sub-record. The 861 comments mentioning a protest are prose and stay
+  -- `text`, because inventing a kind the data does not encode would make an
+  -- absence look like a finding.
+  kind TEXT NOT NULL CHECK (kind IN ('text','replay','ejection',
+                                     'umpchange','suspend')),
   text TEXT NOT NULL, payload TEXT,          -- JSON for structured kinds
+  marker INTEGER NOT NULL DEFAULT 0,         -- the body began with `$`
   PRIMARY KEY (game_key, seq)
 );
 
@@ -425,6 +440,65 @@ CREATE TABLE coverage (
   PRIMARY KEY (corpus_id, season, league)
 );
 ```
+
+### 5.1 `com` records carry a second record format inside them
+
+222,495 `com` records, and 88% are free text. The rest hold **structured
+sub-records in the quoted body** — an undocumented format nested inside the
+documented one:
+
+```
+com,"ej,mcgud101,M,sherj901,Call at 2B"
+com,"replay,6,pench001,HOU,welkt901,HOU03,O,N,I,,H"
+com,"umpchange,4,ump1b,hurst801"
+com,"suspended,19131002,NYC14,fans in bleachers"
+```
+
+| Tag | Records | Fields |
+|---|---|---|
+| `ej` | 18,157 | person, role (`M` manager / `P` player), umpire, reason |
+| `replay` | 5,106 | inning, player, team, umpire, site, call, **`Y`/`N` reversed**, … |
+| `umpchange` | 1,468 | inning, position, umpire (`(none)` for a vacancy) |
+| `suspended` | 195 | date `yyyymmdd`, site, reason |
+
+**The `Y`/`N` field is the only machine-readable record of a replay verdict,
+and its meaning is inferred.** It was cross-checked before being relied on: of
+the 5,102 well-formed records, `Y` sits next to a prose comment saying
+"overturned" 2,374 times against 5 saying "upheld", and `N` next to "upheld"
+2,532 times against 30 saying "overturned" — 98.6% agreement with an
+independent human account of the same play. The 48% reversal rate also matches
+the published MLB figure. The 35 disagreements are stored as written rather
+than reconciled; they are a statement about the data.
+
+**A tag prefix is not sufficient to identify one.** Four prose comments begin
+`replay, ` — "replay, scoring two runs" — and a prefix test alone reads them as
+structured records and fabricates a verdict. Every parser therefore also
+requires the field count and the shape of the fields it depends on. This is the
+one place in the pipeline where a misclassification would produce a confident
+wrong answer rather than a missing one.
+
+The `$` prefix on 66,000 comment bodies is recorded as `marker` and **not
+interpreted**. It appears in every era and the pattern does not settle to a
+single reading — play-level versus game-level, or the start of a comment split
+across records, both fit some cases and not others. Named neutrally for the
+same reason as the `U` coverage marker ([02-GRAMMAR](02-GRAMMAR.md) §4.1).
+
+### 5.2 Build order
+
+`comments` and `lineup_entries` are built by `rsse secondary`, a separate pass
+over the archive, **not** by `derive`. Neither needs the state machine: a `com`
+record attaches to the play before it, and `plays.record_id` already names each
+play's archive record, so the link is a lookup. That takes minutes instead of
+an hour and a half, and it means both tables can be added to an existing query
+database without re-deriving 17.9 million plays.
+
+The tag `ReplayOverturned` is the exception and does need a re-derive, because
+it is a *tag*: `rsse/model/game.py` sets `PlayContext.replay_reversed` from a
+linked structured `replay` comment during replay, and tags are derived there.
+
+Because these tables are not derived, `derive --rebuild` — which replaces the
+file — destroys them. It counts and names them before doing so rather than
+letting them disappear quietly.
 
 ## 6. Operational notes
 

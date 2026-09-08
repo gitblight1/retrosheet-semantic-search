@@ -186,16 +186,45 @@ class Search:
                                games_only=True))
 
     def pitcher(self, player_id: str) -> "Search":
-        raise NotImplementedError(
-            "`.pitcher()` needs the `lineup_entries` table, which is specified "
-            "(05-DATABASE §2) but not yet built. `plays` records the batter "
-            "only. Refusing rather than silently matching nothing.")
+        """Plays on which ``player_id`` was the pitcher of record.
+
+        Not a column: `plays` names the batter only. The pitcher has to be
+        reconstructed from `lineup_entries` -- the latest entry at position 1
+        for the fielding team that took effect at or before this play.
+        """
+        return self.fielder(1, player_id)
 
     def fielder(self, position: int, player_id: str) -> "Search":
-        raise NotImplementedError(
-            "`.fielder()` needs `lineup_entries` to map a position to a player "
-            "for a given game and inning; only fielding *credits* by position "
-            "are stored. See `.putout_by()` for the position-only question.")
+        """Plays on which ``player_id`` held ``position`` for the fielding team.
+
+        The lineup is a *timeline*, not a mapping. A `start` record applies
+        from the first play; a `sub` record applies only from the play after
+        the one it follows. So the holder of a position at a given play is the
+        last entry that had taken effect by then -- which is why this compiles
+        to a NOT EXISTS over later entries rather than an equality join.
+
+        Deliberately not answered with `fielding_credits`: those record who
+        *touched the ball*, which is a different question, and a pitcher who
+        faced nine batters without a putout would vanish from the results.
+        See `.putout_by()` for the credits question.
+        """
+        position = int(position)
+        # `team` in lineup_entries is 0 visitor / 1 home, as in `batting_team`,
+        # so the fielding side is its complement.
+        effective = ("(le.is_sub = 0 OR le.play_id IS NULL"
+                     " OR le.play_id < p.play_id)")
+        later = ("(le2.is_sub = 0 OR le2.play_id IS NULL"
+                 " OR le2.play_id < p.play_id)")
+        return self._with(Pred(
+            "EXISTS (SELECT 1 FROM lineup_entries le"
+            "  WHERE le.game_key = p.game_key AND le.position = ?"
+            "    AND le.team = 1 - p.batting_team AND le.player_id = ?"
+            f"   AND {effective}"
+            "    AND NOT EXISTS (SELECT 1 FROM lineup_entries le2"
+            "         WHERE le2.game_key = p.game_key AND le2.position = ?"
+            "           AND le2.team = le.team AND le2.seq > le.seq"
+            f"          AND {later}))",
+            (position, player_id, position)))
 
     # -- §3 play predicates ----------------------------------------------
 

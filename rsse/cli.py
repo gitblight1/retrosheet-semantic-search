@@ -649,6 +649,54 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_secondary(args: argparse.Namespace) -> int:
+    """Build `comments` and `lineup_entries` (spec/05-DATABASE.md §2, §5).
+
+    A separate pass, not part of `derive`: neither table needs the state
+    machine, and `plays.record_id` already links each play to its archive
+    record, so both can be added to an existing query database without
+    re-deriving 17.9 million plays.
+    """
+    from .database import secondary
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    query_path = Path(args.database) if args.database else QUERY_DB
+    for path, what in ((archive_path, "ingest"), (query_path, "derive")):
+        if not path.exists():
+            print(f"no database at {path}; run `rsse {what}` first",
+                  file=sys.stderr)
+            return 2
+
+    conn = dbschema.connect(str(query_path))
+    for pragma in dbschema.LOAD_PRAGMAS:
+        conn.execute(pragma)
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+
+    def progress(season, stats):
+        print(f"  {season} ... ({stats.comments:,} comments,"
+              f" {stats.lineup_entries:,} lineup entries)",
+              file=sys.stderr, flush=True)
+
+    started = time.time()
+    stats = secondary.build(conn, archive,
+                            progress=progress if args.progress else None)
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    conn.commit()
+
+    print(f"games                {stats.games:,}")
+    print(f"comments             {stats.comments:,}")
+    print(f"  by kind            {dict(sorted(stats.kinds.items()))}")
+    print(f"  replay verdicts    {stats.replay_verdicts:,}")
+    print(f"lineup_entries       {stats.lineup_entries:,}")
+    print(f"  unreadable         {len(stats.malformed):,}")
+    for raw in stats.malformed[:5]:
+        print(f"    {raw[:100]}")
+    print(f"wall clock           {(time.time() - started) / 60:.1f} min")
+    conn.close()
+    print(f"\n{ATTRIBUTION}")
+    return 1 if stats.malformed else 0
+
+
 def cmd_coverage(args: argparse.Namespace) -> int:
     """Rebuild or print the coverage table (spec/05-DATABASE.md §5)."""
     from .database import coverage as cov
@@ -774,6 +822,34 @@ def cmd_replay(args: argparse.Namespace) -> int:
     return 0 if bad_games == 0 else 1
 
 
+#: Tables in the query database that `derive` does not rebuild. Kept as data
+#: so a new build step cannot be forgotten here: a table that `--rebuild`
+#: destroys and nothing recreates is a gap nobody would notice.
+NON_DERIVED_TABLES = ("comments", "lineup_entries", "players", "teams", "parks")
+
+
+def _non_derived_tables(path: Path) -> list[tuple[str, int]]:
+    """`(table, row count)` for non-derived tables present and non-empty."""
+    try:
+        conn = dbschema.connect(f"file:{path}?mode=ro")
+    except Exception:
+        return []
+    found = []
+    try:
+        present = {r[0] for r in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'")}
+        for table in NON_DERIVED_TABLES:
+            if table in present:
+                rows = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
+                if rows:
+                    found.append((table, rows))
+    except Exception:
+        return found
+    finally:
+        conn.close()
+    return found
+
+
 def cmd_derive(args: argparse.Namespace) -> int:
     """Build the derived tables from the archive (spec/05-DATABASE.md §2-§4).
 
@@ -794,6 +870,29 @@ def cmd_derive(args: argparse.Namespace) -> int:
         return 2
 
     query_path.parent.mkdir(parents=True, exist_ok=True)
+    if args.rebuild and query_path.exists() and not args.keep_file:
+        # Replace the file rather than dropping tables inside it. `DROP TABLE`
+        # on 69 million `play_tags` rows and their indexes has to free every
+        # page of an 11 GB file, which reads and rewrites the whole thing
+        # before a single row is loaded -- measured at ~12 MB/s on an
+        # encrypted volume, entirely in `D` state. Unlinking is instant and
+        # leaves no freelist behind.
+        #
+        # Safe for the same reason `drop_derived` is: nothing here is a source
+        # of truth. Curated tags are not lost either -- they are re-read from
+        # `curated_tags.json` on every derive, which is what makes that file
+        # the source of truth rather than the table (04-ONTOLOGY §8).
+        # Replacing the file also takes out anything in it that `derive` does
+        # not rebuild -- `comments` and `lineup_entries` are built by a
+        # separate pass (`rsse secondary`). Losing them silently would be
+        # worse than the slow path, so they are counted first and named.
+        casualties = _non_derived_tables(query_path)
+        for suffix in ("", "-wal", "-shm"):
+            sibling = query_path.with_name(query_path.name + suffix)
+            sibling.unlink(missing_ok=True)
+        for table, rows in casualties:
+            print(f"note: dropped {table} ({rows:,} rows) with the file; "
+                  f"rebuild it with `rsse secondary`", file=sys.stderr)
     conn = dbschema.connect(str(query_path))
     for pragma in dbschema.LOAD_PRAGMAS:
         conn.execute(pragma)
@@ -1086,8 +1185,12 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--season", help="explicit season(s), comma separated")
     d.add_argument("--limit", type=int, help="first N games")
     d.add_argument("--rebuild", action="store_true",
-                   help="drop the derived tables first; safe, nothing here is "
-                        "a source of truth")
+                   help="replace the query database; safe, nothing in it is a "
+                        "source of truth")
+    d.add_argument("--keep-file", action="store_true",
+                   help="with --rebuild, drop the tables in place instead of "
+                        "replacing the file (slower; keeps any non-derived "
+                        "tables such as comments and lineup_entries)")
     d.add_argument("--no-indexes", action="store_true",
                    help="skip index creation, for a timing run")
     d.add_argument("--progress", action="store_true")
@@ -1115,6 +1218,13 @@ def main(argv: list[str] | None = None) -> int:
     x = sub.add_parser("explain", help="show the SQL and plan for a search")
     _add_query_flags(x)
     x.set_defaults(func=cmd_explain)
+
+    sc = sub.add_parser("secondary",
+                        help="build comments and lineup_entries")
+    sc.add_argument("--archive")
+    sc.add_argument("--database")
+    sc.add_argument("--progress", action="store_true")
+    sc.set_defaults(func=cmd_secondary)
 
     cv = sub.add_parser("coverage", help="what the corpus actually covers")
     cv.add_argument("--database")

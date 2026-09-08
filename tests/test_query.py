@@ -15,6 +15,7 @@ from rsse.database import coverage as covbuild
 from rsse.database import derived as dbderived
 from rsse.database import load as dbload
 from rsse.database import schema as dbschema
+from rsse.database import secondary as dbsecondary
 from rsse.query import QueryError, Search, connect
 
 FIXTURE = Path(__file__).parent / "fixtures" / "TEST2000KCA.EVA"
@@ -39,6 +40,7 @@ class QueryBase(unittest.TestCase):
         dbschema.create_derived(query)
         dbderived.build(query, archive, parser_version="test")
         dbschema.create_derived_indexes(query)
+        dbsecondary.build(query, archive)
         covbuild.build(query)
         query.close()
         archive.close()
@@ -94,12 +96,15 @@ class Compilation(QueryBase):
             with self.assertRaises(QueryError):
                 call()
 
-    def test_predicates_needing_unbuilt_tables_refuse(self):
-        # Silently matching nothing would read as "it never happened".
-        with self.assertRaises(NotImplementedError):
-            Search().pitcher("smith001")
-        with self.assertRaises(NotImplementedError):
-            Search().fielder(6, "smith001")
+    def test_pitcher_compiles_without_touching_fielding_credits(self):
+        """Who was pitching is a lineup question, not a credits question.
+
+        Answering it from `fielding_credits` would silently drop every play
+        the pitcher did not touch the ball on.
+        """
+        sql, _ = Search().pitcher("smith001")._compile("p.play_id")
+        self.assertIn("lineup_entries", sql)
+        self.assertNotIn("fielding_credits", sql)
 
 
 class Defaults(QueryBase):
@@ -182,6 +187,77 @@ class ForceAndTagOuts(QueryBase):
 
     def test_a_non_force_query_carries_no_force_report(self):
         self.assertIsNone(Search().strikeout().run(self.conn, limit=1).force)
+
+
+class Lineups(QueryBase):
+    """`.pitcher()` and `.fielder()` read the lineup as a timeline (§2)."""
+
+    def starters(self, position):
+        return self.conn.execute(
+            "SELECT DISTINCT player_id FROM lineup_entries"
+            " WHERE position = ? AND is_sub = 0", (position,)).fetchall()
+
+    def test_lineup_entries_were_loaded(self):
+        starts, subs = self.conn.execute(
+            "SELECT sum(1 - is_sub), sum(is_sub) FROM lineup_entries"
+        ).fetchone()
+        self.assertGreater(starts, 0)
+        self.assertIsNotNone(subs)
+
+    def test_a_starting_pitcher_matches_plays(self):
+        for (player_id,) in self.starters(1):
+            n = Search().pitcher(player_id).count(self.conn)
+            if n:
+                return
+        self.fail("no starting pitcher matched any play")
+
+    def test_the_position_holders_partition_the_plays(self):
+        """Exactly one player holds a position on any given play.
+
+        Summing `.fielder(pos, id)` over every player who ever held the
+        position must therefore equal the number of plays -- if it exceeds
+        them, the timeline logic is matching a replaced fielder as well as
+        his replacement, which is the failure mode this predicate exists to
+        avoid.
+        """
+        total = Search().count(self.conn)
+        for position in (1, 2):
+            holders = self.conn.execute(
+                "SELECT DISTINCT player_id FROM lineup_entries"
+                " WHERE position = ?", (position,)).fetchall()
+            matched = sum(Search().fielder(position, pid).count(self.conn)
+                          for (pid,) in holders)
+            self.assertEqual(matched, total,
+                             f"position {position}: {matched} matched vs "
+                             f"{total} plays")
+
+    def test_pitcher_is_the_fielding_side_not_the_batting_side(self):
+        # A pitcher never pitches to his own team, so no play may match both
+        # `.pitcher(x)` and `.batter(x)`.
+        for (pid,) in self.starters(1):
+            both = Search().pitcher(pid).batter(pid).count(self.conn)
+            self.assertEqual(both, 0)
+
+
+class Comments(QueryBase):
+    def test_comments_were_loaded_and_linked(self):
+        total, linked = self.conn.execute(
+            "SELECT count(*), count(play_id) FROM comments").fetchone()
+        self.assertGreaterEqual(total, 0)
+        self.assertLessEqual(linked, total)
+
+    def test_every_comment_links_to_a_play_in_its_own_game(self):
+        bad = self.conn.execute(
+            "SELECT count(*) FROM comments c JOIN plays p USING (play_id)"
+            " WHERE p.game_key <> c.game_key").fetchone()[0]
+        self.assertEqual(bad, 0)
+
+    def test_a_comment_never_links_forward(self):
+        """A `com` record describes the play before it, never after."""
+        bad = self.conn.execute(
+            "SELECT count(*) FROM comments c JOIN plays p USING (play_id)"
+            " WHERE p.record_id > c.record_id").fetchone()[0]
+        self.assertEqual(bad, 0)
 
 
 class Sequences(QueryBase):
