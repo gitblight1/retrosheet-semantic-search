@@ -22,60 +22,69 @@ _NO_POSTSEASON_FILES = (
     "limited to games labelled inside regular-season team files")
 
 
-#: Predicates that narrow which games matched but are not visible to the
-#: coverage scope, because the coverage table is keyed by (season, league).
-_NARROWED = ("a team or park filter narrows the games matched; the coverage "
-             "totals below are for the whole seasons and leagues searched")
+#: `plays_unparsed` / `plays_inconsistent` are the only figures still taken at
+#: (season, league) granularity, because that is how the `coverage` table is
+#: keyed. Every other figure is aggregated from `games` under the query's own
+#: scope, so it is exact.
+_COARSE_DEFECTS = ("plays_unparsed and plays_inconsistent are per season and "
+                   "league; the other totals are exact for this query's scope")
 
 
 def build_coverage(conn, search) -> CoverageReport:
-    """What the query searched, from the `coverage` table (§6).
+    """What the query searched (§6.1).
 
-    Scope comes from the query's own game-level predicates, never from the
-    rows it matched: coverage derived from results says "we looked exactly
-    where we found something", which is worse than no coverage at all.
+    Scope comes from the query's own game-level predicates, never from the rows
+    it matched: coverage derived from results says "we looked exactly where we
+    found something", which is worse than no coverage at all.
+
+    Aggregated directly from `games` rather than by summing `coverage` rows.
+    Summing at (season, league) granularity counts games the query's game-type,
+    team or park filters excluded -- it reported 203,270 games searched for a
+    default-scope query that had in fact excluded 611 exhibition and all-star
+    games sitting inside otherwise-included seasons.
     """
-    scope_sql, scope_params = search.scope_sql()
-    pairs = conn.execute(scope_sql, scope_params).fetchall()
-    if not pairs:
+    scope, params = search.scope_sql()
+    row = conn.execute(
+        "SELECT count(*), coalesce(sum(g.plays), 0),"
+        " min(g.date), max(g.date),"
+        " sum(CASE WHEN g.pitch_detail = 'pitches' THEN 1 ELSE 0 END),"
+        " sum(CASE WHEN g.pitch_detail = 'count' THEN 1 ELSE 0 END),"
+        " sum(CASE WHEN g.pitch_detail IS NULL OR g.pitch_detail"
+        "     NOT IN ('pitches','count') THEN 1 ELSE 0 END)"
+        + scope, params).fetchone()
+    if not row or not row[0]:
         return CoverageReport((), (), 0, 0, "", "",
                               notes=("no games are in scope for this query",))
 
-    rows = []
-    select = ("SELECT season, league, games, plays, first_date, last_date,"
-              " games_with_pitches, games_with_count_only,"
-              " games_without_pitch_data, plays_unparsed, plays_inconsistent"
-              " FROM coverage WHERE season = ? AND league = ?")
+    pairs = conn.execute(
+        "SELECT DISTINCT g.season, coalesce(g.league, '??')" + scope,
+        params).fetchall()
+    seasons = tuple(sorted({p[0] for p in pairs if p[0] is not None}))
+    leagues = tuple(sorted({p[1] for p in pairs}))
+
+    unparsed = inconsistent = 0
     for season, league in pairs:
-        rows.extend(conn.execute(select, (season, league)).fetchall())
+        defects = conn.execute(
+            "SELECT plays_unparsed, plays_inconsistent FROM coverage"
+            " WHERE season = ? AND league = ?", (season, league)).fetchone()
+        if defects:
+            unparsed += defects[0]
+            inconsistent += defects[1]
 
-    if not rows:
-        return CoverageReport((), (), 0, 0, "", "",
-                              notes=("the `coverage` table is empty or does "
-                                     "not cover the seasons searched; run "
-                                     "`rsse coverage --rebuild`",))
-
-    dates = [r[4] for r in rows if r[4]] + [r[5] for r in rows if r[5]]
     notes = []
     if search._game_types and set(search._game_types).issubset(
             set(POSTSEASON_TYPES)):
         notes.append(_NO_POSTSEASON_FILES)
-    if any(p.needs_games and not p.games_only for p in search.preds) or \
-            any("g.home_team" in p.where or "g.site" in p.where
-                for p in search.preds):
-        notes.append(_NARROWED)
+    if unparsed or inconsistent:
+        notes.append(_COARSE_DEFECTS)
     return CoverageReport(
-        seasons=tuple(sorted({r[0] for r in rows})),
-        leagues=tuple(sorted({r[1] for r in rows})),
-        games=sum(r[2] for r in rows),
-        plays=sum(r[3] for r in rows),
-        first_date=min(dates) if dates else "",
-        last_date=max(dates) if dates else "",
-        games_with_pitches=sum(r[6] for r in rows),
-        games_with_count_only=sum(r[7] for r in rows),
-        games_without_pitch_data=sum(r[8] for r in rows),
-        plays_unparsed=sum(r[9] for r in rows),
-        plays_inconsistent=sum(r[10] for r in rows),
+        seasons=seasons, leagues=leagues,
+        games=row[0], plays=row[1],
+        first_date=row[2] or "", last_date=row[3] or "",
+        games_with_pitches=row[4] or 0,
+        games_with_count_only=row[5] or 0,
+        games_without_pitch_data=row[6] or 0,
+        plays_unparsed=unparsed, plays_inconsistent=inconsistent,
         notes=tuple(notes),
     )
 

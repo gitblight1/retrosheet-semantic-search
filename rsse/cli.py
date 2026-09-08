@@ -401,6 +401,13 @@ DERIVED_CHECKS = [
     ("non-batter advance with no runner id", True,
      "SELECT a.play_id FROM runner_advances a JOIN plays p USING (play_id)"
      " WHERE a.origin <> 'B' AND a.runner_id IS NULL"),
+    # The batter has an identity too. It was attached only when the advance
+    # was implicit, so `K.3XH(21);2-3;1-2;B-1` named all three runners on base
+    # and left the batter anonymous -- the same fact identified or not
+    # depending on whether the scorer wrote the advance.
+    ("batter advance with no runner id", True,
+     "SELECT a.play_id FROM runner_advances a JOIN plays p USING (play_id)"
+     " WHERE a.origin = 'B' AND a.runner_id IS NULL"),
     ("bad bases string", False,
      "SELECT play_id FROM plays WHERE LENGTH(bases_before) <> 3"
      "    OR LENGTH(bases_after) <> 3"),

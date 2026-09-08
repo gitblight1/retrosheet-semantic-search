@@ -72,7 +72,7 @@ rsse/semantic/derive.py   implication, confidence, curated tags
 rsse/database/derived.py  archive -> typed tables
 rsse/database/coverage.py what the corpus actually covers
 rsse/query/               Search builder, compiler, coverage reporting
-tests/                    196 tests; tests/gold/ 5 gold plays
+tests/                    200 tests; tests/gold/ 5 gold plays
 ```
 
 **Raw layer built and loaded** (build step 2). 31,115,272 records from 2,646

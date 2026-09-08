@@ -627,3 +627,45 @@ class PlacedRunnerTiming(unittest.TestCase):
         self.assertEqual(homer.runs_on_play, 3)
         self.assertEqual(homer.parse_status, "ok")
         self.assertEqual(replay.inconsistent, 0)
+
+
+class BatterHasIdentityWhereverWritten(unittest.TestCase):
+    """A batter's advance names him whether or not the scorer wrote it.
+
+    The implicit form already carried `Runner(batter_id)`; the explicit form
+    did not, so `K.3XH(21);2-3;1-2;B-1` identified all three runners on base
+    and left the batter anonymous. Same physical fact, present or absent
+    depending on notation -- the failure mode that put 69,938 batters in the
+    2000 season with no advance row at all.
+    """
+
+    def loaded(self):
+        state = HalfInningState(outs=2)
+        state.bases["1"] = Runner("streg101")
+        state.bases["2"] = Runner("freej105")
+        state.bases["3"] = Runner("clymo101")
+        return state
+
+    def batter_advance(self, event, state=None):
+        _after, out = apply_play(state or self.loaded(), parse(event).event,
+                                 batter_id="picko101")
+        return [a for a in out.advances if a.origin == "B"]
+
+    def test_explicit_batter_advance_names_the_batter(self):
+        rows = self.batter_advance("K.3XH(21);2-3;1-2;B-1")
+        self.assertEqual(len(rows), 1)
+        self.assertIsNotNone(rows[0].runner)
+        self.assertEqual(rows[0].runner.player_id, "picko101")
+
+    def test_implicit_and_explicit_forms_agree(self):
+        explicit = self.batter_advance("K.3XH(21);2-3;1-2;B-1")[0]
+        implicit = self.batter_advance("K.3XH(21);2-3;1-2")[0]
+        self.assertEqual(explicit.runner, implicit.runner)
+        self.assertEqual(explicit.dest, implicit.dest)
+
+    def test_a_retired_batter_is_named_too(self):
+        rows = self.batter_advance("43/G4", HalfInningState(outs=0))
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0].runner.player_id, "picko101")
+        self.assertTrue(rows[0].is_out)
+

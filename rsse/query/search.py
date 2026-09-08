@@ -451,12 +451,17 @@ class Search:
         return "p.parse_status = 'ok'"
 
     def scope_sql(self) -> tuple[str, tuple]:
-        """The games this query searched, before any play-level predicate.
+        """The `FROM games` clause selecting the games this query searched.
 
-        Coverage must describe what was *searched*, not what matched. Deriving
+        Returned as a fragment so callers can aggregate it however they need.
+        Coverage must describe what was *searched*, not what matched: deriving
         it from the result rows makes it circular -- a query that matches in
         two seasons would report that only those two were looked at, which is
         the exact misreading the report exists to prevent.
+
+        Only predicates on `games` columns count. A predicate on `plays`
+        narrows the *result*, which is its job, and must not narrow the
+        denominator the result is read against.
         """
         where, params = [], []
         for pred in self.preds:
@@ -467,7 +472,7 @@ class Search:
         if gt_sql:
             where.append(gt_sql)
             params.extend(gt_params)
-        sql = "SELECT DISTINCT g.season, coalesce(g.league, '??') FROM games g"
+        sql = " FROM games g"
         if where:
             sql += " WHERE " + " AND ".join(where)
         return sql, tuple(params)

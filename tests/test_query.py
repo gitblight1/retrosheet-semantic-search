@@ -216,9 +216,30 @@ class Coverage(QueryBase):
         self.assertGreater(result.coverage.games, 0)
         self.assertIn("games", result.coverage.describe())
 
-    def test_a_team_filter_is_flagged_as_narrowing(self):
-        result = Search().strikeout().team("KCA").run(self.conn, limit=1)
-        self.assertTrue(any("narrows" in n for n in result.coverage.notes))
+    def test_game_level_filters_narrow_coverage_exactly(self):
+        """Coverage is aggregated from `games`, not summed from the coverage
+        table, so a game-level filter reduces it exactly.
+
+        Summing per (season, league) counted games the filter had excluded:
+        a default-scope corpus query reported 203,270 games searched while
+        actually excluding 611 exhibition and all-star games inside otherwise
+        included seasons.
+        """
+        wide = Search().strikeout().run(self.conn, limit=1).coverage
+        narrow = Search().strikeout().team("KCA").run(self.conn, limit=1).coverage
+        self.assertLessEqual(narrow.games, wide.games)
+        expected = self.conn.execute(
+            "SELECT count(*) FROM games WHERE home_team = ? OR away_team = ?",
+            ("KCA", "KCA")).fetchone()[0]
+        self.assertEqual(narrow.games, expected)
+
+    def test_excluded_game_types_are_not_counted_as_searched(self):
+        everything = Search().all_game_types().run(self.conn, limit=1).coverage
+        default = Search().run(self.conn, limit=1).coverage
+        excluded = self.conn.execute(
+            "SELECT count(*) FROM games WHERE game_type IN"
+            " ('exhibition','allstar')").fetchone()[0]
+        self.assertEqual(everything.games - default.games, excluded)
 
     def test_coverage_rows_sum_to_the_games_table(self):
         games = self.conn.execute("SELECT count(*) FROM games").fetchone()[0]

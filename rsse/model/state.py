@@ -648,7 +648,14 @@ def apply_play(state: HalfInningState, event: G.Event, *,
     runs = 0
 
     for adv in event.advances:
-        runner = None if adv.origin == "B" else before.bases.get(adv.origin)
+        # The batter is not on a base yet, so he is not in `before.bases` --
+        # but he has an identity, and an explicit `B-1` must carry it just as
+        # the implicit form below does. Leaving it None made the same physical
+        # fact identified or anonymous depending on whether the scorer wrote
+        # the advance: `K.3XH(21);2-3;1-2;B-1` named all three runners and not
+        # the batter.
+        runner = (Runner(batter_id) if adv.origin == "B"
+                  else before.bases.get(adv.origin))
         resolved = ResolvedAdvance(
             origin=adv.origin, dest=adv.dest, marked_out=adv.marked_out,
             is_out=adv.is_out, is_explicit=True, runner=runner, raw=adv.emit(),
@@ -732,7 +739,7 @@ def apply_play(state: HalfInningState, event: G.Event, *,
                 origin="B", dest="1", marked_out=True, is_out=True,
                 is_explicit=False, is_force=True,
                 force_certainty=batter_certainty,
-                raw="(B)",
+                runner=Runner(batter_id), raw="(B)",
             ))
     elif batter_live and b_adv is None:
         # The batter's movement is an advance like any other, and it gets a row
