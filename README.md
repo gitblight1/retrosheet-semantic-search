@@ -180,7 +180,14 @@ Everything in the build order is built and validated against the full corpus.
 | Derived tables | 17,891,790 plays, 11.6 GB, **21/21** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 224, all passing |
+| Tests | 242, all passing |
+
+**Score reconciliation is built but has never been run.** `rsse gamelogs` and
+`rsse reconcile` compare every replayed final score against Retrosheet's
+separately-compiled game logs — the only check here that comes from outside the
+event files. retrosheet.org was unreachable from the development machine, so no
+log file has been loaded. If you have the `gl*.zip` archives, unzip them into
+`data/gamelogs/` and run those two commands; loading needs no network access.
 
 Not built: `players`, `teams` and `parks`. The roster and team files are on
 disk but have never been ingested, and reading them straight from the file tree
@@ -202,6 +209,8 @@ python3 -m rsse.cli derive --progress          # derived tables (~90 min)
 python3 -m rsse.cli verify --derived           # derived-table integrity (21 checks)
 python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
 python3 -m rsse.cli coverage --rebuild         # coverage table
+python3 -m rsse.cli gamelogs --fetch           # game logs, for score reconciliation
+python3 -m rsse.cli reconcile --explain-er     # replayed scores vs published ones
 python3 -m rsse.cli query ...                  # search; --format table|json|csv
 python3 -m rsse.cli explain ...                # the SQL and plan for a search
 python3 -m unittest discover -s tests -t .
@@ -216,11 +225,11 @@ anything `derive` itself does not rebuild.
 
 ```
 rsse/parser/     lexer, recursive-descent parser, AST that emits from its fields
-rsse/model/      half-inning replay, force derivation, `com` record structure
+rsse/model/      half-inning replay, force derivation, `com` and game-log records
 rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary and coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           224 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           242 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

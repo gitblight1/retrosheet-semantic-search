@@ -1,5 +1,8 @@
 """Corpus acquisition (spec/01-CORPUS.md §2, §4).
 
+Event archives, and the game logs used to check the replay against numbers
+Retrosheet published independently of the event files.
+
 Downloads Retrosheet's per-season event archives. Source files are treated as
 immutable: each is recorded with its SHA-256 so a later re-ingest can detect
 that Retrosheet has reissued a corrected file rather than silently mixing
@@ -45,6 +48,105 @@ def _get(url: str, attempts: int = MAX_ATTEMPTS) -> bytes:
         except Exception as exc:  # noqa: BLE001 - retried, then reported
             last = exc
     raise RuntimeError(f"{url}: giving up after {attempts} attempts: {last}")
+
+
+#: Candidate locations for the game log index, tried in order.
+#:
+#: **Unverified.** retrosheet.org was unreachable from the development machine
+#: when this was written -- DNS resolved and TCP to :443 timed out, while other
+#: hosts connected immediately -- so no path here has been confirmed against
+#: the live site. A list is used rather than a single guess because a wrong
+#: path costs a request and requests are the scarce resource: this project has
+#: already been rate-limited off the server once (BUILD-LOG §3.3).
+#:
+#: If all of these fail, the game logs can be unzipped into `data/gamelogs/`
+#: by hand and `rsse gamelogs` will load them without any network access.
+GAMELOG_INDEX_CANDIDATES = (
+    f"{BASE}/gamelogs/index.html",
+    f"{BASE}/gamelogs/",
+    f"{BASE}/gamelogs.htm",
+)
+#: The first candidate, for error messages that need something to name.
+GAMELOG_INDEX = GAMELOG_INDEX_CANDIDATES[0]
+GAMELOG_LINK = re.compile(r'href="([^"]*gl[^"]*\.zip)"', re.I)
+
+
+def available_gamelogs() -> list[str]:
+    """URLs of the published game log archives.
+
+    Tries each candidate index once -- not `MAX_ATTEMPTS` times -- because a
+    wrong path is not a transient failure and retrying it four times with
+    backoff is indistinguishable from hammering.
+    """
+    html = None
+    tried = []
+    for index in GAMELOG_INDEX_CANDIDATES:
+        try:
+            html = _get(index, attempts=1).decode("latin-1")
+        except Exception as exc:  # noqa: BLE001 - reported below
+            tried.append(f"{index}: {exc}")
+            time.sleep(DELAY_SECONDS)
+            continue
+        if GAMELOG_LINK.search(html):
+            break
+        tried.append(f"{index}: fetched, but no gl*.zip links found")
+        html = None
+        time.sleep(DELAY_SECONDS)
+
+    if html is None:
+        raise RuntimeError(
+            "could not find the game log index. Tried:\n  "
+            + "\n  ".join(tried)
+            + "\nDownload the gl*.zip archives by hand and unzip them into "
+              "data/gamelogs/; `rsse gamelogs` needs no network access.")
+
+    urls = []
+    for href in GAMELOG_LINK.findall(html):
+        if href.startswith("http"):
+            urls.append(href)
+        elif href.startswith("/"):
+            urls.append(BASE + href)
+        else:
+            urls.append(f"{BASE}/gamelogs/{href.lstrip('./')}")
+    return sorted(set(urls))
+
+
+def fetch_gamelogs(dest: Path, urls: list[str] | None = None) -> list[Path]:
+    """Download and extract the game log archives into ``dest``.
+
+    Same throttling as the event fetch, and for the same reason: a first pass
+    at 1s between requests had the server stop responding. The archives are
+    small -- one line per game rather than one per play -- so this is a short
+    fetch, but it is not a reason to hurry.
+    """
+    dest.mkdir(parents=True, exist_ok=True)
+    if urls is None:
+        urls = available_gamelogs()
+        time.sleep(DELAY_SECONDS)
+
+    extracted: list[Path] = []
+    for url in urls:
+        name = url.rsplit("/", 1)[-1]
+        zip_path = dest / name
+        if not zip_path.exists():
+            try:
+                blob = _get(url)
+            except Exception as exc:  # noqa: BLE001 - reported, not swallowed
+                print(f"  {name}: download failed: {exc}", flush=True)
+                continue
+            tmp = zip_path.with_suffix(".zip.part")
+            tmp.write_bytes(blob)
+            tmp.replace(zip_path)
+            time.sleep(DELAY_SECONDS)
+        try:
+            with zipfile.ZipFile(zip_path) as zf:
+                names = [n for n in zf.namelist() if not n.endswith("/")]
+                zf.extractall(dest)
+            extracted.extend(dest / n for n in names)
+        except zipfile.BadZipFile:
+            print(f"  {name}: corrupt archive, removing", flush=True)
+            zip_path.unlink(missing_ok=True)
+    return extracted
 
 
 def available_years() -> list[int]:

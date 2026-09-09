@@ -270,7 +270,8 @@ only move downward.
 
 Score and earned-run reconciliation are the strongest checks available, because
 they compare against numbers Retrosheet published independently of the event
-strings. They will catch classes of bug no unit test is shaped to find.
+strings. They will catch classes of bug no unit test is shaped to find. See
+§4.3 for how they are implemented and what is still unverified.
 
 The two **run** invariants are the cheap stand-in for them, and they are listed
 because until the derived tables existed *nothing whatsoever checked a run
@@ -338,6 +339,61 @@ A third is smaller but was a real bug: quality flags must be order-independent,
 so `.strikeout().include_uncertain()` and `.include_uncertain().strikeout()`
 must compile identically. A builder documented as immutable, whose answer
 changes with call order, gives no signal that anything is wrong.
+
+### 4.3 Game logs, and validating a positional format
+
+Retrosheet's game logs are one 161-field CSV row per game, compiled separately
+from the event files. That separation is the whole value: every other check in
+this document compares the pipeline against itself, and internal consistency
+cannot catch an error that is internally consistent.
+
+`rsse gamelogs` loads them into the **archive** — they are source data, not
+derived — in their own table rather than `raw_records`, which is partitioned
+exactly by `game_spans` (§4) and must stay that way. `rsse reconcile` then
+compares `games.final_home` / `final_away`, produced by replaying 17.9 million
+plays, against the published score.
+
+Three things the reconciliation must not treat as failures:
+
+| | Why |
+|---|---|
+| a game in one source and not the other | the logs are Major League games; the corpus includes the Negro Leagues. Coverage, reported separately |
+| a forfeit | the score is awarded by rule, not scored on the field |
+| a suspended or later-completed game | the record is split, so neither half is a fair test |
+
+**The field offsets cannot be validated by a fixture.** The format is
+positional with no header row, so a wrong offset yields a plausible number
+rather than an error — and a test file written from the offset table agrees
+with that table however wrong it is. That is the same tautology as a unit test
+asserting whatever the code currently produces.
+
+What *can* be validated is that the values arriving in each field look like
+the thing the field is supposed to hold. `check_layout` runs seven such tests
+over every load — scores are plausible run totals, out counts are multiples of
+three, earned runs do not exceed runs allowed, team ids are three characters —
+and these are properties of baseball rather than of Retrosheet's file format,
+so a one-field shift fails them en masse. Each carries a tolerance, because
+real data has genuine oddities (a 19th-century game with no out count) and a
+check with no tolerance would report those instead of a layout error. A failing
+check means the offsets are wrong far more likely than the data is, and
+`rsse gamelogs` says so and exits non-zero.
+
+The **earned-run field is deliberately not chosen from the documentation.**
+The layout names both an "individual" and a "team" earned-run figure per side
+and does not settle which is the per-game total; picking wrong would report
+thousands of false mismatches. Both are stored, and
+`rsse reconcile --explain-er` decides it empirically by comparing each against
+the event files' own `data,er` records — the same approach that settled the
+replay verdict flag ([05-DATABASE](05-DATABASE.md) §5.1).
+
+**Status: built, not yet run.** retrosheet.org was unreachable from the
+development machine when this was written — DNS resolved, TCP to port 443 timed
+out, other hosts connected in 0.1s — so no game log file has been loaded and no
+score has been reconciled. Parsing, loading, the layout guard and the
+reconciliation are implemented and tested against synthetic rows; the offsets
+themselves are unconfirmed until a real file arrives. The download is also the
+one part that cannot be tested here, so the loader takes files from a directory
+and needs no network access at all.
 
 ## 5. Performance suite
 

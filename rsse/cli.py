@@ -32,6 +32,7 @@ QUERY_DEFAULT = "rsse.db"          # derived, queryable tables
 ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 EVENTS = DATA / "events"
+GAMELOGS = DATA / "gamelogs"
 KNOWN_DEFECTS = ROOT / "tests" / "known-source-defects.json"
 ARCHIVE = DATA / "database" / ARCHIVE_DEFAULT
 QUERY_DB = DATA / "database" / QUERY_DEFAULT
@@ -650,6 +651,137 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_gamelogs(args: argparse.Namespace) -> int:
+    """Download and/or load Retrosheet's game logs (spec/07-TESTING.md §4)."""
+    from .database import gamelogs
+    from .util import download
+
+    root = Path(args.dir) if args.dir else GAMELOGS
+    if args.fetch:
+        print(f"fetching game logs into {root} ...", file=sys.stderr)
+        download.fetch_gamelogs(root)
+
+    files = sorted(p for p in root.glob("*")
+                   if p.is_file() and p.suffix.lower() in (".txt", ".csv"))
+    if not files:
+        print(f"no game log files in {root}.\n"
+              "Retrosheet publishes the game logs as gl*.zip archives under "
+              "retrosheet.org; try `rsse gamelogs --fetch`, or download and "
+              f"unzip them into {root} by hand -- loading needs no network "
+              "access.", file=sys.stderr)
+        return 2
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    if not archive_path.exists():
+        print(f"no archive at {archive_path}; run `rsse ingest` first",
+              file=sys.stderr)
+        return 2
+    conn = dbschema.connect(str(archive_path))
+    for pragma in dbschema.LOAD_PRAGMAS:
+        conn.execute(pragma)
+
+    def progress(path):
+        print(f"  {path.name} ...", file=sys.stderr, flush=True)
+
+    stats = gamelogs.load(conn, files,
+                          progress=progress if args.progress else None)
+    print(f"files                {stats.files}")
+    print(f"lines                {stats.lines:,}")
+    print(f"loaded               {stats.loaded:,}")
+    print(f"malformed            {len(stats.malformed):,}")
+    for path, line_no, why in stats.malformed[:5]:
+        print(f"    {Path(path).name}:{line_no}  {why}")
+
+    # The field offsets cannot be checked by a fixture -- a test file written
+    # from them agrees with them however wrong they are. These check the
+    # *values* against the shape each field is supposed to hold, which is a
+    # property of baseball rather than of the file format.
+    print("\nlayout checks (field offsets against real data):")
+    bad = 0
+    for finding in stats.layout:
+        mark = "ok  " if finding.ok else "FAIL"
+        bad += 0 if finding.ok else 1
+        print(f"  {mark} {finding.description:44s}"
+              f" {finding.failed:>7,}/{finding.checked:,} ({finding.rate:.3%})")
+    if bad:
+        print(f"\n{bad} layout check(s) failed. The field offsets in "
+              "rsse/model/gamelog.py are far more likely wrong than the data "
+              "is; do not reconcile against this load.")
+    conn.close()
+    print(f"\n{ATTRIBUTION}")
+    return 1 if (stats.malformed or bad) else 0
+
+
+def cmd_reconcile(args: argparse.Namespace) -> int:
+    """Check every replayed final score against the published game log.
+
+    The strongest check available on the state machine, and the first one that
+    compares against numbers produced independently of the event files
+    (spec/07-TESTING.md §4).
+    """
+    from .database import gamelogs
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    query_path = Path(args.database) if args.database else QUERY_DB
+    for path, what in ((archive_path, "ingest"), (query_path, "derive")):
+        if not path.exists():
+            print(f"no database at {path}; run `rsse {what}` first",
+                  file=sys.stderr)
+            return 2
+
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+    have = archive.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        " AND name='game_logs'").fetchone()[0]
+    if not have:
+        print("no game logs in the archive; run `rsse gamelogs` first",
+              file=sys.stderr)
+        return 2
+    query = dbschema.connect(f"file:{query_path}?mode=ro")
+
+    seasons = [int(y) for y in args.season.split(",")] if args.season else None
+    result = gamelogs.reconcile(query, archive, seasons=seasons)
+
+    print(f"games compared       {result.compared:,}")
+    print(f"scores agree         {result.agreed:,}  ({result.rate:.4%})")
+    print(f"scores disagree      {len(result.mismatches):,}")
+    # Coverage, not error: Retrosheet's logs are Major League games and the
+    # corpus includes the Negro Leagues, so a game in one and not the other is
+    # expected and must not read as a failure.
+    print(f"in the logs only     {result.log_only:,}")
+    print(f"in the replay only   {result.replay_only:,}")
+    print(f"skipped, forfeit     {result.skipped_forfeit:,}")
+    print(f"skipped, incomplete  {result.skipped_incomplete:,}")
+
+    if result.mismatches:
+        print("\nmismatches (replay away-home vs log away-home):")
+        for game_id, ra, rh, la, lh in result.mismatches[:args.show]:
+            print(f"  {game_id}  replay {ra}-{rh}   log {la}-{lh}"
+                  f"   delta {ra - la:+d}/{rh - lh:+d}")
+        if len(result.mismatches) > args.show:
+            print(f"  ... and {len(result.mismatches) - args.show:,} more")
+
+    if args.explain_er:
+        print("\nwhich earned-run field is the team total?")
+        for key, value in gamelogs.explain_earned_runs(query, archive).items():
+            print(f"  {key:12s} {value:,}")
+
+    if args.report:
+        Path(args.report).write_text(json.dumps({
+            "compared": result.compared, "agreed": result.agreed,
+            "mismatches": result.mismatches,
+            "log_only": result.log_only, "replay_only": result.replay_only,
+            "skipped_forfeit": result.skipped_forfeit,
+            "skipped_incomplete": result.skipped_incomplete,
+        }, indent=2))
+        print(f"\nreport written to {args.report}")
+
+    archive.close()
+    query.close()
+    print(f"\n{ATTRIBUTION}")
+    return 1 if result.mismatches else 0
+
+
 def cmd_secondary(args: argparse.Namespace) -> int:
     """Build `comments` and `lineup_entries` (spec/05-DATABASE.md §2, §5).
 
@@ -1219,6 +1351,26 @@ def main(argv: list[str] | None = None) -> int:
     x = sub.add_parser("explain", help="show the SQL and plan for a search")
     _add_query_flags(x)
     x.set_defaults(func=cmd_explain)
+
+    gl = sub.add_parser("gamelogs",
+                        help="download/load Retrosheet game logs")
+    gl.add_argument("--fetch", action="store_true", help="download first")
+    gl.add_argument("--dir", help="where the game log files live")
+    gl.add_argument("--archive")
+    gl.add_argument("--progress", action="store_true")
+    gl.set_defaults(func=cmd_gamelogs)
+
+    rc = sub.add_parser("reconcile",
+                        help="check replayed scores against the game logs")
+    rc.add_argument("--archive")
+    rc.add_argument("--database")
+    rc.add_argument("--season", help="comma-separated seasons")
+    rc.add_argument("--show", type=int, default=20,
+                    help="how many mismatches to print")
+    rc.add_argument("--explain-er", action="store_true",
+                    help="test which earned-run field is the team total")
+    rc.add_argument("--report", help="write a JSON report to this path")
+    rc.set_defaults(func=cmd_reconcile)
 
     sc = sub.add_parser("secondary",
                         help="build comments and lineup_entries")
