@@ -454,12 +454,19 @@ com,"umpchange,4,ump1b,hurst801"
 com,"suspended,19131002,NYC14,fans in bleachers"
 ```
 
-| Tag | Records | Fields |
-|---|---|---|
-| `ej` | 18,157 | person, role (`M` manager / `P` player), umpire, reason |
-| `replay` | 5,106 | inning, player, team, umpire, site, call, **`Y`/`N` reversed**, … |
-| `umpchange` | 1,468 | inning, position, umpire (`(none)` for a vacancy) |
-| `suspended` | 195 | date `yyyymmdd`, site, reason |
+The two counts below differ on purpose, and the gap is the point of §5.1's
+warning: the first column counts bodies whose text *starts* with the tag, the
+second counts bodies that actually parse as one.
+
+| Tag | Prefix matches | Parsed | Fields |
+|---|---|---|---|
+| `ej` | 18,157 | **18,129** | person, role (`M` manager / `P` player), umpire, reason |
+| `replay` | 5,106 | **5,102** | inning, player, team, umpire, site, call, **`Y`/`N` reversed**, … |
+| `umpchange` | 1,468 | **1,465** | inning, position, umpire (`(none)` for a vacancy) |
+| `suspended` | 195 | **195** | date `yyyymmdd`, site, reason |
+
+The 40 records in the gap are prose that happens to begin with the tag word.
+A prefix test would have read every one of them as a structured record.
 
 **The `Y`/`N` field is the only machine-readable record of a replay verdict,
 and its meaning is inferred.** It was cross-checked before being relied on: of

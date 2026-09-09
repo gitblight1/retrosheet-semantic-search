@@ -237,5 +237,47 @@ class UntrustedState(unittest.TestCase):
             self.assertEqual(row["parse_status"], "ok",
                              "state resets at the boundary; doubt must not cross")
 
+class LineupRecordFields(unittest.TestCase):
+    """Splitting a `start`/`sub` record (rsse/database/secondary.py).
+
+    Both failure modes here were found in the corpus, and neither raises: a
+    lineup record this parser cannot read becomes a player who appears never
+    to have played, which is a silent hole in `.pitcher()`.
+    """
+
+    def split(self, line):
+        from rsse.database.secondary import _lineup_fields
+        return _lineup_fields(tuple(line.split(",")))
+
+    def test_ordinary_start_record(self):
+        self.assertEqual(
+            self.split('start,nichs101,"Simon Nicholls",0,1,6'),
+            ("nichs101", "Simon Nicholls", 0, 1, 6))
+
+    def test_a_trailing_space_after_the_position(self):
+        # Three records in the corpus are written this way. Unstripped, the
+        # position fails `isdigit()` and the record is reported unreadable.
+        self.assertEqual(
+            self.split('sub,hemsr101,"Rollie Hemsley",0,9,11 '),
+            ("hemsr101", "Rollie Hemsley", 0, 9, 11))
+
+    def test_a_comma_inside_the_quoted_name(self):
+        # Read left to right, the name fragment lands where the position
+        # belongs and `int()` raises on a well-formed row. Fields are read
+        # from the end for this reason.
+        self.assertEqual(
+            self.split('sub,x001,"Griffey, Ken Jr.",1,3,8'),
+            ("x001", "Griffey, Ken Jr.", 1, 3, 8))
+
+    def test_single_quoted_names_are_accepted(self):
+        self.assertEqual(
+            self.split("sub,deinp101,'Pep Deininger',0,4,12")[1],
+            "Pep Deininger")
+
+    def test_an_unreadable_record_returns_none_rather_than_raising(self):
+        for line in ("sub,x001,junk", 'sub,x001,"Name",1,3,left field'):
+            self.assertIsNone(self.split(line), line)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -78,8 +78,12 @@ def _lineup_fields(fields: tuple[str, ...]) -> tuple | None:
     """
     if len(fields) < 6:
         return None
-    player_id = fields[1]
-    team, order, position = fields[-3], fields[-2], fields[-1]
+    player_id = fields[1].strip()
+    # Stripped, because three records in the corpus carry a trailing space
+    # after the position -- `sub,hemsr101,"Rollie Hemsley",0,9,11 `. Without
+    # this they fail `isdigit()` and a perfectly readable lineup record is
+    # reported as unreadable, which is a silent hole in `.pitcher()`.
+    team, order, position = (f.strip() for f in fields[-3:])
     name = ",".join(fields[2:-3]).strip().strip('"').strip("'")
     if not (team.isdigit() and order.lstrip("-").isdigit()
             and position.lstrip("-").isdigit()):

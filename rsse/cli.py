@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import collections
 import json
+import os
 import re
 import sys
 import time
@@ -1241,7 +1242,16 @@ def main(argv: list[str] | None = None) -> int:
                                    else cmd_verify(a)))
 
     args = ap.parse_args(argv)
-    return args.func(args)
+    try:
+        return args.func(args)
+    except BrokenPipeError:
+        # `rsse coverage | head` is an ordinary thing to do, and every one of
+        # these commands prints more than a screenful. Python's default is to
+        # raise here and then complain again at shutdown when it flushes
+        # stdout, so the fd is pointed at devnull before returning.
+        devnull = os.open(os.devnull, os.O_WRONLY)
+        os.dup2(devnull, sys.stdout.fileno())
+        return 0
 
 
 if __name__ == "__main__":
