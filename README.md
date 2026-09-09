@@ -1,18 +1,260 @@
 # Retrosheet Semantic Search Engine (RSSE)
 
-RSSE is a semantic query engine over Retrosheet event files. It preserves raw
-data while exposing parsed and semantic representations for historical baseball
-research, so questions can be asked in baseball terms rather than Retrosheet
-event syntax.
+Ask questions about baseball history in **baseball terms**, over every play
+Retrosheet has published — 17,891,790 plays across 203,285 games, 1908 to 2025.
 
-The motivating question: *bases loaded, two outs, uncaught third strike, catcher
-throws to the pitcher covering home for the force — has that happened before?*
-Retrosheet records neither "dropped third strike" nor "force play" as such, so
-both must be derived. See [spec/08-WORKED-EXAMPLE.md](spec/08-WORKED-EXAMPLE.md).
+Retrosheet's event files are precise and complete, and they are written in a
+dense notation that records what happened without naming it. `K.3XH(21)` is a
+strikeout, an uncaught third strike, a throw from the catcher to the pitcher,
+and a force out at home — and the file says none of those things. RSSE derives
+them, keeps the original bytes, and lets you search on the derived facts.
+
+```
+rsse query --bases-loaded --outs 2 --dropped-third \
+           --force-play-at H --putout-sequence 2,1
+```
+
+```
+1908-09-14 WS1190809142   b5 2 out, bases 111   K.3XH(21);2-3;1-2;B-1
+
+1 matching plays
+searched: 202,650 games, 17,840,457 plays, 1908-2025, leagues AL/FL/NGL/NL
+force certainty: 1 derived, 0 likely, 0 ambiguous; 0 batter_ran unknown
+```
+
+Once in 118 seasons. Philadelphia at Washington, 14 September 1908, bottom of
+the fifth: bases loaded, two out, the batter strikes out, the ball gets away,
+the catcher throws to the pitcher covering the plate, and the runner from third
+is forced at home to end the inning.
+
+Four lines below it in the source file, Retrosheet's own scorer left a note:
+
+```
+com,"Catcher threw to pitcher at home on dropped third strike"
+```
+
+Every tag on that play was derived from the event string alone. The comment is
+an independent human account of the same play, and it agrees.
+
+## Quick start
+
+Python 3.11+, no third-party dependencies.
+
+```bash
+git clone <this repo> && cd retrosheet
+python3 -m rsse.cli fetch                 # download the corpus  (~862 MB)
+python3 -m rsse.cli ingest --progress     # byte-exact archive   (~11 min, 1.9 GB)
+python3 -m rsse.cli derive --progress     # queryable tables     (~90 min, 11.6 GB)
+python3 -m rsse.cli secondary --progress  # comments + lineups   (~10 min)
+python3 -m rsse.cli coverage --rebuild    # coverage table       (~10 s)
+```
+
+Then ask it something:
+
+```bash
+python3 -m rsse.cli query --strikeout --force-play-at H --seasons 1996,1997
+python3 -m rsse.cli query --triple-play --format json
+python3 -m rsse.cli coverage --season-range 1908,1920
+```
+
+`fetch` is throttled and resumable. `derive` reads the **archive**, never the
+event files, so a rebuild reproduces exactly the bytes that were ingested —
+Retrosheet reissues corrected files, and a rebuild that silently picked up new
+data would not be a rebuild.
+
+If you only want a season or two, every build step takes `--season`:
+
+```bash
+python3 -m rsse.cli derive --season 2000    # ~1 min instead of ~90
+```
+
+## Querying
+
+The CLI covers the common cases; the Python API covers all of them. Every
+predicate has one defined SQL contract — see
+[06-QUERY](spec/06-QUERY.md).
+
+```python
+from rsse.query import Search, connect
+
+conn = connect("data/database/rsse.db")
+
+result = (Search()
+          .bases_loaded()
+          .outs(2)                       # before the play; .outs_after() for the other
+          .dropped_third()
+          .force_play(at="H")
+          .putout_sequence([2, 1])       # one throw: catcher to pitcher
+          .run(conn))
+
+for play in result:
+    print(play.date, play.game_id, play.event_raw, play.tags)
+
+print(result.coverage.describe())         # what was searched
+print(result.excluded.describe())         # what the default filters removed
+print(result.force.describe())            # how sure the force derivation is
+```
+
+`Search` is immutable — every method returns a new query — and nothing runs
+until `.run()`, `.count()` or `.explain()`.
+
+### Three things worth knowing before you trust a result
+
+**A count never comes back bare.** Every result carries a `CoverageReport`
+saying what was actually searched, and it cannot be suppressed. `0 rows` with
+coverage reads *"no such play in the 202,650 games from 1908 to 2025"*; without
+it, it reads *"never happened"*, which the data does not support. Coverage is
+computed from the query's own scope, never from the rows it matched.
+
+**Derived facts say how sure they are.** A force play is an inference — the
+files never record one. Where the notation settles it, `force_certainty` is
+`derived`; where a throw only implies it, `likely`; where nothing settles it,
+the play claims no force and says so via `batter_ran = 'unknown'` (2.97% of the
+corpus, 7.70% of 1920, 0.00% of 2020). All of it is reported rather than
+quietly filtered, because an era comparison built on a silent 7% gap looks fine
+and is wrong.
+
+**What is not recorded is not offered.** There is no predicate for *was the out
+made by touching the base or tagging the runner* — no era of Retrosheet records
+it, and a predicate implying otherwise would be the most misleading thing in
+the API. `.force_play()`, `.tag_out()` and `.out_at()` are what exist:
+`.out_at()` is the union, the other two partition it, and running a query with
+and without the derived predicate is how you check the derivation.
+
+`.explain()` returns the SQL and the query plan. It is public API on purpose: a
+researcher must be able to audit what a "never happened" answer actually asked.
+
+## What it holds
+
+Two databases, deliberately separate.
+
+**The archive** is the source of truth: 31,115,272 records from 2,646 files,
+stored byte for byte with provenance and per-game spans, 1.9 GB. Every event
+string in it has been parsed and re-emitted identically — the round-trip gate
+([02-GRAMMAR §6](spec/02-GRAMMAR.md)) — so nothing was silently dropped on the
+way in.
+
+**The query database** is derived from the archive and holds nothing that is a
+source of truth, which is what makes it safe to rebuild:
+
+| Table | Rows | What it is |
+|---|---|---|
+| `games` | 203,285 | one row per game, with the `info` header flattened |
+| `plays` | 17,891,790 | one row per play: base-out state, score, the raw event string |
+| `runner_advances` | 14,482,091 | every runner movement, with `is_force` and its certainty |
+| `fielding_credits` | 12,983,019 | putouts, assists and errors by position |
+| `credit_sequences` | 9,057,478 | one throw sequence each — `64(1)3` is two of them, not one |
+| `play_tags` | 69,076,275 | 84 semantic tags, each with a derivation rule |
+| `comments` | 222,495 | scorer notes, including 5,102 replay verdicts and 18,129 ejections |
+| `lineup_entries` | 5,537,381 | starters and substitutions, as a timeline |
+| `coverage` | 274 | what the corpus covers, per season and league |
+
+Total 11.6 GB. `rsse verify --derived` runs 21 integrity checks over it,
+all passing.
+
+### Coverage caveats you should know about
+
+- **No postseason.** Every file is a regular-season team file; there are no
+  `.EVE` files in the corpus. `--only-postseason` reaches the tiebreakers and
+  Negro Leagues championship games recorded inside team files, and never a
+  World Series.
+- **Pitch sequences are modern.** Most games before the 1990s record no pitch
+  data at all. `CoverageReport` states the split for whatever you searched.
+- **7 plays cannot be parsed** and 15 more inherit a base-out state known to be
+  wrong because of them; those carry `state_untrusted` and are excluded by
+  default ([03-STATE §7.1](spec/03-STATE.md)).
+- **Retrosheet data is subject to correction** and carries no guarantee of
+  accuracy.
+
+## Status
+
+Everything in the build order is built and validated against the full corpus.
+
+| Layer | State |
+|---|---|
+| Corpus | 118 seasons, 1908–2025, 862 MB, 2,646 files |
+| Parser | 17,891,790 plays; **0** unexplained parse failures, **0** round-trip failures |
+| Archive | 31,115,272 records, 1.94 GB, all raw invariants hold |
+| State machine | 203,285 games, **0** state-inconsistent plays |
+| Ontology | 84 tags, one derivation rule each, a positive **and** a negative case each |
+| Derived tables | 17,891,790 plays, 11.6 GB, **21/21** integrity checks |
+| Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
+| Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
+| Tests | 224, all passing |
+
+Not built: `players`, `teams` and `parks`. The roster and team files are on
+disk but have never been ingested, and reading them straight from the file tree
+would break the rule that derived tables come from the archive. Doing it
+properly needs a new archive table for records that belong to no game, since
+`raw_records` is partitioned exactly by `game_spans` and `rsse verify` asserts
+it. `parks` also needs a Retrosheet download the project does not hold.
+
+### Commands
+
+```
+python3 -m rsse.cli fetch                      # download the corpus
+python3 -m rsse.cli sweep --by-season --progress   # parse every event string (~10 min)
+python3 -m rsse.cli ingest --progress          # build the archive (~11 min)
+python3 -m rsse.cli verify                     # raw-layer integrity
+python3 -m rsse.cli replay --progress          # replay every game (~15 min)
+python3 -m rsse.cli tags --seasons 12          # era-spread tag census (~20 min)
+python3 -m rsse.cli derive --progress          # derived tables (~90 min)
+python3 -m rsse.cli verify --derived           # derived-table integrity (21 checks)
+python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
+python3 -m rsse.cli coverage --rebuild         # coverage table
+python3 -m rsse.cli query ...                  # search; --format table|json|csv
+python3 -m rsse.cli explain ...                # the SQL and plan for a search
+python3 -m unittest discover -s tests -t .
+```
+
+`sweep` exits non-zero on any round-trip failure or any parse failure not
+listed in [tests/known-source-defects.json](tests/known-source-defects.json).
+`derive --rebuild` replaces the query database; it warns before removing
+anything `derive` itself does not rebuild.
+
+### Layout
+
+```
+rsse/parser/     lexer, recursive-descent parser, AST that emits from its fields
+rsse/model/      half-inning replay, force derivation, `com` record structure
+rsse/semantic/   84 tags, implication, confidence, curated tags
+rsse/database/   archive DDL and ingest; derived, secondary and coverage builds
+rsse/query/      Search builder, SQL compiler, coverage and force reporting
+tests/           224 tests; tests/gold/ holds 5 plays asserted through every layer
+```
+
+## Design notes
+
+Four ideas do most of the work, and each was arrived at the hard way. The full
+account of what building this found — every bug and what it implies — is in
+`BUILD-LOG.md`.
+
+**The raw data is never the derived data.** Two databases, and the derived one
+holds no source of truth. That is what makes `--rebuild` safe and what makes a
+correction traceable.
+
+**Deterministic or flagged.** Every derived value is either produced by a
+stated rule or marked uncertain. Nothing is guessed, and an inconsistency is
+recorded rather than smoothed over — which is why 15 plays out of 17.9 million
+carry a status saying their base state cannot be trusted, instead of looking
+like every other row.
+
+**A gate detects the class of error it is shaped for, and nothing else.** The
+round-trip gate proves nothing was discarded, not that it was filed correctly.
+The out-accounting invariant proves outs balance and says nothing about runs —
+and when a run invariant was finally added, it immediately found that every
+home run written with an explicit `B-H` advance had been scoring twice. Every
+time a quantity nobody had checked acquired a check, it found a bug.
+
+**A tag is a rule, not a name.** A tag cannot be registered without a
+derivation, and it cannot ship without a positive *and* a negative test case: a
+rule that only ever sees positives will happily over-fire.
 
 ## Specifications
 
-Normative, in reading order:
+The specs are the contract — written to be built from without consulting
+anything else, and [02-GRAMMAR](spec/02-GRAMMAR.md) is validated against the
+corpus rather than against Retrosheet's documentation alone.
 
 | | |
 |---|---|
@@ -28,175 +270,8 @@ Normative, in reading order:
 Two documents the original discussion called for are **not** in the set: a
 roadmap, and a record of the future extensions and non-goals it listed
 (Statcast and Baseball Savant integration, WPA/RE24, custom ontologies; and the
-non-goals bounding the project). Those are scope commitments rather than
-build contracts, and they currently live only in the untracked build log.
-
-The specs are the contract: they are written to be built from without
-consulting anything else, and `spec/02-GRAMMAR.md` is validated against the
-corpus rather than against Retrosheet's documentation alone.
-
-## Status
-
-**Parser layer built and validated against the complete corpus.** The corpus
-sweep — build step 1 — is done:
-
-| | |
-|---|---|
-| seasons | 118 (1908–2025, complete) |
-| games | 203,282 |
-| plays | **17,891,790** |
-| parse failures | **7**, all [documented source defects](tests/known-source-defects.json) |
-| unexplained failures | **0** |
-| round-trip failures | **0** |
-| sweep runtime | ~10 min |
-
-The twelve grammar gaps the sweep closed, and what they imply, are in
-[02-GRAMMAR §9](spec/02-GRAMMAR.md). One finding is left open: the `U` modifier,
-which occurs in only four seasons and is undocumented — RSSE parses and
-preserves it but deliberately asserts no meaning for it
-([02-GRAMMAR §4.1](spec/02-GRAMMAR.md)).
-
-```
-rsse/parser/grammar.py    AST; every node emits from structured fields
-rsse/parser/lexer.py      annotation trivia, and the +/- disambiguation
-rsse/parser/parser.py     recursive descent over spec/02-GRAMMAR.md §2
-rsse/parser/records.py    record and play-record reading
-rsse/util/download.py     corpus acquisition, throttled
-rsse/cli.py               rsse fetch | rsse sweep
-rsse/database/schema.py   archive + query DDL
-rsse/database/load.py     ingest, provenance, round-trip gate
-rsse/model/state.py       half-inning state, force derivation, credits
-rsse/model/game.py        whole-game replay, per-play context
-rsse/semantic/ontology.py 84 tags, one derivation rule each
-rsse/semantic/derive.py   implication, confidence, curated tags
-rsse/database/derived.py  archive -> typed tables
-rsse/database/coverage.py what the corpus actually covers
-rsse/database/secondary.py comments and lineup_entries
-rsse/model/comments.py    `com` records, and the structured records inside them
-rsse/query/               Search builder, compiler, coverage reporting
-tests/                    219 tests; tests/gold/ 5 gold plays
-```
-
-**Raw layer built and loaded** (build step 2). 31,115,272 records from 2,646
-files, byte-exact, with provenance and per-game spans; all integrity invariants
-hold (`rsse verify`, <1s). Two findings from the load are written up in the
-specs: Retrosheet game ids are **not unique**
-([01-CORPUS §5.4](spec/01-CORPUS.md)), and the measured size means the original
-<2 GB goal has to be replaced ([05-DATABASE §7](spec/05-DATABASE.md)).
-
-**State machine built and validated** (build step 3). Inning replay
-reconstructs bases, outs, runs and — the point of the exercise — **force plays,
-which Retrosheet never records**. Across all 203,285 games: **zero
-state-inconsistent plays**, and the only three short half-innings are each
-explained by a known source defect. Seven bugs the invariant caught, and the
-six pre-1947 plays that contradict the rulebook, are written up in
-[03-STATE §8](spec/03-STATE.md).
-
-**Ontology built** (build step 4). 84 tags, each with a derivation rule over
-the parse tree and the replayed state, in
-[rsse/semantic/](rsse/semantic/). A tag exists only as a registered rule, so a
-name cannot be added without a derivation; a tag added without both a positive
-**and** a negative test case fails the suite. `rsse tags` derives the corpus
-and reports a census, failing on any tag that never fires.
-
-Building it found two defects in the layers below, both on the project's own
-motivating play and both invisible to every corpus-wide invariant, because no
-play of that shape occurs in 1908–2025:
-
-- the out-count inference of [03-STATE §4.5](spec/03-STATE.md) was never
-  implemented, so the bare form `K.3XH(21)` totalled four outs and came back
-  tagged `TagOut` where its equivalents were tagged `ForceOut`;
-- the batter's own out at first — the commonest force play in baseball — was
-  producing no runner-advance row at all.
-
-Both were caught by the gold corpus's `equivalents` assertion
-([07-TESTING §2.1](spec/07-TESTING.md)), from an entry for a game that has not
-been released yet.
-
-The corpus census over a 12-season era-spread sample (1908–2025, 20,796 games,
-1,821,286 plays): 7,050,409 tag rows, 0 plays skipped, 0.9% uncertain, no tag
-firing on more than 54% of plays.
-
-Running it found a **parser** bug three layers down. `G`, `F`, `L`, `P`, `BG`,
-`BP` and `BL` were classified as no-argument modifier codes, so `/G6` parsed as
-a trajectory and bare `/G` did not — and every consumer reading
-`Modifier.trajectory` missed the bare form. `LineOut` had been under-firing by
-**145%**, `GroundOut` by 51%, and the force derivation was falling back on its
-one inference across a third of the corpus. The round-trip gate passes either
-way, since a bare `G` emits as `G` from either node type: it proves nothing was
-discarded, not that anything was filed correctly.
-
-That in turn led to reworking the force certainty scale — see
-[03-STATE §4.2](spec/03-STATE.md), which now separates *was there a force
-situation* (derivable) from *was the out executed by a touch or a tag* (never
-recorded, in any era).
-
-**Derived tables built** (build step 5). `rsse derive` promotes the archive
-into the typed tables searches run against — `games`, `plays`,
-`runner_advances`, `fielding_credits`, `credit_sequences`, `tags`, `play_tags`
-— and the [06-QUERY §1](spec/06-QUERY.md) SQL runs against them. Measured on
-the full 2000 season: 222,509 plays, **567 bytes per play**, ~1.0 min/season,
-projecting to ~10.1 GB for the corpus. The full-corpus build has not been run.
-
-Building it found five defects in the layers below, the worst of which is that
-**every home run written with an explicit `B-H` advance scored one run too
-many** — a solo shot recorded as `HR/F7D+.B-H(UR)` scored two. Nothing had ever
-checked a run count: the out-accounting invariant cannot see runs, score
-reconciliation needs game logs we do not hold, and a unit test had asserted
-`runs_on_play == 3` on a play with one runner on base, which is arithmetically
-impossible. Adding the two run invariants of
-[03-STATE §3.1](spec/03-STATE.md) then found 91 more plays, all traced to
-`radj` not being the first record of its half-inning — so half the 2020+
-extra-inning half-innings had no placed runner at all.
-
-Not yet built: query API, and the §2 tables the motivating query does not need
-(`lineup_entries`, `players`, `teams`, `parks`, `comments`, `coverage`).
-
-### Commands
-
-```
-python3 -m rsse.cli fetch                   # download the corpus (~118 seasons)
-python3 -m rsse.cli sweep --by-season --progress --report data/sweep-report.json
-python3 -m rsse.cli ingest --progress          # build the raw layer (~11 min)
-python3 -m rsse.cli verify                     # raw-layer integrity checks
-python3 -m rsse.cli replay --progress          # replay every game (~15 min)
-python3 -m rsse.cli derive --season 2000        # derived tables, one season (~1 min)
-python3 -m rsse.cli derive --progress          # full derived layer (~80 min, ~10 GB)
-python3 -m rsse.cli tags --seasons 12          # era-spread census (~20 min)
-python3 -m rsse.cli tags --progress            # full corpus; hours, and the real gate
-python3 -m rsse.cli verify --derived           # derived-table integrity (21 checks)
-python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
-python3 -m rsse.cli coverage --rebuild         # coverage table (~10 s)
-python3 -m rsse.cli query --bases-loaded --outs 2 --dropped-third \
-                          --force-play-at H --putout-sequence 2,1
-python3 -m unittest discover -s tests -t .
-```
-
-`sweep` exits non-zero on any round-trip failure or any parse failure not listed
-in [tests/known-source-defects.json](tests/known-source-defects.json).
-
-## Build order
-
-1. **Corpus sweep first** — *done, all 118 seasons.* Run the §2 grammar over
-   every event string before writing any semantic code. Gaps are cheap to fix
-   in the parser and expensive once the ontology depends on it; the sweep found
-   twelve.
-2. **Raw layer and round-trip gate** ([02-GRAMMAR](spec/02-GRAMMAR.md) §6) —
-   *done.* 31,115,272 records, byte-exact, 0 round-trip failures over the whole
-   corpus on every run.
-3. **State machine**, checked against the out-accounting invariant — *done,
-   0 state-inconsistent plays.* Final-score and `data,er` reconciliation
-   ([07-TESTING](spec/07-TESTING.md) §4) is the stronger check and still needs
-   Retrosheet's game logs, which are a separate download.
-4. **Ontology** — *done, 84 tags.* Tags with derivation rules
-   ([04-ONTOLOGY](spec/04-ONTOLOGY.md)), validated per tag by a positive and a
-   negative case and corpus-wide by `rsse tags`.
-5. **Derived tables** ([05-DATABASE](spec/05-DATABASE.md) §2–4) — *done,
-   validated on a full season.* `rsse derive`, reading the archive rather than
-   the event files so a rebuild reproduces the ingested bytes.
-6. **Query API** ([06-QUERY](spec/06-QUERY.md)) — *done.* `Search`, the
-   `CoverageReport` that makes an empty result readable, and
-   `rsse query` / `explain` / `coverage`.
+non-goals bounding the project). Those are scope commitments rather than build
+contracts, and they currently live only in the untracked build log.
 
 ## Licensing and attribution
 
@@ -225,7 +300,7 @@ Retrosheet makes no guarantee of accuracy, and data is subject to correction.
 [02-GRAMMAR](spec/02-GRAMMAR.md) encodes the *format*, which is factual, and
 restates rather than reproduces their text.
 
-### Development
+## Development
 
 RSSE was designed and directed by its author and written with substantial
 assistance from an AI coding agent (Claude). The project's conception, the
