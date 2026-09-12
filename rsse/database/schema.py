@@ -79,6 +79,53 @@ CREATE TABLE IF NOT EXISTS game_spans (
   record_count    INTEGER NOT NULL,
   UNIQUE (game_id, occurrence)
 );
+
+-- Source records that belong to no game: rosters, team files, ballparks,
+-- biographies. They cannot go in `raw_records`, because `raw_records` is
+-- partitioned exactly by `game_spans` and `rsse verify` asserts both
+-- `count(raw_records) == sum(game_spans.record_count)` and
+-- `sum(source_files.record_count) == count(raw_records)`. A non-game record
+-- has no span to belong to, so adding one would break the first check, and
+-- giving its file a `source_files` row would break the second.
+--
+-- Hence a parallel pair rather than a `kind` column on the existing tables.
+-- It costs six duplicated metadata columns and buys leaving both invariants
+-- exactly as they are: `source_files` keeps meaning "a file of game records",
+-- and the two new checks below are of the same shape rather than weakened
+-- versions of the old ones (spec/05-DATABASE.md §1.2).
+CREATE TABLE IF NOT EXISTS aux_files (
+  aux_file_id   INTEGER PRIMARY KEY,
+  corpus_id     INTEGER NOT NULL REFERENCES corpus,
+  path          TEXT NOT NULL,
+  -- One kind per *format*, because that is what the reader dispatches on:
+  -- `TEAM####` is four positional fields and `teams.csv` is six with a
+  -- header, so calling both 'team' would put a branch in every consumer.
+  kind          TEXT NOT NULL
+    CHECK (kind IN ('roster','team','teamlist','park','bio')),
+  -- Rosters and team files are per-season; ballparks and biographies are not.
+  season        INTEGER,
+  sha256        TEXT NOT NULL,
+  byte_length   INTEGER NOT NULL,
+  mtime         TEXT NOT NULL,
+  line_ending   TEXT NOT NULL CHECK (line_ending IN ('crlf','lf','mixed')),
+  -- Whether the file's last line carries a terminator. Needed to rebuild the
+  -- bytes exactly; without it a file that ends mid-line and one that does not
+  -- reassemble identically, and the round-trip gate would pass on both.
+  final_newline INTEGER NOT NULL DEFAULT 1,
+  record_count  INTEGER NOT NULL DEFAULT 0,
+  UNIQUE (corpus_id, path)
+);
+
+CREATE TABLE IF NOT EXISTS aux_records (
+  aux_record_id INTEGER PRIMARY KEY,
+  aux_file_id   INTEGER NOT NULL REFERENCES aux_files,
+  line_no       INTEGER NOT NULL,
+  -- Verbatim, terminator stripped. These files have no record type to key on
+  -- the way an event file does: a `.ROS` line is positional and a `.csv` has
+  -- a header row, so interpretation belongs in the derived layer and the
+  -- archive keeps only the bytes.
+  raw_line      TEXT NOT NULL
+);
 """
 
 # Applied after bulk load: building indexes during insert is far slower.
@@ -95,6 +142,8 @@ CREATE TABLE IF NOT EXISTS game_spans (
 INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_spans_file ON game_spans (file_id);
 CREATE INDEX IF NOT EXISTS ix_spans_game ON game_spans (game_id);
+CREATE INDEX IF NOT EXISTS ix_aux_file ON aux_records (aux_file_id, line_no);
+CREATE INDEX IF NOT EXISTS ix_aux_kind ON aux_files (kind);
 """
 
 #: The query database records which archive it was derived from, so a result

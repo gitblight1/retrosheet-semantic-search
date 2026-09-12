@@ -87,6 +87,30 @@ assumption about the data, and it is asserted directly: the spans must
 partition `raw_records` exactly, must not overlap, and a span lookup must
 return the same rows as a `game_id` scan.
 
+### 1.2 Source records that belong to no game
+
+Rosters, team files, ballparks and biographies are Retrosheet data with no
+game to attach to, and `raw_records` is partitioned exactly by `game_spans`.
+They live in a parallel pair, `aux_files` and `aux_records`, whose columns
+mirror `source_files` and `raw_records` and whose invariants are asserted
+separately (§8.1).
+
+`aux_files.kind` is one value per *format* — `roster`, `team`, `teamlist`,
+`park`, `bio` — because that is what a reader dispatches on: `TEAM####` is
+four positional fields and `teams.csv` is six with a header, so calling both
+`team` would put a branch in every consumer.
+
+`aux_files.final_newline` records whether the file's last line carries a
+terminator. Exactly one of the 3,435 files does not, and without the column it
+rebuilds one byte short and the round-trip gate is the only thing that would
+ever notice.
+
+`aux_records.raw_line` holds the line verbatim, terminator stripped, decoded
+as latin-1. Latin-1 is a total byte-to-character mapping, so the decode and
+re-encode are lossless whatever the file contains. Every one of these files
+happens to be valid UTF-8 today; that is not a thing to depend on in an
+archive.
+
 ## 2. Games and lineups
 
 `game_id` is **not** a primary key here, for exactly the reason §1 gave it up in
@@ -697,3 +721,88 @@ The 10-minute import goal is likewise already spent on the raw layer. A
 realistic figure for the full pipeline is 30–45 minutes, and the property worth
 preserving is that ingest is resumable per file and re-parses do not re-read
 the source files.
+
+## 8. Reference data: people, rosters, teams, parks
+
+### 8.1 The archive change, and why it was a change
+
+`ingest` matches `\.EV[ANFR]$`, so rosters, team files, ballparks and
+biographies were never read. They cannot simply join `raw_records`, because
+`rsse verify` asserts two things about it:
+
+```
+count(raw_records) == sum(game_spans.record_count)
+sum(source_files.record_count) == count(raw_records)
+```
+
+A record belonging to no game has no span, so it breaks the first; giving its
+file a `source_files` row breaks the second. Hence `aux_files` and
+`aux_records` (§1.2) — a parallel pair rather than a `kind` column on the
+existing tables. It costs six duplicated metadata columns and buys leaving
+both invariants exactly as they were: `source_files` keeps meaning "a file of
+game records", and the two new checks are of the same shape rather than
+weakened versions of the old.
+
+**The round-trip gate applies here too.** Event files get one per event
+string; these get one per file: reassembling `raw_line` in `line_no` order,
+with the recorded line ending, must reproduce the file's SHA-256. All 3,435
+files pass. The `final_newline` column exists because exactly one of them ends
+without a terminator, and without that column it rebuilds one byte short.
+
+Two files are **deliberately not ingested**. `parkcode.txt` has the same nine
+columns as `ballparks.csv`, contributes no park id that file lacks, and covers
+113 of the corpus's 292 sites against 285 — a strict subset, not a second
+source. `allplayers.csv` adds no *person*: every one of its 3,422 ids already
+appears in a roster or a biography. What it adds is per-season appearance
+counts, which is statistics rather than identity.
+
+### 8.2 The tables
+
+`people`, `roster_entries`, `teams`, `franchises`, `parks`, built by
+`rsse reference` from the archive in about five seconds. Four decisions shape
+them.
+
+**Verbatim, not normalised.** Retrosheet spells the majors `A`/`N` in 88
+seasons and `AL`/`NL` in 1920–1949, with **no season using both**. Both reach
+`teams.league` unchanged. Rewriting it here would make the derived table
+disagree with the archive it came from, for nothing a query cannot get with an
+`IN`.
+
+**Every observed id gets a row, with NULL where nothing is known.** Four
+people appear in the corpus with no roster line and no biography, and seven
+ballparks host games `ballparks.csv` has never heard of. `people.source` and
+`parks.source` say `observed` for those. The payoff is that **every reference
+join in the database resolves at zero** — a person nobody recorded is
+distinguishable from a broken join, which is the same argument as the nullable
+`earned_team` (§5.4).
+
+**`people` is not "players".** 2,369 of the 26,966 biographies carry umpire
+dates and 1,006 carry manager dates, and **471 of the umpires the corpus names
+never appear in a lineup** — they are reachable only through `comments`.
+Filtering the file to people who batted would lose every one.
+
+**A roster entry is keyed on the file, not the field.** 85 of 121,600 roster
+lines name a team other than the file holding them, and keying on the field
+collides: `PH51933.ROS` carries a line reading `NY5`, which then repeats the
+row already in `NY51933.ROS`. A roster file *is* that club's roster, so the
+filename is the stronger statement, and it is unique across all 121,600 lines.
+What the line said is kept in `stated_team_id` rather than discarded.
+
+### 8.3 The park-date check that is not a gate
+
+`ballparks.csv` carries `START` and `END`, which looked like a free external
+check: a game's date should fall inside its park's range. It was measured
+before being believed, and it is **not** a gate.
+
+409 of 121,489 comparable games fall outside, and **380 of them (93%) are
+Negro Leagues**. The reason is that the file dates a park by its *Major
+League* occupancy, not its lifetime: Kansas City's Municipal Stadium reads
+1955–1972 while the corpus holds 198 Negro Leagues games there from 1924.
+Shipping it as a check would have fired on 409 correct games, which is the
+failure a firing guard always has ([07-TESTING](07-TESTING.md) §4.3). It is
+counted and reported instead, and the count is the finding.
+
+The first version of that measurement said **106,537** games were out of
+range. The dates are not zero-padded — `4/20/1912` — and slicing them in SQL
+produced garbage on every one. `parks.start_iso` / `end_iso` exist so that
+nobody does it again.

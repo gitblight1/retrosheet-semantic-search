@@ -45,8 +45,10 @@ git clone <this repo> && cd retrosheet
 python3 -m rsse.cli fetch                 # download the corpus  (~862 MB)
 python3 -m rsse.cli ingest --progress     # byte-exact archive   (~11 min, 1.9 GB)
 python3 -m rsse.cli derive --progress     # queryable tables     (~90 min, 11.6 GB)
+python3 -m rsse.cli ingest --aux          # rosters/teams/parks  (~10 s)
 python3 -m rsse.cli secondary --progress  # comments + lineups   (~10 min)
-python3 -m rsse.cli earned-runs           # earned runs, derived (~25 min)
+python3 -m rsse.cli earned-runs           # earned runs, derived (~21 min)
+python3 -m rsse.cli reference             # people, teams, parks (~5 s)
 python3 -m rsse.cli coverage --rebuild    # coverage table       (~10 s)
 ```
 
@@ -188,11 +190,11 @@ Everything in the build order is built and validated against the full corpus.
 | Archive | 31,115,272 records, 1.94 GB, all raw invariants hold |
 | State machine | 203,285 games, **0** state-inconsistent plays |
 | Ontology | 84 tags, one derivation rule each, a positive **and** a negative case each |
-| Derived tables | 17,891,790 plays, 11.6 GB, **27/27** integrity checks |
+| Derived tables | 17,891,790 plays, 11.6 GB, **33/33** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
 | Earned runs | 1,796,610 derived from the play-by-play; **98.9486%** agree with Retrosheet's own per-run flags |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 286, all passing |
+| Tests | 313, all passing |
 
 **Every replayed score matches the published one.** `rsse reconcile` compares
 `games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
@@ -205,12 +207,17 @@ that do not come from the event files:
 | scores agree | **200,876 (100.0000%)** |
 | scores disagree | **0** |
 
-Not built: `players`, `teams` and `parks`. The roster and team files are on
-disk but have never been ingested, and reading them straight from the file tree
-would break the rule that derived tables come from the archive. Doing it
-properly needs a new archive table for records that belong to no game, since
-`raw_records` is partitioned exactly by `game_spans` and `rsse verify` asserts
-it. `parks` also needs a Retrosheet download the project does not hold.
+**Reference data is built.** 26,985 people, 121,600 roster entries, 3,493 team
+seasons, 292 franchises and 663 parks, from 3,435 files that `ingest` never
+used to read. They live in their own archive tables (`aux_files`,
+`aux_records`) so that `raw_records` stays partitioned exactly by `game_spans`
+— the invariant `rsse verify` asserts — and every one of them round-trips to
+its source file byte for byte.
+
+Every reference join resolves: four people and seven ballparks that no
+Retrosheet file describes still get a row, with null attributes and a `source`
+of `observed`, so a person nobody recorded is distinguishable from a broken
+join.
 
 ### Commands
 
@@ -225,6 +232,7 @@ python3 -m rsse.cli derive --progress          # derived tables (~90 min)
 python3 -m rsse.cli verify --derived           # derived-table integrity (21 checks)
 python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
 python3 -m rsse.cli earned-runs --check        # derive earned runs, then check them
+python3 -m rsse.cli reference                  # people, rosters, teams, parks
 python3 -m rsse.cli coverage --rebuild         # coverage table
 python3 -m rsse.cli gamelogs --fetch           # game logs, for score reconciliation
 python3 -m rsse.cli reconcile --explain-er     # replayed scores vs published ones
@@ -248,7 +256,7 @@ rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary, earned-run and
                  coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           286 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           313 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

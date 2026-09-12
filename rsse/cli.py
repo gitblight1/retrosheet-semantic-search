@@ -238,11 +238,39 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         print(f"\nCORPUS CHANGED: {exc}", file=sys.stderr)
         return 3
 
+    aux_stats = None
+    if args.aux:
+        # Rosters, team files, ballparks and biographies: the same archive,
+        # its own tables, because a record belonging to no game cannot live in
+        # one partitioned by game (spec/05-DATABASE.md §1.2).
+        from .database import auxiliary
+        aux_files = auxiliary.discover(root, Path(args.parks) if args.parks
+                                       else DATA / "parks")
+        if not aux_files:
+            print(f"no auxiliary files under {root}", file=sys.stderr)
+        else:
+            def aux_progress(done, total, st):
+                if args.progress:
+                    print(f"  aux {done}/{total} ... {st.records:,} records",
+                          file=sys.stderr, flush=True)
+            aux_stats = auxiliary.AuxStats()
+            try:
+                auxiliary.ingest(conn, corpus_id, aux_files, aux_stats,
+                                 progress=aux_progress,
+                                 verify=not args.no_verify)
+            except dbload.CorpusChanged as exc:
+                print(f"\nCORPUS CHANGED: {exc}", file=sys.stderr)
+                return 3
+
     if not args.no_index:
         print("building indexes ...", file=sys.stderr, flush=True)
         dbschema.create_indexes(conn)
     conn.execute("ANALYZE")
     conn.commit()
+    if aux_stats is not None:
+        print(f"auxiliary            {aux_stats.summary()}")
+        for path, why in aux_stats.roundtrip_failures[: args.top or 5]:
+            print(f"  ROUND-TRIP FAILED  {why}", file=sys.stderr)
 
     print(stats.summary())
     known = load_known_defects()
@@ -321,6 +349,45 @@ def cmd_verify(args: argparse.Namespace) -> int:
     print(f"source files         {files}")
     if recorded != records:
         failures.append(f"source_files sums to {recorded:,}, raw_records has {records:,}")
+
+    # --- auxiliary records: the same two shapes, asserted separately.
+    # Kept apart from the checks above on purpose. `source_files` and
+    # `raw_records` still mean exactly what they meant -- files of game
+    # records, partitioned by game -- and these say the same things about the
+    # files that belong to no game (spec/05-DATABASE.md §1.2).
+    has_aux = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'aux_files'").fetchone()[0]
+    if has_aux:
+        aux_files, aux_declared = conn.execute(
+            "SELECT count(*), coalesce(sum(record_count), 0) FROM aux_files"
+        ).fetchone()
+        aux_records = conn.execute(
+            "SELECT count(*) FROM aux_records").fetchone()[0]
+        print(f"auxiliary files      {aux_files}")
+        print(f"auxiliary records    {aux_records:,}")
+        if aux_declared != aux_records:
+            failures.append(f"aux_files declares {aux_declared:,},"
+                            f" aux_records has {aux_records:,}")
+        orphans = conn.execute(
+            "SELECT count(*) FROM aux_records r"
+            " LEFT JOIN aux_files f USING (aux_file_id)"
+            " WHERE f.aux_file_id IS NULL").fetchone()[0]
+        if orphans:
+            failures.append(f"{orphans:,} aux_records with no file")
+
+        # The archive's promise is bytes. For event files that is enforced per
+        # event string; here it is enforced per file, by rebuilding it.
+        if not args.quick:
+            from .database.auxiliary import check_roundtrip
+            bad = []
+            for (aux_id,) in conn.execute(
+                    "SELECT aux_file_id FROM aux_files ORDER BY aux_file_id"):
+                failure = check_roundtrip(conn, aux_id)
+                if failure:
+                    bad.append(failure)
+            print(f"auxiliary round-trip {len(bad)} failures")
+            failures.extend(bad[:5])
 
     print(f"archive              {db_path} ({db_path.stat().st_size / 1e9:.2f} GB)")
     conn.close()
@@ -428,6 +495,41 @@ DERIVED_CHECKS = [
      " WHERE p.parse_status = 'unparsed'"),
 ]
 
+#: Run only when `people` is present, since the reference tables are built by
+#: their own pass (spec/05-DATABASE.md §8). Every one of these is at zero only
+#: because a row is written for every id the corpus names, with null
+#: attributes where no file explains it -- omitting those would turn a person
+#: nobody recorded into a broken join.
+REFERENCE_CHECKS = [
+    ("lineup player not in people", False,
+     "SELECT l.player_id FROM (SELECT DISTINCT player_id FROM lineup_entries) l"
+     " LEFT JOIN people p ON p.person_id = l.player_id"
+     " WHERE p.person_id IS NULL"),
+    ("batter not in people", False,
+     "SELECT b.batter_id FROM (SELECT DISTINCT batter_id FROM plays) b"
+     " LEFT JOIN people p ON p.person_id = b.batter_id"
+     " WHERE p.person_id IS NULL"),
+    ("roster entry not in people", False,
+     "SELECT r.person_id FROM (SELECT DISTINCT person_id FROM roster_entries) r"
+     " LEFT JOIN people p ON p.person_id = r.person_id"
+     " WHERE p.person_id IS NULL"),
+    ("game site not in parks", False,
+     "SELECT g.site FROM (SELECT DISTINCT site FROM games"
+     "                     WHERE site IS NOT NULL AND site <> '') g"
+     " LEFT JOIN parks p ON p.park_id = g.site WHERE p.park_id IS NULL"),
+    ("team-season not in teams", False,
+     "SELECT x.t FROM (SELECT DISTINCT home_team AS t, season FROM games"
+     "                  UNION SELECT DISTINCT away_team, season FROM games) x"
+     " LEFT JOIN teams tm ON tm.team_id = x.t AND tm.season = x.season"
+     " WHERE tm.team_id IS NULL"),
+    # A park date that will not parse is worse than one that is absent: it
+    # silently drops out of every range comparison instead of being counted.
+    ("park date present but unparseable", False,
+     "SELECT park_id FROM parks"
+     " WHERE (start_date IS NOT NULL AND start_iso IS NULL)"
+     "    OR (end_date IS NOT NULL AND end_iso IS NULL)"),
+]
+
 #: Run only when `earned_runs` is present, since it is built by its own pass
 #: (spec/05-DATABASE.md §5.4) and a database without it is not broken.
 EARNED_RUN_CHECKS = [
@@ -499,6 +601,12 @@ def cmd_verify_derived(args: argparse.Namespace) -> int:
     else:
         print("note: no earned_runs table; run `rsse earned-runs` to add"
               f" {len(EARNED_RUN_CHECKS)} more checks\n", file=sys.stderr)
+    if conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+                    " AND name = 'people'").fetchone()[0]:
+        checks += REFERENCE_CHECKS
+    else:
+        print("note: no reference tables; run `rsse reference` to add"
+              f" {len(REFERENCE_CHECKS)} more checks\n", file=sys.stderr)
 
     failed = 0
     for name, trusted_only, sql in checks:
@@ -1062,6 +1170,69 @@ def _write_earned_report(path: Path, result) -> None:
     }, indent=2) + "\n")
 
 
+def cmd_reference(args: argparse.Namespace) -> int:
+    """Build `people`, `roster_entries`, `teams`, `franchises` and `parks`.
+
+    Its own pass, from the archive's `aux_records` (spec/05-DATABASE.md §8).
+    Needs `rsse ingest --aux` first, which is where the source files enter the
+    archive at all.
+    """
+    from .database import reference as refdb
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    query_path = Path(args.database) if args.database else QUERY_DB
+    for path, what in ((archive_path, "ingest"), (query_path, "derive")):
+        if not path.exists():
+            print(f"no database at {path}; run `rsse {what}` first",
+                  file=sys.stderr)
+            return 2
+
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+    have = archive.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        " AND name='aux_files'").fetchone()[0]
+    if not have or not archive.execute(
+            "SELECT count(*) FROM aux_files").fetchone()[0]:
+        print("no auxiliary files in the archive; run `rsse ingest --aux`"
+              " first", file=sys.stderr)
+        return 2
+
+    conn = dbschema.connect(str(query_path))
+    for pragma in dbschema.LOAD_PRAGMAS:
+        conn.execute(pragma)
+    started = time.time()
+    stats = refdb.build(conn, archive)
+
+    print(f"people               {stats.people:,}")
+    for source, n in sorted(stats.by_source.items(), key=lambda kv: -kv[1]):
+        print(f"  from {source:<16} {n:,}")
+    print(f"roster_entries       {stats.roster_entries:,}")
+    if stats.team_field_conflicts:
+        # 85 lines name a team other than the file they sit in. Kept, with the
+        # stated value in `stated_team_id`, rather than silently resolved.
+        print(f"  team field conflicts {stats.team_field_conflicts}"
+              f"  (see roster_entries.stated_team_id)")
+    print(f"teams                {stats.teams:,}")
+    print(f"franchises           {stats.franchises:,}")
+    print(f"parks                {stats.parks:,}")
+    if stats.parks_observed_only:
+        print(f"  observed only      {stats.parks_observed_only}"
+              f"  (a game is played there and no file describes it)")
+    outside = stats.games_outside_park_dates
+    if outside:
+        # Reported, deliberately not gated: `ballparks.csv` dates a park by
+        # its Major League occupancy, not its lifetime.
+        pct = 100 * stats.games_outside_park_dates_ngl / outside
+        print(f"\ngames outside their park's stated dates  {outside:,}"
+              f" of {stats.games_park_date_comparable:,}")
+        print(f"  Negro Leagues                          "
+              f"{stats.games_outside_park_dates_ngl:,}  ({pct:.0f}%)"
+              f" -- the file dates Major League use only")
+    print(f"\nelapsed              {time.time() - started:.1f}s")
+    print(f"\n{ATTRIBUTION}")
+    return 0
+
+
 def cmd_secondary(args: argparse.Namespace) -> int:
     """Build `comments` and `lineup_entries` (spec/05-DATABASE.md §2, §5).
 
@@ -1292,7 +1463,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
 #: named before that happens -- `coverage` included, which was missing from
 #: this list and is the reason it silently vanished from the database.
 NON_DERIVED_TABLES = ("comments", "lineup_entries", "earned_runs", "coverage",
-                      "players", "teams", "parks")
+                      "people", "roster_entries", "teams", "franchises",
+                      "parks")
 
 
 def _non_derived_tables(path: Path) -> list[tuple[str, int]]:
@@ -1634,6 +1806,10 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("--no-verify", action="store_true",
                    help="skip the round-trip gate (not recommended)")
     i.add_argument("--no-index", action="store_true")
+    i.add_argument("--aux", action="store_true",
+                   help="also archive rosters, team files, parks and bios")
+    i.add_argument("--parks", help="directory holding the whole-corpus"
+                   " auxiliary files (default data/parks)")
     i.set_defaults(func=cmd_ingest)
 
     r = sub.add_parser("replay", help="replay every game and check the state machine")
@@ -1729,6 +1905,12 @@ def main(argv: list[str] | None = None) -> int:
     ern.add_argument("--report", help="write a JSON report to this path")
     ern.set_defaults(func=cmd_earnedruns)
 
+    rf = sub.add_parser("reference",
+                        help="build people, rosters, teams and parks")
+    rf.add_argument("--archive")
+    rf.add_argument("--database")
+    rf.set_defaults(func=cmd_reference)
+
     sc = sub.add_parser("secondary",
                         help="build comments and lineup_entries")
     sc.add_argument("--archive")
@@ -1745,6 +1927,8 @@ def main(argv: list[str] | None = None) -> int:
 
     v = sub.add_parser("verify", help="check raw-layer integrity")
     v.add_argument("--archive")
+    v.add_argument("--quick", action="store_true",
+                   help="skip rebuilding every auxiliary file from its records")
     v.add_argument("--derived", action="store_true",
                    help="check the derived tables instead of the archive")
     v.add_argument("--database")
