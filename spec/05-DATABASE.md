@@ -501,9 +501,30 @@ The tag `ReplayOverturned` is the exception and does need a re-derive, because
 it is a *tag*: `rsse/model/game.py` sets `PlayContext.replay_reversed` from a
 linked structured `replay` comment during replay, and tags are derived there.
 
-Because these tables are not derived, `derive --rebuild` — which replaces the
-file — destroys them. It counts and names them before doing so rather than
-letting them disappear quietly.
+`earned_runs` (§5.4) and `coverage` are separate passes for the same reason.
+So the full sequence after a rebuild is:
+
+```
+rsse derive --rebuild        # plays, advances, credits, tags   (~90 min)
+rsse secondary               # comments + lineup_entries        (~10 min)
+rsse earned-runs --check     # earned runs, then the 3-way check (~21 min)
+rsse coverage --rebuild      # what the corpus covers           (~10 s)
+rsse verify --derived        # 27 integrity checks              (~5 min)
+```
+
+**`earned-runs` must follow `secondary`, and the dependency is silent.** The
+pitcher charged with a run comes from `lineup_entries`
+([03-STATE](03-STATE.md) §9.5), and without that table the build does not
+fail — it writes all 1.8 million runs with a NULL pitcher. The per-run check
+barely depends on who was pitching, so the headline agreement would still come
+back near 99% and only the `data,er` comparison would collapse. `earned-runs`
+therefore refuses to start unless `lineup_entries` holds at least one pitcher.
+
+Because none of these tables is derived, `derive --rebuild` — which replaces
+the file — destroys them all. It counts and names them first rather than
+letting them disappear quietly. `coverage` was missing from that list until
+the rebuild for the `FLE$` correction was about to run, which is why it had
+already silently vanished from the database once.
 
 ### 5.3 Game logs, and measuring what the corpus lacks
 

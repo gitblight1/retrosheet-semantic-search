@@ -481,21 +481,21 @@ never be checked.
 
 ```
 runs adjudicated     1,796,610   in 203,236 games
-  settled by rule    1,509,046
-  graded likely        108,169
-  9.16 defers          179,395   (9.99%)
+  settled by rule    1,509,054
+  graded likely        108,165
+  9.16 defers          179,391   (9.98%)
 
-runs compared        1,616,073
-  agree              1,599,081   (98.9486%)
-  differ                16,992
-TUR before 1969        1,142     -- notation not yet in use
+runs compared        1,616,079
+  agree              1,599,106   (98.9497%)
+  differ                16,973
+TUR before 1969        1,140     -- notation not yet in use
 ```
 
 | source | compared | in bound | exact | exact agree |
 |---|---|---|---|---|
-| `data,er` | 1,167,947 | 99.16% | 1,026,202 | **99.47%** |
+| `data,er` | 1,167,947 | 99.16% | 1,026,203 | **99.47%** |
 | game log individual ER | 402,092 | 98.34% | 276,651 | **99.16%** |
-| game log team ER | 402,092 | 98.42% | 276,651 | **99.22%** |
+| game log team ER | 402,092 | 98.43% | 276,651 | **99.22%** |
 
 #### The grades are calibrated, which is the result that matters
 
@@ -575,11 +575,18 @@ idea.
 The check found a defect in the **state machine**, two layers down:
 [03-STATE](03-STATE.md) §2 rule 2 listed `FLE$` — an error on a foul fly — as
 putting the batter on first. It does not; it prolongs the plate appearance,
-which is the entire reason 9.16(a)(2)(i) exists. All **8,562** `FLE` plays in
-the corpus are followed by another play with the same batter, and 6,187 of
-them had left a phantom runner on first for the rest of the half-inning:
+which is the entire reason 9.16(a)(2)(i) exists. Of the **8,563** `FLE` plays
+in the corpus, all 8,562 that have a following play are followed by the same
+batter, and 6,187 of them had left a phantom runner on first for the rest of the half-inning:
 **20,883 plays across 6,183 half-innings** with a runner in the base state who
 was still holding a bat.
+
+These figures are from the run *after* the `FLE$` correction below was
+derived. Before it they were 98.9486% and 179,395 deferred: the correction
+moved **34 verdicts** out of 1,796,610, improving agreement by 19 net
+disagreements, and every one of them falls in a half-inning containing an
+`FLE`. That the movement is confined there, and small, is the check on the
+fix rather than a footnote to it.
 
 No gate here could see it. No out was invented, so out accounting balanced.
 The half-innings still ended with three. And a runner no advance in the file

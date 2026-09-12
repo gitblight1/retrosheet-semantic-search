@@ -334,8 +334,10 @@ def batter_destination(event: G.Event) -> str | None:
         # A muffed foul fly does not end the plate appearance, it prolongs it
         # -- which is the whole reason OBR 9.16(a)(2)(i) exists. §2 rule 2
         # listed `FLE$` as putting the batter on first, and the corpus is
-        # unanimous against it: **all 8,562 `FLE` plays in the corpus are
-        # followed by another play with the same batter at bat.** Placing him
+        # unanimous against it: of the 8,563 `FLE` plays in the corpus, the
+        # 8,562 that have a following play are **every one** followed by the
+        # same batter at bat -- the odd one is the last play of its game, not
+        # a counter-example. Placing him
         # on first leaves a phantom runner there for the rest of the
         # half-inning, and no invariant in the project could see it -- outs
         # still balanced, and a runner nobody's advance ever mentions never

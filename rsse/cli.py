@@ -935,6 +935,25 @@ def cmd_earnedruns(args: argparse.Namespace) -> int:
     archive = dbschema.connect(f"file:{archive_path}?mode=ro")
     seasons = [int(y) for y in args.season.split(",")] if args.season else None
 
+    # `lineup_entries` is where the pitcher on the mound comes from (9.16(f)).
+    # Without it this does not fail -- it writes every run with a NULL
+    # pitcher, and since the per-run check barely depends on who was pitching,
+    # the headline agreement would still come back near 99%. Only the
+    # `data,er` comparison would collapse, and only if someone read it.
+    probe = dbschema.connect(f"file:{query_path}?mode=ro")
+    have_lineups = probe.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'lineup_entries'").fetchone()[0]
+    pitchers = probe.execute(
+        "SELECT count(*) FROM lineup_entries WHERE position = 1"
+    ).fetchone()[0] if have_lineups else 0
+    probe.close()
+    if not pitchers:
+        print("no pitchers in lineup_entries; run `rsse secondary` first."
+              " Without it every run would be charged to nobody, and the"
+              " per-run check would not notice.", file=sys.stderr)
+        return 2
+
     if not args.check_only:
         conn = dbschema.connect(str(query_path))
         for pragma in dbschema.LOAD_PRAGMAS:
@@ -1124,7 +1143,12 @@ def cmd_coverage(args: argparse.Namespace) -> int:
           f"{'plays':>10} {'pitches':>8} {'unparsed':>9} {'untrusted':>10}"
           "  dates")
     total_games = total_plays = total_missing = 0
-    unknown_missing = False
+    #: Games in seasons the comparison could actually reach. The percentage
+    #: below is over these only: counting a league whose missing games are
+    #: unknown into the numerator would report better coverage than was
+    #: measured.
+    measured_games = 0
+    unmeasured: list[tuple] = []
     for row in conn.execute(
             "SELECT season, league, games, plays, games_with_pitches,"
             " plays_unparsed, plays_inconsistent, first_date, last_date,"
@@ -1132,9 +1156,10 @@ def cmd_coverage(args: argparse.Namespace) -> int:
             f" FROM coverage{where} ORDER BY season, league", params):
         missing = row[9]
         if missing is None:
-            unknown_missing = True
+            unmeasured.append((row[0], row[1]))
         else:
             total_missing += missing
+            measured_games += row[2]
         print(f"{row[0]:>7} {row[1]:<4} {row[2]:>7,} "
               f"{('?' if missing is None else f'{missing:,}'):>8} "
               f"{row[3]:>10,} {row[4]:>8,} {row[5]:>9,} {row[6]:>10,}"
@@ -1142,13 +1167,29 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         total_games += row[2]
         total_plays += row[3]
     print(f"\n{total_games:,} games, {total_plays:,} plays")
-    if unknown_missing:
-        print("games with no event file: unknown for some seasons "
-              "(run `rsse gamelogs`, then `rsse coverage --rebuild`)")
+    # A NULL here has two causes and only one of them is fixable, which the
+    # message has to say. When *nothing* is measured the game logs are simply
+    # not loaded. When some rows are measured and others are not, the others
+    # are leagues the game logs do not cover -- Retrosheet publishes Major
+    # League logs only -- and no download will ever fill them. Telling the
+    # user to run `rsse gamelogs` in that case sends them after a file that
+    # exists and will not help, and suppresses the real total while doing it.
+    if not measured_games:
+        print("games with no event file: not measured -- no game logs in the"
+              " archive.\n  Run `rsse gamelogs`, then `rsse coverage"
+              " --rebuild`.")
     else:
-        whole = total_games + total_missing
+        whole = measured_games + total_missing
         print(f"games with no event file: {total_missing:,} "
-              f"({total_games / whole:.2%} of known games held)")
+              f"({measured_games / whole:.2%} of known games held)")
+        if unmeasured:
+            leagues = sorted({lg for _season, lg in unmeasured})
+            print(f"  not measurable for {len(unmeasured)} season-league rows"
+                  f" ({', '.join(leagues)}): Retrosheet's game logs are Major"
+                  "\n  League only, so these have no published game list to"
+                  " compare against. The\n  column is NULL rather than 0"
+                  " because nobody has counted, not because\n  nothing is"
+                  " missing.")
     print(f"\n{ATTRIBUTION}")
     conn.close()
     return 0
@@ -1246,7 +1287,11 @@ def cmd_replay(args: argparse.Namespace) -> int:
 #: Tables in the query database that `derive` does not rebuild. Kept as data
 #: so a new build step cannot be forgotten here: a table that `--rebuild`
 #: destroys and nothing recreates is a gap nobody would notice.
-NON_DERIVED_TABLES = ("comments", "lineup_entries", "earned_runs",
+#: Tables in the query database that `derive` does not build. `--rebuild`
+#: replaces the file, so each of these is destroyed with it and has to be
+#: named before that happens -- `coverage` included, which was missing from
+#: this list and is the reason it silently vanished from the database.
+NON_DERIVED_TABLES = ("comments", "lineup_entries", "earned_runs", "coverage",
                       "players", "teams", "parks")
 
 

@@ -53,8 +53,9 @@ Precedence, highest first:
    | `FLE$`, `SB`, `CS`, `PO`, `POCS`, `WP`, `PB`, `BK`, `DI`, `OA`, `NP` | batter stays at the plate |
    **`FLE$` was in the first row of that table until the earned-run
    derivation went looking**, and it is the one entry the corpus refutes
-   outright: **all 8,562 `FLE` plays are followed by another play with the
-   same batter at bat.** A muffed foul fly prolongs the plate appearance
+   outright: of the **8,563** `FLE` plays in the corpus, the 8,562 that have
+   a following play are **every one** followed by the same batter at bat. (The
+   odd one out is the last play of its game, not a counter-example.) A muffed foul fly prolongs the plate appearance
    rather than ending it — which is the entire reason OBR 9.16(a)(2)(i)
    exists — and placing the batter on first leaves a runner standing there
    who is still holding a bat.
