@@ -64,12 +64,52 @@ class Compilation(QueryBase):
         self.assertIn("JOIN play_tags", sql)
         self.assertNotIn("EXISTS (SELECT 1 FROM play_tags", sql)
 
-    def test_a_tag_inside_any_of_compiles_to_exists(self):
+    def test_a_tag_inside_any_of_compiles_to_a_subquery(self):
         # A JOIN cannot express OR, so the same predicate must have a second
         # form -- this is the reason `Pred` carries both.
         sql, _ = Search().any_of(Search().strikeout(),
                                  Search().tag("Walk"))._compile("p.play_id")
-        self.assertIn("EXISTS (SELECT 1 FROM play_tags", sql)
+        self.assertIn("p.play_id IN (SELECT x.play_id FROM play_tags", sql)
+        self.assertIn(" OR ", sql)
+
+    def test_sub_table_predicates_never_compile_to_correlated_exists(self):
+        """`IN (SELECT ...)` lets the inner index drive; `EXISTS` cannot.
+
+        A correlated `EXISTS` is evaluated once per candidate play, so the
+        index on the inner table can only be probed. Measured on the full
+        corpus, the difference was 18,163 ms against 187 ms for
+        `.force_play(at="H")` and 22,893 ms against 5.6 ms for
+        `.putout_sequence([6,4,3])`.
+        """
+        searches = (
+            Search().force_play(at="H"),
+            Search().out_at("2"),
+            Search().tag_out(at="3"),
+            Search().error(6),
+            Search().putout_sequence([6, 4, 3]),
+            Search().contains_sequence([6, 4]),
+            Search().putout_by(3, assist_by=[6, 4]),
+            Search().exclude_curated(),
+            Search().curated_only(),
+        )
+        for search in searches:
+            sql, _ = search._compile("p.play_id")
+            with self.subTest(sql=sql):
+                self.assertNotIn("EXISTS", sql,
+                                 "correlated EXISTS defeats the inner index")
+                # Asserting the wrapper alone is not enough. The first attempt
+                # at this changed `EXISTS (...)` to `p.play_id IN (...)` and
+                # left `a.play_id = p.play_id` inside the subquery, which is
+                # still correlated and still evaluated once per play -- the
+                # query looked fixed and ran at exactly the old speed. Only
+                # the benchmark caught it.
+                for line in sql.splitlines():
+                    if "IN (SELECT" in line:
+                        self.assertNotIn(
+                            "= p.play_id", line,
+                            "a correlation clause inside the subquery keeps "
+                            "the per-play evaluation the IN form exists to "
+                            "avoid")
 
     def test_ordering_is_total(self):
         sql, _ = Search().strikeout()._compile("p.play_id")
@@ -344,6 +384,36 @@ class Results(QueryBase):
     def test_an_unknown_tag_is_an_error_not_an_empty_result(self):
         with self.assertRaises(QueryError):
             Search().tag("NoSuchTagExists").run(self.conn)
+
+
+class BenchHarness(QueryBase):
+    """The benchmark harness itself (spec/07-TESTING.md §5).
+
+    Not a performance test -- timings on a fixture of two games mean nothing.
+    This asserts the harness runs, which is what stops `rsse bench` from
+    rotting silently between the corpus-scale runs that do mean something.
+    """
+
+    def test_every_benchmark_builds_and_runs(self):
+        from rsse import bench
+        for spec in bench.BENCHMARKS:
+            with self.subTest(spec.name):
+                result = bench.run_one(self.conn, spec, repeats=1)
+                self.assertEqual(result.name, spec.name)
+                self.assertGreaterEqual(result.median_ms, 0.0)
+
+    def test_every_benchmark_has_a_budget_and_a_known_mode(self):
+        from rsse import bench
+        for spec in bench.BENCHMARKS:
+            with self.subTest(spec.name):
+                self.assertGreater(spec.budget_ms, 0)
+                self.assertIn(spec.mode, ("count", "run", "rows"))
+
+    def test_benchmark_names_are_unique(self):
+        # `--only` matches on the name, and the report is keyed by it.
+        from rsse import bench
+        names = [b.name for b in bench.BENCHMARKS]
+        self.assertEqual(len(names), len(set(names)))
 
 
 if __name__ == "__main__":

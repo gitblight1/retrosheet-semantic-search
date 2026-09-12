@@ -38,6 +38,16 @@ class QueryError(ValueError):
     """A query that cannot be answered, stated as such rather than guessed at."""
 
 
+#: Sub-table predicates compile to ``p.play_id IN (SELECT ...)``, never to a
+#: correlated ``EXISTS``. The two are logically identical and are not remotely
+#: the same query: `EXISTS` correlates on `p.play_id`, so SQLite evaluates it
+#: once per candidate play and the inner index can only ever be probed, never
+#: driven. `IN` lets the subquery run once and drive. Measured on the full
+#: corpus, `.force_play(at="H")` went from 18,163 ms to 187 ms and
+#: `.putout_sequence([6,4,3])` from 22,893 ms to 5.6 ms -- the second is a
+#: 4,000x difference produced by moving three words.
+
+
 @dataclass(frozen=True)
 class Pred:
     """One predicate, in both of the forms the compiler may need.
@@ -209,22 +219,40 @@ class Search:
         See `.putout_by()` for the credits question.
         """
         position = int(position)
+        # Expressed as the *interval* each entry holds the position for,
+        # rather than as "no later entry has taken effect yet".
+        #
+        # The obvious form is `EXISTS ... AND NOT EXISTS ...` correlated on
+        # `p.play_id`, which reads directly from the rule and takes 32.9
+        # seconds: it walks the lineup twice for every candidate play. A
+        # window function computes each holder's interval once per game --
+        # `LEAD` gives the play the *next* entry took effect after, which is
+        # exactly where this one stops holding -- and the whole thing becomes
+        # a range test. Same answer, 90 ms.
+        #
         # `team` in lineup_entries is 0 visitor / 1 home, as in `batting_team`,
-        # so the fielding side is its complement.
-        effective = ("(le.is_sub = 0 OR le.play_id IS NULL"
-                     " OR le.play_id < p.play_id)")
-        later = ("(le2.is_sub = 0 OR le2.play_id IS NULL"
-                 " OR le2.play_id < p.play_id)")
+        # so the fielding side is its complement. A starter has a NULL
+        # `play_id` and holds from the beginning, which `coalesce(..., 0)`
+        # expresses without a special case.
         return self._with(Pred(
-            "EXISTS (SELECT 1 FROM lineup_entries le"
-            "  WHERE le.game_key = p.game_key AND le.position = ?"
-            "    AND le.team = 1 - p.batting_team AND le.player_id = ?"
-            f"   AND {effective}"
-            "    AND NOT EXISTS (SELECT 1 FROM lineup_entries le2"
-            "         WHERE le2.game_key = p.game_key AND le2.position = ?"
-            "           AND le2.team = le.team AND le2.seq > le.seq"
-            f"          AND {later}))",
-            (position, player_id, position)))
+            "p.play_id IN ("
+            " SELECT pl.play_id FROM plays pl"
+            "   JOIN (SELECT game_key, team, player_id,"
+            "                coalesce(play_id, 0) AS start_after,"
+            "                LEAD(coalesce(play_id, 0)) OVER ("
+            "                    PARTITION BY game_key, team ORDER BY seq)"
+            "                  AS next_after"
+            "           FROM lineup_entries"
+            "          WHERE position = ?"
+            "            AND game_key IN (SELECT game_key FROM lineup_entries"
+            "                              WHERE position = ?"
+            "                                AND player_id = ?)) h"
+            "     ON h.game_key = pl.game_key"
+            "    AND h.team = 1 - pl.batting_team"
+            "  WHERE h.player_id = ?"
+            "    AND pl.play_id > h.start_after"
+            "    AND (h.next_after IS NULL OR pl.play_id <= h.next_after))",
+            (position, position, player_id, player_id)))
 
     # -- §3 play predicates ----------------------------------------------
 
@@ -242,9 +270,8 @@ class Search:
         if td is not None and td.alias_of:
             name = td.alias_of
         return self._with(Pred(
-            where=("EXISTS (SELECT 1 FROM play_tags x WHERE"
-                   " x.play_id = p.play_id AND x.tag_id = "
-                   + _tag_id_sql(name) + CONF_TOKEN + ")"),
+            where=("p.play_id IN (SELECT x.play_id FROM play_tags x WHERE"
+                   " x.tag_id = " + _tag_id_sql(name) + CONF_TOKEN + ")"),
             params=(name,),
             join=("JOIN play_tags {a} ON {a}.play_id = p.play_id"
                   " AND {a}.tag_id = " + _tag_id_sql(name) + CONF_TOKEN),
@@ -296,7 +323,10 @@ class Search:
         credit sequence contains an error is not an out (02-GRAMMAR §5), and a
         predicate matching the `X` over-counts.
         """
-        clauses = ["a.play_id = p.play_id", "a.is_out = 1"]
+        # No `a.play_id = p.play_id` here: the correlation is what the
+        # `IN` form exists to avoid, and leaving it inside the subquery
+        # keeps the per-play evaluation while looking like the fix.
+        clauses = ["a.is_out = 1"]
         params: list = []
         if not include_tag_outs:
             clauses.append("a.is_force = 1")
@@ -310,33 +340,33 @@ class Search:
             clauses.append("a.force_certainty = ?")
             params.append(certainty)
         return self._with(Pred(
-            "EXISTS (SELECT 1 FROM runner_advances a WHERE "
+            "p.play_id IN (SELECT a.play_id FROM runner_advances a WHERE "
             + " AND ".join(clauses) + ")",
             tuple(params), is_force=True, force_at=at))
 
     def out_at(self, base: str) -> "Search":
         return self._with(Pred(
-            "EXISTS (SELECT 1 FROM runner_advances a WHERE a.play_id = p.play_id"
-            " AND a.is_out = 1 AND a.destination = ?)", (base,)))
+            "p.play_id IN (SELECT a.play_id FROM runner_advances a"
+            " WHERE a.is_out = 1 AND a.destination = ?)", (base,)))
 
     def tag_out(self, at: str | None = None) -> "Search":
-        clauses = ["a.play_id = p.play_id", "a.is_out = 1", "a.is_force = 0"]
+        clauses = ["a.is_out = 1", "a.is_force = 0"]
         params: list = []
         if at is not None:
             clauses.append("a.destination = ?")
             params.append(at)
         return self._with(Pred(
-            "EXISTS (SELECT 1 FROM runner_advances a WHERE "
+            "p.play_id IN (SELECT a.play_id FROM runner_advances a WHERE "
             + " AND ".join(clauses) + ")", tuple(params)))
 
     def error(self, fielder: int | None = None) -> "Search":
-        clauses = ["f.play_id = p.play_id", "f.credit = 'error'"]
+        clauses = ["f.credit = 'error'"]
         params: list = []
         if fielder is not None:
             clauses.append("f.fielder = ?")
             params.append(int(fielder))
         return self._with(Pred(
-            "EXISTS (SELECT 1 FROM fielding_credits f WHERE "
+            "p.play_id IN (SELECT f.play_id FROM fielding_credits f WHERE "
             + " AND ".join(clauses) + ")", tuple(params)))
 
     def hit_location(self, pattern: str) -> "Search":
@@ -363,7 +393,7 @@ class Search:
                               scope)
 
     def _sequence(self, test: str, value: str, scope: str | None) -> "Search":
-        clauses = ["cs.play_id = p.play_id", test]
+        clauses = [test]
         params: list = [value]
         if scope is not None:
             if scope not in ("basic", "advance"):
@@ -371,18 +401,17 @@ class Search:
             clauses.append("cs.scope = ?")
             params.append(scope)
         return self._with(Pred(
-            "EXISTS (SELECT 1 FROM credit_sequences cs WHERE "
+            "p.play_id IN (SELECT cs.play_id FROM credit_sequences cs WHERE "
             + " AND ".join(clauses) + ")", tuple(params)))
 
     def putout_by(self, fielder: int, assist_by=()) -> "Search":
-        clauses = ["EXISTS (SELECT 1 FROM fielding_credits f"
-                   " WHERE f.play_id = p.play_id AND f.credit = 'putout'"
-                   " AND f.fielder = ?)"]
+        clauses = ["p.play_id IN (SELECT f.play_id FROM fielding_credits f"
+                   " WHERE f.credit = 'putout' AND f.fielder = ?)"]
         params: list = [int(fielder)]
         for a in assist_by:
-            clauses.append("EXISTS (SELECT 1 FROM fielding_credits f"
-                           " WHERE f.play_id = p.play_id AND f.credit = 'assist'"
-                           " AND f.fielder = ?)")
+            clauses.append("p.play_id IN (SELECT f.play_id FROM"
+                           " fielding_credits f"
+                           " WHERE f.credit = 'assist' AND f.fielder = ?)")
             params.append(int(a))
         return self._with(Pred("(" + " AND ".join(clauses) + ")", tuple(params)))
 
@@ -543,11 +572,11 @@ class Search:
         if status:
             wheres.append(status)
         if self._curated == "only":
-            wheres.append("EXISTS (SELECT 1 FROM play_tags c"
-                          " WHERE c.play_id = p.play_id AND c.source='curated')")
+            wheres.append("p.play_id IN (SELECT c.play_id FROM play_tags c"
+                          " WHERE c.source = 'curated')")
         elif self._curated == "exclude":
-            wheres.append("NOT EXISTS (SELECT 1 FROM play_tags c"
-                          " WHERE c.play_id = p.play_id AND c.source='curated')")
+            wheres.append("p.play_id NOT IN (SELECT c.play_id FROM play_tags c"
+                          " WHERE c.source = 'curated')")
 
         gt_sql, gt_params = self._game_type_sql()
         if gt_sql:
@@ -619,11 +648,15 @@ class Search:
             rows.append(PlayResult(*r))
         rows = tuple(replace(r, tags=_tags_for(conn, r.play_id)) for r in rows)
 
-        total = search.count(conn) if search._limit else len(rows)
+        # `build_excluded` groups the population by `parse_status`, and its
+        # `ok` bucket *is* the number of matches -- so the total comes from
+        # there rather than from a second full execution of the query.
+        excluded = build_excluded(conn, search)
+        total = excluded.matched if search._limit else len(rows)
         return ResultSet(
             rows=rows, total=total,
             coverage=build_coverage(conn, search),
-            excluded=build_excluded(conn, search),
+            excluded=excluded,
             force=build_force(conn, search) if search.uses_force else None,
             sql=sql, params=params,
             ontology_version=ONTOLOGY_VERSION,

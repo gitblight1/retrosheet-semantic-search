@@ -300,8 +300,10 @@ def credit_sequences(event: G.Event) -> list[CreditSeq]:
 
 #: Implicit destination by basic event, used when no explicit B advance exists.
 _HIT_DEST = {"S": "1", "D": "2", "T": "3"}
+#: `FLE$` is deliberately **not** here, though §2 rule 2 listed it until the
+#: earned-run derivation went looking. See `batter_destination`.
 _REACH_FIRST = (G.Walk, G.HitByPitch, G.ReachedOnError, G.FieldersChoice,
-                G.FoulFlyError, G.Interference)
+                G.Interference)
 #: Events that leave the batter at the plate: the play did not involve them.
 _NOT_BATTER = ("SB", "CS", "PO", "POCS", "DI", "OA", "WP", "PB", "BK")
 
@@ -327,6 +329,17 @@ def batter_destination(event: G.Event) -> str | None:
     if isinstance(basic, G.NoPlay):
         return None
     if isinstance(basic, G.BaseRunning) and basic.code in _NOT_BATTER:
+        return None
+    if isinstance(basic, G.FoulFlyError):
+        # A muffed foul fly does not end the plate appearance, it prolongs it
+        # -- which is the whole reason OBR 9.16(a)(2)(i) exists. §2 rule 2
+        # listed `FLE$` as putting the batter on first, and the corpus is
+        # unanimous against it: **all 8,562 `FLE` plays in the corpus are
+        # followed by another play with the same batter at bat.** Placing him
+        # on first leaves a phantom runner there for the rest of the
+        # half-inning, and no invariant in the project could see it -- outs
+        # still balanced, and a runner nobody's advance ever mentions never
+        # scores, so the score reconciliation stayed at 100%.
         return None
     if isinstance(basic, G.Hit):
         return _HIT_DEST.get(basic.kind)

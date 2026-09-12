@@ -270,9 +270,7 @@ CREATE TABLE runner_advances (
   force_certainty TEXT NOT NULL DEFAULT 'derived'
     CHECK (force_certainty IN ('derived','likely','ambiguous','n/a')),
   scored         INTEGER NOT NULL DEFAULT 0,
-  earned         INTEGER,
-  rbi            INTEGER,
-  raw            TEXT NOT NULL,
+  raw            TEXT NOT NULL,   -- as written, flags included; see §5.4
   PRIMARY KEY (play_id, seq)
 );
 CREATE INDEX ix_adv_force ON runner_advances (is_force, destination)
@@ -540,6 +538,63 @@ regular-season games the logs list that the corpus has no event file for. It is
 "we know of no missing games" and "we have not looked" must not read alike in
 a table whose purpose is to bound a negative result. `CoverageReport` carries
 the same distinction through to the query API.
+
+## 5.4 Earned runs
+
+`earned_runs` holds one row per run scored, with the verdict derived from the
+play-by-play ([03-STATE](03-STATE.md) §9) rather than read off Retrosheet's
+flags.
+
+```sql
+CREATE TABLE earned_runs (
+  play_id        INTEGER NOT NULL REFERENCES plays,
+  adv_seq        INTEGER NOT NULL,          -- runner_advances.seq
+  game_key       INTEGER NOT NULL REFERENCES games,
+  inning         INTEGER NOT NULL,
+  half           TEXT NOT NULL CHECK (half IN ('top','bottom')),
+  batting_team   INTEGER NOT NULL CHECK (batting_team IN (0,1)),
+  runner_id      TEXT,
+  pitcher_id     TEXT,                      -- charged, per 9.16(f)
+  earned_team    INTEGER,                   -- NULL where 9.16 defers
+  earned_pitcher INTEGER,
+  certainty      TEXT NOT NULL
+    CHECK (certainty IN ('derived','likely','ambiguous','untrusted')),
+  reason         TEXT NOT NULL,
+  recorded       TEXT NOT NULL,             -- '', 'UR' or 'TUR', as written
+  PRIMARY KEY (play_id, adv_seq)
+);
+```
+
+Three things about this table are deliberate.
+
+**`earned_team` and `earned_pitcher` are nullable, and NULL is a verdict.**
+9.16 hands several of its own clauses to the scorer in its own words. A
+derivation that answered anyway would be inventing a fact, and an unearned
+verdict has to be earned the same way a zero does (§3). `certainty` says
+which clause, `reason` says which words.
+
+**`batting_team` is stored rather than read off `half`.** 51 games have the
+home team batting first ([03-STATE](03-STATE.md) §6.5), and every total here
+is charged to the *other* side. Deriving the fielding side from `half` would
+put 51 games' earned runs against the wrong pitchers, and the totals would
+still add up.
+
+**`recorded` sits beside the derivation and is never used by it.** It is the
+answer key ([07-TESTING](07-TESTING.md) §4.5), stored here so the comparison
+stays runnable without re-parsing 17.9 million events.
+
+The table is built by its own pass, `rsse earned-runs`, for the same reason
+`comments` and `lineup_entries` are (§5.2): it needs nothing the derived
+tables do not already hold. `runner_advances` carries every movement with its
+error negation resolved, `credit_sequences` carries the errors, and
+`runner_advances.raw` preserves the `(UR)` and `(TUR)` flags exactly as
+written — which is what makes the check possible at all. Two archive record
+types are still read: `presadj`, which restates responsibility, and
+`data,er`, which is one of the things the result is checked against.
+
+It is therefore **not** rebuilt by `derive`, and like the other non-derived
+tables it is named in the casualty warning `derive --rebuild` prints before
+replacing the file.
 
 ## 6. Operational notes
 

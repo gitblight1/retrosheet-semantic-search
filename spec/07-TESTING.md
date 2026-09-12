@@ -262,7 +262,7 @@ only move downward.
 | `runs_on_play <= runners_on_base + 1` | runs credited to nobody |
 | `runs_on_play ==` count of scoring advances | a run counted twice |
 | reconstructed final score `==` game `info` score | state machine drift |
-| reconstructed earned runs `==` `data,er` records | responsibility and error logic |
+| derived earned-run bounds contain `data,er` | responsibility and error logic (§4.5) |
 | every half-inning ends with 3 outs, or is the game's last | out accounting |
 | `outs_before + outs_recorded <= 3` everywhere | over-counted outs from `X` with a negating error |
 | no duplicate base occupancy in `bases_after` | advance resolution |
@@ -271,7 +271,16 @@ only move downward.
 Score and earned-run reconciliation are the strongest checks available, because
 they compare against numbers Retrosheet published independently of the event
 strings. They will catch classes of bug no unit test is shaped to find. See
-§4.3 for how they are implemented and what is still unverified.
+§4.3 for the score check and §4.5 for earned runs — which turned out to be
+denser than either of these lines suggests, because Retrosheet adjudicates
+every run individually and not merely every game.
+
+The earned-run row says *contain*, not *equal*, and that is not a weakening.
+9.16 defers several of its own clauses to the scorer, so the derivation
+produces an interval — the runs it calls earned, and those it declines to call
+either way ([03-STATE](03-STATE.md) §9.3). A published figure either falls
+inside that interval or it does not, which is a falsifiable check that does not
+require pretending to have resolved an ambiguity the rule leaves open.
 
 The two **run** invariants are the cheap stand-in for them, and they are listed
 because until the derived tables existed *nothing whatsoever checked a run
@@ -448,17 +457,227 @@ Retrosheet publishes a single combined archive, `gl1871_2025.zip`, so the fetch
 is **one request** rather than 155. That matters: this project has already been
 rate-limited off the server once (§4).
 
+### 4.5 Earned runs, and the densest check in the project
+
+Earned runs are derived from the play-by-play ([03-STATE](03-STATE.md) §9) and
+then checked against **three** published figures, none of which the derivation
+reads:
+
+| source | what it adjudicates |
+|---|---|
+| `(UR)` / `(TUR)` advance flags | every individual run, 1908–2025 |
+| `data,er` records | earned runs per pitcher per game |
+| game log `er_individual` / `er_team` | both ledgers, per team per game |
+
+The first of these is the find. `(UR)` appears in every season at 11.46% of
+scoring advances — the published unearned-run rate for the span — so it is a
+**complete per-run adjudication covering the whole corpus**, not a sparse
+annotation. That is 1.8 million independent verdicts against the 203,285 game
+totals the other two sources offer, and it is why the derivation must not read
+it: spending a complete answer key as an input buys a derivation that can
+never be checked.
+
+#### Result
+
+```
+runs adjudicated     1,796,610   in 203,236 games
+  settled by rule    1,509,046
+  graded likely        108,169
+  9.16 defers          179,395   (9.99%)
+
+runs compared        1,616,073
+  agree              1,599,081   (98.9486%)
+  differ                16,992
+TUR before 1969        1,142     -- notation not yet in use
+```
+
+| source | compared | in bound | exact | exact agree |
+|---|---|---|---|---|
+| `data,er` | 1,167,947 | 99.16% | 1,026,202 | **99.47%** |
+| game log individual ER | 402,092 | 98.34% | 276,651 | **99.16%** |
+| game log team ER | 402,092 | 98.42% | 276,651 | **99.22%** |
+
+#### The grades are calibrated, which is the result that matters
+
+| certainty | compared | agree |
+|---|---|---|
+| `derived` | 1,507,904 | **99.660%** |
+| `likely` | 108,169 | **89.031%** |
+
+A certainty vocabulary is worth nothing if it does not predict anything. These
+do: where the derivation says the rule decided, it is right 99.66% of the
+time; where it says one reading is merely indicated, 89.0%. **69% of all
+disagreements fall in the `likely` bucket**, which holds 6.7% of the runs.
+
+The deferrals are justified the same way. Each deferred class splits roughly
+40/60 against what the scorers actually wrote — never 95/5. A class that came
+back lopsided would mean the rule *had* decided it and the deferral was
+evasion; none does.
+
+#### The era trend says as much about the source as about the rule
+
+| decade | compared | agree | deferred |
+|---|---|---|---|
+| 1900s | 13,361 | 95.45% | 20.7% |
+| 1910s | 83,267 | 96.66% | 18.6% |
+| 1920s | 98,471 | 98.15% | 13.0% |
+| 1940s | 89,799 | 98.52% | 11.6% |
+| 1960s | 114,926 | 99.18% | 10.6% |
+| 1980s | 157,503 | 99.36% | 9.9% |
+| 2000s | 213,763 | **99.52%** | 7.5% |
+| 2010s | 197,813 | 99.45% | 7.2% |
+
+Monotone, and steepest exactly where Retrosheet's files stop being
+transcriptions of scoresheets and become reconstructions from published box
+scores. In the early files the unearned-run totals had to be distributed
+across individual runs to match a printed pitcher total, and the disagreements
+concentrate there. The deferral rate falls for a different reason: fewer
+errors are committed.
+
+This is a claim about the source, so it is stated as a correlation and not as
+an excuse. The 1900s figure is 95.45%, and some of that is the rule.
+
+#### `(TUR)` did not exist before 1969
+
+Three uses in 1911, then **none at all until 1969**. A derived `TUR` against a
+recorded `UR` in a 1920 game is a distinction the source had no way to write
+down, and counting it as a disagreement blames the rule for a gap in the
+notation. 1,142 runs, reported as their own line and folded into neither
+agreement nor disagreement.
+
+This was checked before it was believed: **all 18** such cases in the first
+sample were pre-1969, which is what a notation gap looks like and not what a
+rule defect looks like.
+
+#### A hypothesis that measured worse
+
+9.16(b) makes a run unearned when the runner "would have been put out by
+errorless play". The derivation counts only the outs Retrosheet actually
+writes. Extending it to throwing errors on advances — `FC5.1-3(E5/TH)` is the
+third baseman throwing at the runner taking third and missing, which is
+plainly a chance not accepted — is the obvious next step.
+
+It is wrong. Over 211,000 runs on a twelve-season spread:
+
+| | agreement |
+|---|---|
+| as shipped | **98.8453%** |
+| extended to error-aided advances | 98.8383% |
+
+A narrower form, restricted to errors charged to the fielder covering the
+destination base, gained 7 runs in 38,167 on a three-season sample — and lost
+on twelve. The three-season gain was noise, and the rule is not in the code.
+It is recorded here because the next person to read 9.16(b) will have the same
+idea.
+
+#### What this found underneath
+
+The check found a defect in the **state machine**, two layers down:
+[03-STATE](03-STATE.md) §2 rule 2 listed `FLE$` — an error on a foul fly — as
+putting the batter on first. It does not; it prolongs the plate appearance,
+which is the entire reason 9.16(a)(2)(i) exists. All **8,562** `FLE` plays in
+the corpus are followed by another play with the same batter, and 6,187 of
+them had left a phantom runner on first for the rest of the half-inning:
+**20,883 plays across 6,183 half-innings** with a runner in the base state who
+was still holding a bat.
+
+No gate here could see it. No out was invented, so out accounting balanced.
+The half-innings still ended with three. And a runner no advance in the file
+ever names never scores, so score reconciliation stayed at **100.0000%**
+throughout. The defect was reachable only from a question nobody had asked
+yet — *did this batter's plate appearance end?* — which is the same lesson
+this document has now recorded six times, arriving from a new direction.
+
 ## 5. Performance suite
 
-Pinned queries with wall-clock budgets, run on a fixed corpus snapshot:
+`rsse bench` runs twelve pinned queries against the full corpus, each with a
+wall-clock budget. Warm cache — every query is run once to warm SQLite's page
+cache and then timed over repeats, and the **median** is reported, since one
+run competing with another process should not move a pinned number.
 
-- the motivating query (bases loaded, 2 outs, uncaught third strike, force at
-  home, sequence 2-1) — <100 ms
-- single-tag lookups over the most common tags — <100 ms
-- a full-corpus `.count()` on a rare tag — <250 ms
-- `.contains_sequence()` on the unindexed path — budgeted separately and
-  documented as slow
-- full ingest — <10 min; database <2 GB; peak RSS <500 MB
+**The plan is pinned alongside the time.** Each benchmark records whether its
+plan scans `plays`. A query can sit inside budget today and be one row count
+away from scanning 17.9 million rows; recording only the number loses the
+reason it was good.
+
+| Benchmark | Measured | Budget | What it exercises |
+|---|---|---|---|
+| motivating: sql | 144 ms | 500 ms | the compiled query alone, 5 predicates |
+| motivating: full | 920 ms | 3,000 ms | the same query with its mandatory reports |
+| common tag count | 3,059 ms | 10,000 ms | 1.7M matching plays; the worst realistic case |
+| rare tag count | <1 ms | 100 ms | rarity should be cheap |
+| rare tag with rows | 303 ms | 1,000 ms | materialising results, not just counting |
+| tag + season | 207 ms | 700 ms | tag join plus a `games` filter |
+| two tags | 240 ms | 800 ms | two joins on `ix_playtags_tag` |
+| force predicate | 156 ms | 500 ms | `runner_advances` on its partial index |
+| putout sequence | 4 ms | 100 ms | equality on `ix_credseq_text` |
+| contains_sequence | 1,341 ms | 5,000 ms | `LIKE '%64%'`, unindexable by construction |
+| context only | 659 ms | 2,000 ms | no tag to drive the plan |
+| pitcher lookup | 44 ms | 200 ms | the lineup timeline |
+
+Budgets are roughly **three times** the measured median, floored at 100 ms.
+Not the measured value: these timings move with disk contention, and a budget
+set at the observed number fails on a busy afternoon and teaches everyone to
+ignore it. Three times still catches what these exist for — the regressions
+found below were 160x and 3,800x, not 20%.
+
+Ingest and derive budgets are measured in [05-DATABASE](05-DATABASE.md) §7.
+
+### 5.1 What pinning them found
+
+The original budgets in this section — <100 ms for the motivating query,
+<250 ms for a rare-tag count — were written before any data existed, like the
+<2 GB database goal §7 of 05-DATABASE had to replace. Measuring them was
+expected to end in revising them. It did not. **Four predicates were
+accidentally quadratic.**
+
+Every sub-table predicate compiled to a correlated `EXISTS`, which SQLite
+evaluates once per candidate play, so the index on the inner table could only
+ever be probed and never driven. Rewritten as `p.play_id IN (SELECT ...)`,
+the subquery runs once and drives:
+
+| | before | after |
+|---|---|---|
+| `.force_play(at="H")` | 24,975 ms | **156 ms** |
+| `.putout_sequence([6,4,3])` | 16,797 ms | **4 ms** |
+| `.contains_sequence([6,4])` | 21,650 ms | **1,341 ms** |
+| `.pitcher(...)` | 45,826 ms | **44 ms** |
+
+`.pitcher()` needed more than a rewrite, because it correlates on game and team
+rather than only on play. The form that reads straight from the rule — "no
+later lineup entry has taken effect yet" — walks the lineup twice for every
+candidate play. A window function computes each holder's *interval* once per
+game and the predicate becomes a range test. That the partition invariant of
+§4.2 still holds is what says the rewrite is semantically identical rather
+than merely faster.
+
+The mandatory reports were also costing more than the queries they describe:
+`.run()` on the motivating query took 4,615 ms against a 244 ms `.count()`,
+because `ExcludedCounts` re-ran the query with filters relaxed and
+`ForceReport` ran five more aggregates. Collapsing the certainty split into one
+`GROUP BY`, reusing the grouped pass's own total instead of re-counting, and
+fetching coverage in one query instead of 274 brought it to **920 ms** with
+byte-identical output.
+
+### 5.2 A benchmark catches what a unit test is not shaped for
+
+The `EXISTS` → `IN` change was made once and did nothing. The wrapper changed
+and the correlation clause stayed *inside* the subquery:
+
+```sql
+p.play_id IN (SELECT a.play_id FROM runner_advances a
+              WHERE a.play_id = p.play_id AND ...)   -- still correlated
+```
+
+The query looked rewritten and ran at exactly the old speed. The regression
+test written to guard the change asserted `"EXISTS" not in sql`, which passed:
+it was shaped for *did the wrapper change*, and the defect was *is it still
+correlated*.
+
+The benchmark caught it on the next run, because wall-clock time is the one
+property a query cannot satisfy by looking right. That is the argument for this
+suite beyond regression-catching, and the test now asserts no `= p.play_id`
+appears inside any `IN (SELECT ...)`.
 
 ## 6. Property tests
 

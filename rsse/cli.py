@@ -428,6 +428,43 @@ DERIVED_CHECKS = [
      " WHERE p.parse_status = 'unparsed'"),
 ]
 
+#: Run only when `earned_runs` is present, since it is built by its own pass
+#: (spec/05-DATABASE.md §5.4) and a database without it is not broken.
+EARNED_RUN_CHECKS = [
+    ("orphan earned run -> plays", False,
+     "SELECT e.play_id FROM earned_runs e LEFT JOIN plays p USING (play_id)"
+     " WHERE p.play_id IS NULL"),
+    # The one that matters. A run with no verdict is not a run called earned
+    # -- it is a run nobody looked at, and it would sink into every total
+    # here without moving a single agreement percentage.
+    ("scored advance with no verdict", False,
+     "SELECT a.play_id FROM runner_advances a"
+     " LEFT JOIN earned_runs e ON e.play_id = a.play_id AND e.adv_seq = a.seq"
+     " WHERE a.scored = 1 AND e.play_id IS NULL"),
+    ("verdict on an advance that did not score", False,
+     "SELECT e.play_id FROM earned_runs e"
+     " JOIN runner_advances a ON a.play_id = e.play_id AND a.seq = e.adv_seq"
+     " WHERE a.scored = 0"),
+    # `ambiguous` and NULL are two spellings of one statement and must never
+    # come apart: a certain verdict marked ambiguous is thrown away, and a
+    # NULL without it reads as a missing value rather than a deliberate one.
+    ("ambiguous verdict that claims an answer", False,
+     "SELECT play_id FROM earned_runs"
+     " WHERE certainty = 'ambiguous' AND earned_team IS NOT NULL"),
+    # `untrusted` is not the same statement. It says the half-inning's state
+    # is unreliable, not that the rule declined -- so a categorical verdict
+    # about *this runner* ("he reached on an error") survives it, while one
+    # that leans on the out count does not. Both spellings are legal there;
+    # what is not legal is a NULL with a confident certainty on it.
+    ("no verdict, and no reason given for having none", False,
+     "SELECT play_id FROM earned_runs"
+     " WHERE earned_team IS NULL"
+     "   AND certainty NOT IN ('ambiguous','untrusted')"),
+    ("earned for the team, unearned for the pitcher", False,
+     "SELECT play_id FROM earned_runs"
+     " WHERE earned_team = 1 AND earned_pitcher = 0"),
+]
+
 _TRUSTED = "p.parse_status NOT IN ('unparsed','state_untrusted')"
 
 
@@ -455,8 +492,16 @@ def cmd_verify_derived(args: argparse.Namespace) -> int:
     print(f"untrusted state      {untrusted:,}   (excluded from base-state checks)")
     print()
 
+    checks = list(DERIVED_CHECKS)
+    if conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+                    " AND name = 'earned_runs'").fetchone()[0]:
+        checks += EARNED_RUN_CHECKS
+    else:
+        print("note: no earned_runs table; run `rsse earned-runs` to add"
+              f" {len(EARNED_RUN_CHECKS)} more checks\n", file=sys.stderr)
+
     failed = 0
-    for name, trusted_only, sql in DERIVED_CHECKS:
+    for name, trusted_only, sql in checks:
         query = f"{sql} AND {_TRUSTED}" if trusted_only else sql
         started = time.time()
         count = conn.execute(f"SELECT COUNT(*) FROM ({query})").fetchone()[0]
@@ -469,7 +514,7 @@ def cmd_verify_derived(args: argparse.Namespace) -> int:
                 print(f"       e.g. play_id {row[0]}")
     conn.close()
 
-    print(f"\n{len(DERIVED_CHECKS) - failed}/{len(DERIVED_CHECKS)} checks pass")
+    print(f"\n{len(checks) - failed}/{len(checks)} checks pass")
     print(f"\n{ATTRIBUTION}")
     return 1 if failed else 0
 
@@ -651,6 +696,62 @@ def cmd_explain(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_bench(args: argparse.Namespace) -> int:
+    """Run the pinned query benchmarks (spec/07-TESTING.md §5)."""
+    from . import bench as benchmod
+    from .query import connect
+
+    db_path = Path(args.database) if args.database else QUERY_DB
+    if not db_path.exists():
+        print(f"no query database at {db_path}; run `rsse derive` first",
+              file=sys.stderr)
+        return 2
+    conn = connect(str(db_path))
+
+    def progress(b):
+        print(f"  {b.name} ...", file=sys.stderr, flush=True)
+
+    results = benchmod.run_all(conn, repeats=args.repeats, only=args.only,
+                               progress=progress if args.progress else None)
+
+    print(f"{'benchmark':24s} {'median':>9} {'best':>9} {'budget':>9} "
+          f"{'rows':>10}  plan")
+    failed = 0
+    for r in results:
+        mark = "ok  " if r.ok else "OVER"
+        failed += 0 if r.ok else 1
+        plan = "SCANS plays" if r.scans_plays else "indexed"
+        print(f"{mark} {r.name:19s} {r.median_ms:>8.1f}ms "
+              f"{r.best_ms:>8.1f}ms {r.budget_ms:>8.0f}ms "
+              f"{r.rows:>10,}  {plan}")
+    print(f"\n{len(results) - failed}/{len(results)} within budget")
+
+    if args.report:
+        Path(args.report).write_text(json.dumps({
+            "corpus": _corpus_id(conn),
+            "results": [{"name": r.name, "budget_ms": r.budget_ms,
+                         "median_ms": round(r.median_ms, 2),
+                         "best_ms": round(r.best_ms, 2), "rows": r.rows,
+                         "scans_plays": r.scans_plays, "note": r.note}
+                        for r in results],
+        }, indent=2))
+        print(f"report written to {args.report}")
+    conn.close()
+    return 1 if failed else 0
+
+
+def _corpus_id(conn) -> str:
+    """Identify the data a benchmark ran against.
+
+    A timing without one is not comparable with anything: these numbers move
+    with the corpus, not just with the code.
+    """
+    row = conn.execute("SELECT derived_at, games, plays FROM derive_runs"
+                       " ORDER BY derive_id DESC LIMIT 1").fetchone()
+    return (f"derived {row[0]}, {row[1]:,} games, {row[2]:,} plays"
+            if row else "unknown")
+
+
 def cmd_gamelogs(args: argparse.Namespace) -> int:
     """Download and/or load Retrosheet's game logs (spec/07-TESTING.md §4)."""
     from .database import gamelogs
@@ -810,6 +911,136 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     query.close()
     print(f"\n{ATTRIBUTION}")
     return 1 if result.mismatches else 0
+
+
+def cmd_earnedruns(args: argparse.Namespace) -> int:
+    """Derive earned runs from the play-by-play, and check them.
+
+    The last quantity in the corpus that Retrosheet states without saying how
+    it got there. `--check` compares the derivation against all three of the
+    figures Retrosheet publishes: the `(UR)`/`(TUR)` flag on every individual
+    run, the per-pitcher `data,er` record, and the two per-team totals in the
+    game logs (spec/07-TESTING.md §4.5).
+    """
+    from .database import earnedruns as er
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    query_path = Path(args.database) if args.database else QUERY_DB
+    for path, what in ((archive_path, "ingest"), (query_path, "derive")):
+        if not path.exists():
+            print(f"no database at {path}; run `rsse {what}` first",
+                  file=sys.stderr)
+            return 2
+
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+    seasons = [int(y) for y in args.season.split(",")] if args.season else None
+
+    if not args.check_only:
+        conn = dbschema.connect(str(query_path))
+        for pragma in dbschema.LOAD_PRAGMAS:
+            conn.execute(pragma)
+
+        started = time.time()
+
+        def progress(done, total):
+            if done % 20000 < er.BATCH:
+                print(f"  {done:,}/{total:,} games"
+                      f"  ({time.time() - started:.0f}s)",
+                      file=sys.stderr, flush=True)
+
+        stats = er.build(conn, archive,
+                         progress=progress if args.progress else None,
+                         seasons=seasons)
+        print(f"games                {stats.games:,}")
+        print(f"  with a run in them {stats.scoring_games:,}")
+        print(f"runs adjudicated     {stats.runs:,}")
+        print(f"  settled by rule    {stats.by_certainty['derived']:,}")
+        print(f"  graded likely      {stats.by_certainty['likely']:,}")
+        # Not a failure. 9.16 hands these clauses to the scorer in its own
+        # words, and a derivation that answered anyway would be inventing a
+        # fact rather than deriving one (spec/03-STATE.md §9).
+        print(f"  9.16 defers        {stats.undetermined:,}"
+              f"  ({100 * stats.undetermined / max(stats.runs, 1):.2f}%)")
+        print(f"elapsed              {time.time() - started:.0f}s")
+        print("\nby rule:")
+        for reason, n in stats.by_reason.most_common():
+            print(f"  {n:>9,}  {reason}")
+        conn.close()
+
+    if args.check or args.check_only:
+        query = dbschema.connect(f"file:{query_path}?mode=ro")
+        result = er.reconcile(query, archive)
+        _print_earned_check(result, args.show)
+        if args.report:
+            _write_earned_report(Path(args.report), result)
+            print(f"\nreport written to {args.report}")
+    return 0
+
+
+def _print_earned_check(result, show: int) -> None:
+    """Print the three-way comparison."""
+    runs = result.runs
+    print(f"\nruns compared        {runs.compared:,}")
+    print(f"  agree              {runs.agree:,}  ({runs.rate:.4%})")
+    print(f"  differ             {runs.differ:,}")
+    print(f"9.16 defers          {runs.deferred:,}  -- no claim made")
+    if runs.tur_before_notation:
+        # `(TUR)` has 3 uses in 1911 and none again until 1969. A derived TUR
+        # against a recorded UR in 1920 is a distinction the source could not
+        # write down, and counting it as a disagreement would blame the rule
+        # for a gap in the notation.
+        print(f"TUR before 1969      {runs.tur_before_notation:,}"
+              f"  -- notation not yet in use")
+
+    print(f"\n{'decade':>7} {'compared':>9} {'agree':>8} {'deferred':>9}")
+    for decade, (differ, agree, deferred) in runs.by_decade.items():
+        total = differ + agree
+        print(f"{decade:>7} {total:>9,} {100 * agree / max(total, 1):>7.2f}%"
+              f" {100 * deferred / max(total + deferred, 1):>8.1f}%")
+
+    print(f"\n{'source':<26} {'compared':>9} {'in bound':>9}"
+          f" {'exact':>9} {'exact agree':>12}")
+    for level in (result.pitchers, result.individual, result.team):
+        print(f"{level.name:<26} {level.compared:>9,}"
+              f" {level.within_rate:>8.2%} {level.exact:>9,}"
+              f" {level.exact_rate:>11.2%}")
+
+    if runs.by_reason:
+        print("\nwhere the derivation and the flag disagree:")
+        print(f"{'wrote':>6} {'derived':>8} {'certainty':>10} {'n':>8}  reason")
+        for (wrote, derived, certainty, reason), n in \
+                runs.by_reason.most_common(show):
+            print(f"{wrote:>6} {derived:>8} {certainty:>10} {n:>8,}  {reason}")
+    if result.skipped:
+        print("\nnot compared:")
+        for cause, n in result.skipped.most_common():
+            print(f"  {n:>9,}  {cause}")
+
+
+def _write_earned_report(path: Path, result) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    runs = result.runs
+    path.write_text(json.dumps({
+        "runs": {
+            "compared": runs.compared, "agree": runs.agree,
+            "differ": runs.differ, "rate": runs.rate,
+            "deferred": runs.deferred,
+            "tur_before_notation": runs.tur_before_notation,
+            "by_decade": {str(k): v for k, v in runs.by_decade.items()},
+            "disagreements": [
+                {"recorded": k[0], "derived": k[1], "certainty": k[2],
+                 "reason": k[3], "n": n}
+                for k, n in runs.by_reason.most_common()],
+        },
+        "totals": {
+            level.name: {
+                "compared": level.compared, "within": level.within,
+                "outside": level.outside, "exact": level.exact,
+                "exact_agree": level.exact_agree,
+            }
+            for level in (result.pitchers, result.individual, result.team)},
+        "skipped": dict(result.skipped),
+    }, indent=2) + "\n")
 
 
 def cmd_secondary(args: argparse.Namespace) -> int:
@@ -1015,7 +1246,8 @@ def cmd_replay(args: argparse.Namespace) -> int:
 #: Tables in the query database that `derive` does not rebuild. Kept as data
 #: so a new build step cannot be forgotten here: a table that `--rebuild`
 #: destroys and nothing recreates is a gap nobody would notice.
-NON_DERIVED_TABLES = ("comments", "lineup_entries", "players", "teams", "parks")
+NON_DERIVED_TABLES = ("comments", "lineup_entries", "earned_runs",
+                      "players", "teams", "parks")
 
 
 def _non_derived_tables(path: Path) -> list[tuple[str, int]]:
@@ -1409,6 +1641,14 @@ def main(argv: list[str] | None = None) -> int:
     _add_query_flags(x)
     x.set_defaults(func=cmd_explain)
 
+    bn = sub.add_parser("bench", help="run the pinned query benchmarks")
+    bn.add_argument("--database")
+    bn.add_argument("--repeats", type=int, default=3)
+    bn.add_argument("--only", help="substring of a benchmark name")
+    bn.add_argument("--progress", action="store_true")
+    bn.add_argument("--report", help="write a JSON report to this path")
+    bn.set_defaults(func=cmd_bench)
+
     gl = sub.add_parser("gamelogs",
                         help="download/load Retrosheet game logs")
     gl.add_argument("--fetch", action="store_true", help="download first")
@@ -1428,6 +1668,21 @@ def main(argv: list[str] | None = None) -> int:
                     help="test which earned-run field is the team total")
     rc.add_argument("--report", help="write a JSON report to this path")
     rc.set_defaults(func=cmd_reconcile)
+
+    ern = sub.add_parser("earned-runs",
+                         help="derive earned runs from the play-by-play")
+    ern.add_argument("--archive")
+    ern.add_argument("--database")
+    ern.add_argument("--season", help="comma-separated seasons")
+    ern.add_argument("--progress", action="store_true")
+    ern.add_argument("--check", action="store_true",
+                     help="reconcile against (UR), data,er and the game logs")
+    ern.add_argument("--check-only", action="store_true",
+                     help="reconcile what is already built, deriving nothing")
+    ern.add_argument("--show", type=int, default=15,
+                     help="how many disagreement classes to print")
+    ern.add_argument("--report", help="write a JSON report to this path")
+    ern.set_defaults(func=cmd_earnedruns)
 
     sc = sub.add_parser("secondary",
                         help="build comments and lineup_entries")

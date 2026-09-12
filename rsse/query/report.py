@@ -120,15 +120,18 @@ def build_excluded(conn, search) -> ExcludedCounts:
     is the only version of the number that means anything to whoever is
     reading this particular result.
     """
-    base = search.count(conn)
-
-    # Status exclusions: one pass over the population with the status filter
-    # dropped entirely, grouped by what the status actually was.
+    # One pass over the population with the *status* filter dropped, grouped
+    # by what the status actually was. `_include_unparsed` relaxes only the
+    # status, never the tag confidence, so the `ok` bucket of this grouping is
+    # by construction the count of the query as asked -- and running
+    # `search.count()` separately to get the same number was a second full
+    # execution of the expensive part for nothing.
     widened = replace(search, _include_unparsed=True)
     sql, params = widened._compile("p.play_id, p.parse_status", order=False)
     by_status = dict(conn.execute(
         f"SELECT parse_status, COUNT(*) FROM ({sql}) GROUP BY parse_status",
         params))
+    base = by_status.get("ok", 0)
 
     untrusted = 0 if (search._include_untrusted or search._include_unparsed) \
         else by_status.get("state_untrusted", 0)
@@ -148,9 +151,9 @@ def build_excluded(conn, search) -> ExcludedCounts:
     if search._curated == "exclude":
         curated = max(0, replace(search, _curated=None).count(conn) - base)
 
-    return ExcludedCounts(uncertain_tags=uncertain, untrusted_state=untrusted,
-                          unparsed=unparsed, other_status=other,
-                          curated=curated)
+    return ExcludedCounts(matched=base, uncertain_tags=uncertain,
+                          untrusted_state=untrusted, unparsed=unparsed,
+                          other_status=other, curated=curated)
 
 
 def build_force(conn, search) -> ForceReport:
@@ -170,14 +173,15 @@ def build_force(conn, search) -> ForceReport:
     at_clause = " AND a.destination = ?" if at else ""
     at_params = (at,) if at else ()
 
-    counts = {}
-    for level in ("derived", "likely", "ambiguous"):
-        counts[level] = conn.execute(
-            f"SELECT COUNT(*) FROM ({sql}) m"
-            " JOIN runner_advances a ON a.play_id = m.play_id"
-            " WHERE a.is_out = 1 AND a.is_force = 1"
-            f"{at_clause} AND a.force_certainty = ?",
-            params + at_params + (level,)).fetchone()[0]
+    # One grouped pass, not one query per level. The subquery is the
+    # expensive part and running it three times to split three ways tripled
+    # the cost of the disclosure for no extra information.
+    counts = dict(conn.execute(
+        f"SELECT a.force_certainty, COUNT(*) FROM ({sql}) m"
+        " JOIN runner_advances a ON a.play_id = m.play_id"
+        " WHERE a.is_out = 1 AND a.is_force = 1"
+        f"{at_clause} GROUP BY a.force_certainty",
+        params + at_params))
 
     unknown = conn.execute(
         f"SELECT COUNT(*) FROM ({sql}) m JOIN plays p2 ON p2.play_id = m.play_id"
@@ -193,6 +197,7 @@ def build_force(conn, search) -> ForceReport:
         f"SELECT COUNT(*) FROM ({wsql}) WHERE parse_status = 'state_untrusted'",
         wparams).fetchone()[0]
 
-    return ForceReport(derived=counts["derived"], likely=counts["likely"],
-                       ambiguous=counts["ambiguous"],
+    return ForceReport(derived=counts.get("derived", 0),
+                       likely=counts.get("likely", 0),
+                       ambiguous=counts.get("ambiguous", 0),
                        batter_ran_unknown=unknown, state_untrusted=untrusted)

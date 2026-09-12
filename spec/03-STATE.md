@@ -46,11 +46,34 @@ Precedence, highest first:
    | `T$` | 3 |
    | `H`, `HR` | H (scores) |
    | `W`, `I`, `IW`, `HP`, `C` (interference) | 1 |
-   | `E$`, `$E$`, `FC$`, `FLE$` | 1 |
+   | `E$`, `$E$`, `FC$` | 1 |
    | `K` with no fielders, no compound event, no `B-` advance | out on strikes |
    | `K$$` (e.g. `K23`) | out at the base the sequence retires him at |
    | out on ball (`63`, `54(B)`, `8/F78`) | out |
-   | `SB`, `CS`, `PO`, `POCS`, `WP`, `PB`, `BK`, `DI`, `OA`, `NP` | batter stays at the plate |
+   | `FLE$`, `SB`, `CS`, `PO`, `POCS`, `WP`, `PB`, `BK`, `DI`, `OA`, `NP` | batter stays at the plate |
+   **`FLE$` was in the first row of that table until the earned-run
+   derivation went looking**, and it is the one entry the corpus refutes
+   outright: **all 8,562 `FLE` plays are followed by another play with the
+   same batter at bat.** A muffed foul fly prolongs the plate appearance
+   rather than ending it — which is the entire reason OBR 9.16(a)(2)(i)
+   exists — and placing the batter on first leaves a runner standing there
+   who is still holding a bat.
+
+   **6,187** of those plays had first base empty and put a phantom runner on
+   it; the other 2,376 found first occupied and the placement was silently
+   dropped, which is why the duplicate-occupancy invariant never fired. The
+   corruption then runs to the end of the half-inning: **20,883 plays across
+   6,183 half-innings** carry a base state with a runner in it who was still
+   at the plate.
+
+   Nothing in the project could see it. Outs still balanced, because no out
+   was invented; the half-inning still ended with three; and a phantom runner
+   is named by no advance in the file, so he never scores and the score
+   reconciliation stayed at **100.0000%** ([07-TESTING](07-TESTING.md) §4.4)
+   throughout. Every gate here was shaped for a different question — the
+   recurring lesson of this project, and the first time it has cost the base
+   state itself.
+
 3. An **out-count impossibility** overrides rule 2 for a bare strikeout. If
    reading the batter as retired on strikes would make more than three outs in
    the half-inning, he cannot have been, so he reached first. See §4.5 step 1;
@@ -111,9 +134,11 @@ An explicit advance for a runner always overrides the implicit movement, so
    are two paths to the same movement, and both counting it is what produced
    the double-counted run above.
 4. Runners not mentioned hold. `3-3` is an explicit hold and behaves the same.
-5. Runners reaching `H` score. Determine earned/unearned from `(UR)` / `(TUR)`
-   flags when present; otherwise apply the standard rules against the
-   reconstructed inning and record the result as derived.
+5. Runners reaching `H` score. **Earned or unearned is derived, never read
+   off the `(UR)` / `(TUR)` flags** — see §9, which replaces an earlier
+   version of this rule that used the flags as an input. They cover the whole
+   corpus, which makes them a complete answer key; spending them as an input
+   would have bought a derivation that could never be checked.
 6. Charge each run to the responsible pitcher, honouring any `presadj` record
    ([01-CORPUS](01-CORPUS.md) §3).
 
@@ -618,3 +643,145 @@ of home runs would have come back 3% short, and 7.7% short in 1920.
 
 The two that remain are genuine: an advance that places a runner the basic
 section retires, and a batter destination the grammar leaves undetermined.
+
+
+## 9. Earned runs — the derivation
+
+Earned runs are the second quantity in this corpus that the rulebook defines
+and the record does not explain. Retrosheet writes the *verdict* — `(UR)` on
+an advance, `(TUR)` for the team-only case, `data,er` per pitcher — and never
+the reasoning. This is the reasoning.
+
+The rule is OBR 9.16, and its mechanism is a **reconstructed inning**: replay
+the half-inning as though no error, passed ball, or obstruction had occurred,
+and count the outs the defence *would* have made. Three of them end the
+inning, and every run after that is unearned however cleanly it scored.
+
+### 9.1 Always derive; the flags are the answer key
+
+`(UR)` appears in **every season from 1908 to 2025**, on 205,967 of the
+1,796,610 scoring advances — 11.46%, which is the published unearned-run rate
+for this span. It is a complete annotation, not a sparse one, and its absence
+on a scoring advance means *earned* rather than *unknown*.
+
+That is precisely why it must not be an input. A complete, independent,
+per-run adjudication is the densest check available anywhere in this project:
+1.8 million individual verdicts against the 203,285 game totals that `data,er`
+and the game logs offer. Using it to answer the question would have destroyed
+the only thing that can tell us whether the answer is right.
+
+So the derivation never reads it. It is carried through to
+`earned_runs.recorded` untouched, and compared afterwards
+([07-TESTING](07-TESTING.md) §4.5).
+
+### 9.2 Two ledgers
+
+9.16(g) denies a relief pitcher "the benefit of previous chances for outs not
+accepted". A team's inning can therefore be over in the reconstruction while
+the reliever's is not, and a run be **unearned for the team and earned for the
+pitcher who allowed it**. That is the whole content of `(TUR)`, and it is why
+this derives `earned_team` and `earned_pitcher` separately rather than one
+flag:
+
+| written | team | pitcher |
+|---|---|---|
+| *(no flag)* | earned | earned |
+| `(UR)` | unearned | unearned |
+| `(TUR)` | unearned | earned |
+
+The two map onto the two figures published per side in the game logs —
+`er_team` and `er_individual` — and `data,er` counts the pitcher ledger.
+
+Each pitcher carries his own out count, opened when he arrives at
+`min(reconstructed outs, actual outs)`: the reliever gets no benefit from a
+chance missed before him, and no penalty for an out made on a runner who does
+not exist in the reconstruction either.
+
+### 9.3 Where the rule defers, so does the derivation
+
+9.16 is not mechanical, and it says so in its own text: "in the scorer's
+judgment", "benefit of the doubt shall be given to the pitcher". Those clauses
+are not gaps to be filled by a plausible guess. Where one applies,
+`earned_team` and `earned_pitcher` are **NULL** and `certainty` is
+`ambiguous`.
+
+This is the same discipline as `force_certainty` (§4.4) and the same one as
+the zero-versus-unknown rule in [05-DATABASE](05-DATABASE.md): *an unearned
+verdict has to be earned.* Defaulting an undetermined run to "unearned"
+because the reconstruction could not walk it home would put roughly 10% of all
+runs into a category the rule never placed them in.
+
+| certainty | when | what it claims |
+|---|---|---|
+| `derived` | a categorical clause applies, or the reconstruction never diverged from the inning that was played | the rule decides, and this is its answer |
+| `likely` | the run scored unaided but the reconstruction diverged elsewhere in the inning | an answer, graded |
+| `ambiguous` | 9.16 defers to the scorer | **no claim** |
+| `untrusted` | a play in the half-inning could not be parsed or its state is not trusted (§7.1) | no claim, for a different reason |
+
+The deferral is justified by measurement, not by reading. Each deferred class
+splits roughly 40/60 against what Retrosheet's scorers actually wrote — if any
+of them had come back 95/5, the rule would have been deciding it after all and
+the deferral would be evasion.
+
+### 9.4 What the reconstruction does
+
+Categorical, decided by the rule with no hypothetical consulted:
+
+- **9.16(a)(2)(iii)** reached on an error (`E$`) — unearned, and the batter
+  owes the reconstruction an out.
+- **9.16(a)(2)(ii)** reached on interference or obstruction (`C`) — unearned,
+  and owes **no** out: the batter was still at the plate. Folding this
+  together with the clause above ends innings that should still be going.
+- **9.16(a)(2)(i)** at bat prolonged by a muffed foul fly (`FLE$`) — the muff
+  is the missed chance, counted there, and the at bat's eventual outcome owes
+  nothing further.
+- **9.16(a)(1)** reached on a fielder's choice retiring a runner who himself
+  reached on an error — the batter inherits the taint and the out. This fires
+  on the situation, not the notation: a force out at second is written
+  `54(1)/FO`, a plain out group, and the rule does not turn on whether
+  Retrosheet wrote `FC`.
+- **9.16(b)** life prolonged by an error — an advance written `X` that only
+  succeeded because of an error is an out in the reconstruction. The runner is
+  recorded absent at the base he actually reached, not the one he left.
+- Three reconstructed outs already recorded — unearned for the team.
+
+Deferred to the scorer:
+
+- The third reconstructed out falling on the very play a run scored. Whether
+  it would have come before or after the run is not in the record.
+- An advance aided by an error or a passed ball — 9.16(c) and (e), the clauses
+  that contain the words.
+- A run scored on a play that turned on an error anywhere, including one
+  written in the basic event. `E6/G.3-H` is a run that scored because the
+  shortstop booted the ball, and the advance section says nothing about it;
+  `PO1(E1).2-3` is a pickoff throw that got away. Reading only each advance's
+  own parameters calls both of these unaided.
+- A runner the reconstruction has held short of home by an earlier error.
+
+A **passed ball is aid; a wild pitch is not.** 9.16(a) lists the wild pitch
+among the things that produce an earned run and pointedly omits the passed
+ball, because one is the pitcher's own mistake and the other is the
+catcher's.
+
+### 9.5 Responsibility
+
+Each runner carries the pitcher who was on the mound when he reached base, and
+a run is charged there rather than to whoever threw the pitch it scored on
+(9.16(f)). On a fielder's choice the charge follows the runner erased, so a
+reliever is not handed a run for a baserunner he inherited and merely swapped.
+A `presadj` record overrules all of it: Retrosheet stating who is responsible
+beats working it out.
+
+The **extra-inning placed runner** (§6.4) is outside the reconstruction from
+the first pitch. No pitcher put him on second, so his run is nobody's to earn.
+
+### 9.6 What was tried and rejected
+
+Extending 9.16(b) past the outs Retrosheet actually writes — reading a
+throwing error on an advance as a chance for an out that was not accepted, as
+in `FC5.1-3(E5/TH)`, the third baseman throwing at the runner taking third and
+missing — is the obvious next step, and it is wrong. Over 211,000 runs it made
+agreement **worse**: the cases it fixes are outnumbered by the runners it
+retires who were never going to be out. A narrower form restricted to the
+fielder covering the destination base gained 7 runs in 38,000 on a
+three-season sample and lost on twelve. See [07-TESTING](07-TESTING.md) §4.5.

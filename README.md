@@ -46,6 +46,7 @@ python3 -m rsse.cli fetch                 # download the corpus  (~862 MB)
 python3 -m rsse.cli ingest --progress     # byte-exact archive   (~11 min, 1.9 GB)
 python3 -m rsse.cli derive --progress     # queryable tables     (~90 min, 11.6 GB)
 python3 -m rsse.cli secondary --progress  # comments + lineups   (~10 min)
+python3 -m rsse.cli earned-runs           # earned runs, derived (~25 min)
 python3 -m rsse.cli coverage --rebuild    # coverage table       (~10 s)
 ```
 
@@ -187,10 +188,11 @@ Everything in the build order is built and validated against the full corpus.
 | Archive | 31,115,272 records, 1.94 GB, all raw invariants hold |
 | State machine | 203,285 games, **0** state-inconsistent plays |
 | Ontology | 84 tags, one derivation rule each, a positive **and** a negative case each |
-| Derived tables | 17,891,790 plays, 11.6 GB, **21/21** integrity checks |
+| Derived tables | 17,891,790 plays, 11.6 GB, **27/27** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
+| Earned runs | 1,796,610 derived from the play-by-play; **98.9486%** agree with Retrosheet's own per-run flags |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 250, all passing |
+| Tests | 286, all passing |
 
 **Every replayed score matches the published one.** `rsse reconcile` compares
 `games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
@@ -222,9 +224,11 @@ python3 -m rsse.cli tags --seasons 12          # era-spread tag census (~20 min)
 python3 -m rsse.cli derive --progress          # derived tables (~90 min)
 python3 -m rsse.cli verify --derived           # derived-table integrity (21 checks)
 python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
+python3 -m rsse.cli earned-runs --check        # derive earned runs, then check them
 python3 -m rsse.cli coverage --rebuild         # coverage table
 python3 -m rsse.cli gamelogs --fetch           # game logs, for score reconciliation
 python3 -m rsse.cli reconcile --explain-er     # replayed scores vs published ones
+python3 -m rsse.cli bench                      # pinned query budgets (~1 min)
 python3 -m rsse.cli query ...                  # search; --format table|json|csv
 python3 -m rsse.cli explain ...                # the SQL and plan for a search
 python3 -m unittest discover -s tests -t .
@@ -241,9 +245,10 @@ anything `derive` itself does not rebuild.
 rsse/parser/     lexer, recursive-descent parser, AST that emits from its fields
 rsse/model/      half-inning replay, force derivation, `com` and game-log records
 rsse/semantic/   84 tags, implication, confidence, curated tags
-rsse/database/   archive DDL and ingest; derived, secondary and coverage builds
+rsse/database/   archive DDL and ingest; derived, secondary, earned-run and
+                 coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           250 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           286 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

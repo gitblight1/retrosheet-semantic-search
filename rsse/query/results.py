@@ -94,6 +94,11 @@ class ExcludedCounts:
     numbers are directly comparable with `ResultSet.total`.
     """
 
+    #: Plays that matched every predicate and survived every filter -- the
+    #: result's own total. Carried here because the grouped pass that counts
+    #: the exclusions produces it for free, and counting it again is a second
+    #: execution of the most expensive part of the query.
+    matched: int = 0
     uncertain_tags: int = 0
     untrusted_state: int = 0
     unparsed: int = 0
