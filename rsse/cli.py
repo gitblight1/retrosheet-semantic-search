@@ -745,11 +745,19 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     print(f"games compared       {result.compared:,}")
     print(f"scores agree         {result.agreed:,}  ({result.rate:.4%})")
     print(f"scores disagree      {len(result.mismatches):,}")
-    # Coverage, not error: Retrosheet's logs are Major League games and the
-    # corpus includes the Negro Leagues, so a game in one and not the other is
-    # expected and must not read as a failure.
-    print(f"in the logs only     {result.log_only:,}")
-    print(f"in the replay only   {result.replay_only:,}")
+    # Coverage, not error -- but only once it is broken down. A single
+    # "34,393 games in the logs only" reads as a defect until you know that
+    # 29,133 of them predate the corpus and 1,992 are postseason and all-star
+    # games the event files never contained.
+    print(f"\nin the logs only     {result.log_only:,}")
+    print(f"  before the corpus  {result.log_only_before_corpus:,}")
+    print(f"  postseason         {result.log_only_postseason:,}")
+    print(f"  all-star           {result.log_only_allstar:,}")
+    print(f"  NO EVENT FILE      {result.log_only_gap:,}"
+          "   <- the real coverage gap")
+    print(f"in the replay only   {result.replay_only:,}"
+          "   (Negro Leagues; the logs are Major League)")
+    print(f"  log row skipped    {result.replay_only_skipped:,}")
     print(f"skipped, forfeit     {result.skipped_forfeit:,}")
     print(f"skipped, incomplete  {result.skipped_incomplete:,}")
 
@@ -770,7 +778,13 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         Path(args.report).write_text(json.dumps({
             "compared": result.compared, "agreed": result.agreed,
             "mismatches": result.mismatches,
-            "log_only": result.log_only, "replay_only": result.replay_only,
+            "log_only": result.log_only,
+            "log_only_before_corpus": result.log_only_before_corpus,
+            "log_only_postseason": result.log_only_postseason,
+            "log_only_allstar": result.log_only_allstar,
+            "log_only_gap": result.log_only_gap,
+            "replay_only": result.replay_only,
+            "replay_only_skipped": result.replay_only_skipped,
             "skipped_forfeit": result.skipped_forfeit,
             "skipped_incomplete": result.skipped_incomplete,
         }, indent=2))

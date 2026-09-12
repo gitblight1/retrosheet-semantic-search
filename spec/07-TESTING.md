@@ -369,31 +369,84 @@ asserting whatever the code currently produces.
 
 What *can* be validated is that the values arriving in each field look like
 the thing the field is supposed to hold. `check_layout` runs seven such tests
-over every load — scores are plausible run totals, out counts are multiples of
-three, earned runs do not exceed runs allowed, team ids are three characters —
-and these are properties of baseball rather than of Retrosheet's file format,
-so a one-field shift fails them en masse. Each carries a tolerance, because
-real data has genuine oddities (a 19th-century game with no out count) and a
-check with no tolerance would report those instead of a layout error. A failing
-check means the offsets are wrong far more likely than the data is, and
-`rsse gamelogs` says so and exits non-zero.
+over every load — scores are plausible run totals, earned runs do not exceed
+runs allowed, team ids are three characters — and these are properties of
+baseball rather than of Retrosheet's file format, so a one-field shift fails
+them en masse. Each carries a tolerance, because real data has genuine
+oddities and a check with no tolerance would report those instead of a layout
+error. A failing check means the offsets are wrong far more likely than the
+data is, and `rsse gamelogs` says so and exits non-zero.
 
-The **earned-run field is deliberately not chosen from the documentation.**
-The layout names both an "individual" and a "team" earned-run figure per side
-and does not settle which is the per-game total; picking wrong would report
-thousands of false mismatches. Both are stored, and
-`rsse reconcile --explain-er` decides it empirically by comparing each against
-the event files' own `data,er` records — the same approach that settled the
-replay verdict flag ([05-DATABASE](05-DATABASE.md) §5.1).
+**A guard is only as good as the belief encoded in it.** On the first real
+load, six checks passed at 0.000% and one failed: *out counts are a multiple
+of three*, on 16,838 of 235,607 rows. The offsets were right; the belief was
+wrong. A walk-off ends the home half early, so the game's total out count is
+not a multiple of three — and 7.7% of games end that way. What settled it was
+that **98.95% of the offending rows are home wins, against a 58.65% home-win
+rate overall**, which is the walk-off signature and is not something a shifted
+field could produce. The check now reads *a multiple of three unless the home
+team won*.
 
-**Status: built, not yet run.** retrosheet.org was unreachable from the
-development machine when this was written — DNS resolved, TCP to port 443 timed
-out, other hosts connected in 0.1s — so no game log file has been loaded and no
-score has been reconciled. Parsing, loading, the layout guard and the
-reconciliation are implemented and tested against synthetic rows; the offsets
-themselves are unconfirmed until a real file arrives. The download is also the
-one part that cannot be tested here, so the loader takes files from a directory
-and needs no network access at all.
+The episode is the argument for investigating a firing guard rather than
+trusting it or dismissing it. A check that fires on correct data is worse than
+no check, because the next real failure gets waved through with it.
+
+The **earned-run field was not chosen from the documentation.** The layout
+names both an "individual" and a "team" earned-run figure per side and does not
+settle which is the per-game total; picking wrong would report thousands of
+false mismatches. Both are stored, and `rsse reconcile --explain-er` decided it
+by comparing each against the event files' own `data,er` records — the same
+approach that settled the replay verdict flag
+([05-DATABASE](05-DATABASE.md) §5.1).
+
+The answer is the **individual** field, 16–0, over a 2,011-game sample spread
+across the whole date range. 1,995 of those games cannot tell the two apart —
+the fields are equal in 99.8% of games — so the 16 that discriminate are the
+whole evidence, and they are unanimous. Zero games disagreed with *both*
+candidates, which is a second result: it confirms the earned-run offsets as
+well as the choice between them.
+
+### 4.4 Reconciliation result
+
+| | |
+|---|---|
+| games compared | **200,876** |
+| scores agree | **200,876 (100.0000%)** |
+| scores disagree | **0** |
+
+Every replayed final score matches the independently published one. This is the
+first check in the project that compares against numbers not derived from the
+event strings, and the state machine passes it exactly.
+
+The residual counts are coverage, not error — but only once broken down. A
+single "34,393 games in the logs only" reads as a defect:
+
+| Games in the logs, not the corpus | |
+|---|---|
+| before the corpus begins (pre-1908) | 29,017 |
+| postseason | 1,896 |
+| all-star | 95 |
+| **no event file exists** | **3,385** |
+
+Only the last line is a coverage gap, and it is a real one: **3,385 Major
+League games that Retrosheet's own logs list and the event files do not
+cover**, concentrated in 1920–1955 and peaking in the war years — 289 missing
+games in 1944 alone, 23% of the season. Below 1960 it is a live limitation on
+any era comparison; from 1960 onward it is essentially nil.
+
+The other direction is 2,193 games in the replay and not the logs, every one of
+them Negro Leagues: Retrosheet's game logs are Major League only. 216 more have
+a log row that was excluded as an unfair test (forfeit or suspended), counted
+separately so the number does not imply the logs were silent about them.
+
+**The field offsets are confirmed.** 235,607 rows from 160 files parsed with
+zero malformed lines, every field landing where the map says — `gl2000.txt`
+line 1 is Cubs 5, Mets 3 at `TOK01`, the 2000 opener in Tokyo — and six of
+seven shape checks at 0.000%.
+
+Retrosheet publishes a single combined archive, `gl1871_2025.zip`, so the fetch
+is **one request** rather than 155. That matters: this project has already been
+rate-limited off the server once (§4).
 
 ## 5. Performance suite
 

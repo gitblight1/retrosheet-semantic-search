@@ -136,18 +136,38 @@ class LayoutGuard(unittest.TestCase):
                             for f in failed))
 
     def test_out_counts_that_are_not_multiples_of_three_are_caught(self):
-        rows = [parse_line(make_line(outs="53")) for _ in range(50)]
+        # An away win with a partial final half-inning cannot happen: the home
+        # team always finishes its half unless it has already won.
+        rows = [parse_line(make_line(outs="53", away_score="9",
+                                     home_score="1")) for _ in range(50)]
         failed = [f for f in check_layout(rows) if not f.ok]
         self.assertTrue(any("multiple of three" in f.description
                             for f in failed))
 
-    def test_tolerance_admits_a_few_genuine_oddities(self):
-        # 19th-century and called games really do have odd out counts; one bad
-        # row in fifty must not read as a layout error.
-        rows = ([parse_line(make_line(outs="53"))]
-                + [parse_line(make_line()) for _ in range(199)])
+    def test_a_walk_off_is_not_a_layout_error(self):
+        """7.7% of real games have a partial final half-inning.
+
+        The first version of this check did not know that and flagged every
+        walk-off in the corpus -- 16,838 games -- as evidence the field
+        offsets were wrong. A guard that fires on correct data is worse than
+        no guard, because the next real failure gets waved through.
+        """
+        rows = [parse_line(make_line(outs="52", away_score="3",
+                                     home_score="4")) for _ in range(200)]
         findings = {f.description: f for f in check_layout(rows)}
-        self.assertTrue(findings["out counts are a multiple of three"].ok)
+        key = "out counts are a multiple of three, unless the home team won"
+        self.assertTrue(findings[key].ok)
+
+    def test_tolerance_admits_a_few_genuine_oddities(self):
+        # Called and forfeited games really do have odd out counts with the
+        # away team ahead; one bad row in two hundred must not read as a
+        # layout error.
+        rows = ([parse_line(make_line(outs="53", away_score="9",
+                                      home_score="1"))]
+                + [parse_line(make_line()) for _ in range(399)])
+        findings = {f.description: f for f in check_layout(rows)}
+        key = "out counts are a multiple of three, unless the home team won"
+        self.assertTrue(findings[key].ok)
 
 
 class Reconcile(unittest.TestCase):
@@ -226,6 +246,40 @@ class Reconcile(unittest.TestCase):
         self.assertEqual(result.log_only, 1, "BOS game absent from the replay")
         self.assertEqual(result.mismatches, [])
 
+    def test_log_only_games_are_broken_down_by_cause(self):
+        """One lumped number reads as a defect; the parts do not.
+
+        Of 34,393 games the logs have and the corpus does not, 29,133 predate
+        the corpus and 1,992 are postseason or all-star games the event files
+        never contained. Only the remainder is a coverage gap.
+        """
+        self.add_game(1, "KCA200004070", away=3, home=7, season=2000)
+        self.write_logs([
+            make_line(away_score="3", home_score="7"),                  # match
+            make_line(date="19000501", home_team="BSN"),                # early
+            make_line(date="20001015", home_team="NYN"),                # October
+            make_line(date="20000711", home_team="NLS"),                # all-star
+            make_line(date="20000612", home_team="CHN"),                # real gap
+        ])
+        r = self.run_reconcile()
+        self.assertEqual(r.compared, 1)
+        self.assertEqual(r.log_only_before_corpus, 1)
+        self.assertEqual(r.log_only_postseason, 1)
+        self.assertEqual(r.log_only_allstar, 1)
+        self.assertEqual(r.log_only_gap, 1)
+        self.assertEqual(r.log_only, 4)
+
+    def test_a_skipped_log_row_is_not_reported_as_absent(self):
+        # A forfeited game the corpus *does* hold is not "in the replay only":
+        # the log had something to say about it, it just was not a fair test.
+        self.add_game(1, "KCA200004070", away=3, home=7)
+        fields = make_line().split(",")
+        fields[FIELDS["forfeit"]] = "H"
+        self.write_logs([",".join(fields)])
+        r = self.run_reconcile()
+        self.assertEqual(r.replay_only, 0)
+        self.assertEqual(r.replay_only_skipped, 1)
+
     def test_forfeits_are_excluded_rather_than_counted_wrong(self):
         # A forfeit's score is awarded by rule, not scored on the field, so it
         # is not a fair test of the replay.
@@ -245,6 +299,24 @@ class Reconcile(unittest.TestCase):
         stored = self.archive.execute("SELECT raw FROM game_logs").fetchone()[0]
         self.assertEqual(stored, line,
                          "the published line must survive the load unchanged")
+
+    def test_loading_the_same_file_twice_works(self):
+        """Reloading must be safe -- the first version was not.
+
+        `INSERT OR REPLACE` on the file row assigned a new `gl_file_id` and
+        orphaned every `game_logs` row pointing at the old one, so the first
+        load succeeded and the second died on a foreign key. A loader that
+        only works once is a loader nobody can correct data with.
+        """
+        self.write_logs([make_line()])
+        stats = self.write_logs([make_line(home_score="9")])
+        self.assertEqual(stats.loaded, 1)
+        rows = self.archive.execute(
+            "SELECT home_score FROM game_logs").fetchall()
+        self.assertEqual(rows, [(9,)], "the reload must replace, not duplicate")
+        files = self.archive.execute(
+            "SELECT count(*) FROM game_log_files").fetchone()[0]
+        self.assertEqual(files, 1)
 
     def test_a_malformed_line_is_recorded_not_dropped(self):
         stats = self.write_logs([make_line(), ",".join([""] * 12)])

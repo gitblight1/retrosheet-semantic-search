@@ -207,8 +207,15 @@ LAYOUT_CHECKS = (
     ("league ids are two characters or empty",
      lambda g: len(g.home_league) in (0, 2) and len(g.away_league) in (0, 2),
      0.01),
-    ("out counts are a multiple of three",
-     lambda g: g.outs is None or g.outs % 3 == 0, 0.02),
+    # A walk-off ends the home half early, so the game's total out count is
+    # *not* a multiple of three -- 7.7% of games, and this check originally
+    # flagged every one of them as a layout error. What settled it was that
+    # 98.95% of the offenders are home wins against a 58.65% home-win rate
+    # overall, which is the walk-off signature and not something a shifted
+    # field could produce. The belief about baseball was wrong, not the offset.
+    ("out counts are a multiple of three, unless the home team won",
+     lambda g: (g.outs is None or g.outs % 3 == 0
+                or g.home_score > g.away_score), 0.005),
     ("out counts are a plausible game length",
      lambda g: g.outs is None or 6 <= g.outs <= 200, 0.02),
     ("park ids start with three letters",

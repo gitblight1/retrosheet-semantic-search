@@ -163,6 +163,11 @@ all passing.
 - **7 plays cannot be parsed** and 15 more inherit a base-out state known to be
   wrong because of them; those carry `state_untrusted` and are excluded by
   default ([03-STATE §7.1](spec/03-STATE.md)).
+- **3,385 Major League games have no event file.** Retrosheet's own game logs
+  list them and the corpus cannot cover them. They are concentrated in
+  1920–1955 and peak in the war years — 289 games missing from 1944, 23% of the
+  season. From 1960 onward the gap is essentially nil, but for a pre-1960 era
+  question it is a real limit on what any count here can mean.
 - **Retrosheet data is subject to correction** and carries no guarantee of
   accuracy.
 
@@ -180,14 +185,18 @@ Everything in the build order is built and validated against the full corpus.
 | Derived tables | 17,891,790 plays, 11.6 GB, **21/21** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 242, all passing |
+| Tests | 246, all passing |
 
-**Score reconciliation is built but has never been run.** `rsse gamelogs` and
-`rsse reconcile` compare every replayed final score against Retrosheet's
-separately-compiled game logs — the only check here that comes from outside the
-event files. retrosheet.org was unreachable from the development machine, so no
-log file has been loaded. If you have the `gl*.zip` archives, unzip them into
-`data/gamelogs/` and run those two commands; loading needs no network access.
+**Every replayed score matches the published one.** `rsse reconcile` compares
+`games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
+— against Retrosheet's separately compiled game logs, the only numbers here
+that do not come from the event files:
+
+| | |
+|---|---|
+| games compared | **200,876** |
+| scores agree | **200,876 (100.0000%)** |
+| scores disagree | **0** |
 
 Not built: `players`, `teams` and `parks`. The roster and team files are on
 disk but have never been ingested, and reading them straight from the file tree
@@ -229,7 +238,7 @@ rsse/model/      half-inning replay, force derivation, `com` and game-log record
 rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary and coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           242 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           246 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes
@@ -252,8 +261,11 @@ like every other row.
 round-trip gate proves nothing was discarded, not that it was filed correctly.
 The out-accounting invariant proves outs balance and says nothing about runs —
 and when a run invariant was finally added, it immediately found that every
-home run written with an explicit `B-H` advance had been scoring twice. Every
-time a quantity nobody had checked acquired a check, it found a bug.
+home run written with an explicit `B-H` advance had been scoring twice. Almost
+every time a quantity nobody had checked acquired a check, it found a bug. The
+exception is the biggest check of all: score reconciliation against the game
+logs came back clean on all 200,876 games, which is the one result here that is
+worth more for having been predicted to fail.
 
 **A tag is a rule, not a name.** A tag cannot be registered without a
 derivation, and it cannot ship without a positive *and* a negative test case: a

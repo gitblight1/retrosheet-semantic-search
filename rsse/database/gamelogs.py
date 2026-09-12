@@ -99,13 +99,28 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
         if progress:
             progress(path)
         digest = sha256(path)
-        cur = conn.execute(
-            "INSERT OR REPLACE INTO game_log_files"
-            " (path, sha256, byte_length, loaded_at) VALUES (?,?,?,?)",
-            (str(path), digest, path.stat().st_size,
-             datetime.now(timezone.utc).isoformat(timespec="seconds")))
-        gl_file_id = cur.lastrowid
-        conn.execute("DELETE FROM game_logs WHERE gl_file_id = ?", (gl_file_id,))
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        # Not `INSERT OR REPLACE`: REPLACE deletes the existing row and
+        # inserts a new one with a *new* `gl_file_id`, orphaning every
+        # `game_logs` row that referenced the old one. The first load
+        # succeeded and the second failed on a foreign key. Reuse the id.
+        existing = conn.execute(
+            "SELECT gl_file_id FROM game_log_files WHERE path = ?",
+            (str(path),)).fetchone()
+        if existing:
+            gl_file_id = existing[0]
+            conn.execute("DELETE FROM game_logs WHERE gl_file_id = ?",
+                         (gl_file_id,))
+            conn.execute(
+                "UPDATE game_log_files SET sha256 = ?, byte_length = ?,"
+                " loaded_at = ? WHERE gl_file_id = ?",
+                (digest, path.stat().st_size, now, gl_file_id))
+        else:
+            cur = conn.execute(
+                "INSERT INTO game_log_files"
+                " (path, sha256, byte_length, loaded_at) VALUES (?,?,?,?)",
+                (str(path), digest, path.stat().st_size, now))
+            gl_file_id = cur.lastrowid
 
         rows = []
         file_parsed: list = []
@@ -157,9 +172,28 @@ class Reconciliation:
     agreed: int = 0
     #: `(game_id, replay_away, replay_home, log_away, log_home)`
     mismatches: list[tuple] = field(default_factory=list)
-    #: Games in one source and not the other -- coverage, not error.
-    log_only: int = 0
+    #: Games in one source and not the other -- coverage, not error. Split by
+    #: cause, because one number lumping three unrelated things together is
+    #: what a coverage report exists to avoid: "34,393 games in the logs only"
+    #: reads as a defect until you know 29,133 of them predate the corpus.
+    log_only_before_corpus: int = 0
+    log_only_postseason: int = 0
+    log_only_allstar: int = 0
+    #: Major League games the logs list and the corpus has no event file for.
+    #: The real coverage gap, and the only part of `log_only` that is one.
+    log_only_gap: int = 0
+    #: Replayed games with no log row at all -- Negro Leagues, which the logs
+    #: do not cover.
     replay_only: int = 0
+    #: Replayed games whose log row was excluded as an unfair test. Counted
+    #: apart from `replay_only`, which would otherwise imply the log had
+    #: nothing to say about them.
+    replay_only_skipped: int = 0
+
+    @property
+    def log_only(self) -> int:
+        return (self.log_only_before_corpus + self.log_only_postseason
+                + self.log_only_allstar + self.log_only_gap)
     #: Games excluded because the log row is not a fair test: a forfeit's score
     #: is awarded by rule, and a suspended game is split across records.
     skipped_forfeit: int = 0
@@ -168,6 +202,27 @@ class Reconciliation:
     @property
     def rate(self) -> float:
         return self.agreed / self.compared if self.compared else 0.0
+
+
+#: Home-team codes used for the All-Star Game in the logs.
+_ALLSTAR_HOMES = frozenset({"NLS", "ALS", "AAS", "NAS"})
+
+
+def _classify_log_only(date: str, home_team: str, first_season: int) -> str:
+    """Why a game log row has no counterpart in the corpus.
+
+    October and November games are postseason: the corpus holds regular-season
+    team files only, so the combined `gl1871_2025` archive carries games the
+    event files never could.
+    """
+    year = int(date[:4])
+    if year < first_season:
+        return "before_corpus"
+    if home_team in _ALLSTAR_HOMES:
+        return "allstar"
+    if date[5:7] in ("10", "11"):
+        return "postseason"
+    return "gap"
 
 
 def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
@@ -181,15 +236,20 @@ def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
     out = Reconciliation()
 
     logs: dict[str, tuple] = {}
+    meta: dict[str, tuple[str, str]] = {}
+    skipped_ids: set[str] = set()
     for row in archive_conn.execute(
-            "SELECT game_id, away_score, home_score, forfeit, completion"
-            " FROM game_logs"):
-        game_id, away, home, forfeit, completion = row
+            "SELECT game_id, away_score, home_score, forfeit, completion,"
+            " date, home_team FROM game_logs"):
+        (game_id, away, home, forfeit, completion, date, home_team) = row
+        meta.setdefault(game_id, (date, home_team))
         if forfeit.strip():
             out.skipped_forfeit += 1
+            skipped_ids.add(game_id)
             continue
         if completion.strip():
             out.skipped_incomplete += 1
+            skipped_ids.add(game_id)
             continue
         # A repeated game id means the two rows cannot be told apart on id
         # alone; keeping the first and counting the collision is honest, and
@@ -203,11 +263,17 @@ def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
         sql += " AND season IN (%s)" % ",".join("?" * len(seasons))
         params += list(seasons)
 
+    first_season = query_conn.execute(
+        "SELECT min(season) FROM games").fetchone()[0] or 0
+
     seen = set()
     for game_id, replay_away, replay_home in query_conn.execute(sql, params):
         entry = logs.get(game_id)
         if entry is None:
-            out.replay_only += 1
+            if game_id in skipped_ids:
+                out.replay_only_skipped += 1
+            else:
+                out.replay_only += 1
             continue
         seen.add(game_id)
         out.compared += 1
@@ -217,41 +283,56 @@ def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
         else:
             out.mismatches.append(
                 (game_id, replay_away, replay_home, log_away, log_home))
-    out.log_only = len(logs) - len(seen)
+    for game_id in logs.keys() - seen:
+        date, home_team = meta[game_id]
+        kind = _classify_log_only(date, home_team, first_season)
+        setattr(out, f"log_only_{kind}", getattr(out, f"log_only_{kind}") + 1)
     return out
 
 
-def explain_earned_runs(query_conn, archive_conn, limit: int = 2000) -> dict:
+def explain_earned_runs(query_conn, archive_conn, sample: int = 2000) -> dict:
     """Decide which game log earned-run field is the team total.
 
-    The layout names both an "individual" and a "team" earned-run field per
-    side, and the documentation does not settle which is the per-game total.
-    Rather than pick one and report thousands of false mismatches, both are
-    compared against the event files' own `data,er` records -- the same
-    empirical approach that settled the replay verdict flag
-    (05-DATABASE §5.1) -- and whichever agrees is the one to use.
+    The layout names both an "individual" and a "team" earned-run figure per
+    side and does not settle which is the per-game total. Rather than pick one
+    and report thousands of false mismatches, both are compared against the
+    event files' own `data,er` records -- the same empirical approach that
+    settled the replay verdict flag (05-DATABASE §5.1) -- and whichever agrees
+    is the one to use.
 
-    Returns agreement counts per candidate field. It is a diagnostic, not a
-    gate: a tie or a low score means the question is still open.
+    The sample is spread across the whole date range, not taken from the front.
+    The first version used `LIMIT 2000` with no ordering, which took the
+    earliest rows by rowid: 1871 games, every one of them predating the corpus,
+    so the join found nothing and the diagnostic reported *zero games checked*
+    rather than an answer. Era coverage beats volume, and a sample taken from
+    one end of the data is not a sample.
+
+    Returns agreement counts per candidate field. A diagnostic, not a gate: a
+    tie or a low count means the question is still open.
     """
     scores = {"individual": 0, "team": 0, "neither": 0}
     checked = 0
+
+    # Only games the corpus actually holds, spread evenly over them.
     rows = archive_conn.execute(
-        "SELECT game_id, home_er_individual, home_er_team,"
-        " away_er_individual, away_er_team FROM game_logs"
-        " WHERE home_er_team IS NOT NULL LIMIT ?", (limit,)).fetchall()
-    for game_id, h_ind, h_team, a_ind, a_team in rows:
-        span = archive_conn.execute(
-            "SELECT first_record_id, last_record_id FROM game_spans"
-            " WHERE game_id = ? LIMIT 1", (game_id,)).fetchone()
-        if span is None:
-            continue
+        "SELECT gl.game_id, gl.home_er_individual, gl.home_er_team,"
+        "       gl.away_er_individual, gl.away_er_team,"
+        "       gs.first_record_id, gs.last_record_id"
+        "  FROM game_logs gl JOIN game_spans gs ON gs.game_id = gl.game_id"
+        " WHERE gl.home_er_team IS NOT NULL AND gl.away_er_team IS NOT NULL"
+        " ORDER BY gl.date").fetchall()
+    if not rows:
+        return {"checked": 0, "candidates": 0, **scores}
+    step = max(1, len(rows) // sample)
+
+    for (game_id, h_ind, h_team, a_ind, a_team,
+         first_id, last_id) in rows[::step]:
         total = 0
         found = False
         for (raw,) in archive_conn.execute(
                 "SELECT raw_line FROM raw_records"
                 " WHERE record_id BETWEEN ? AND ? AND raw_line LIKE 'data,er,%'",
-                span):
+                (first_id, last_id)):
             parts = raw.split(",")
             if len(parts) >= 4 and parts[3].strip().isdigit():
                 total += int(parts[3])
@@ -261,10 +342,18 @@ def explain_earned_runs(query_conn, archive_conn, limit: int = 2000) -> dict:
         checked += 1
         # `data,er` covers both teams' pitchers, so the event-file total is the
         # sum of the two sides whichever field is the right one.
-        if h_ind is not None and a_ind is not None and h_ind + a_ind == total:
+        individual = (h_ind or 0) + (a_ind or 0)
+        team = (h_team or 0) + (a_team or 0)
+        if individual == total and team != total:
             scores["individual"] += 1
-        elif h_team is not None and a_team is not None and h_team + a_team == total:
+        elif team == total and individual != total:
             scores["team"] += 1
+        elif team == total and individual == total:
+            # The two fields are equal in 99.8% of games, so most rows cannot
+            # tell them apart. Counted apart from a real disagreement rather
+            # than credited to both.
+            scores.setdefault("indistinguishable", 0)
+            scores["indistinguishable"] += 1
         else:
             scores["neither"] += 1
-    return {"checked": checked, **scores}
+    return {"checked": checked, "candidates": len(rows[::step]), **scores}
