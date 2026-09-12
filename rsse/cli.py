@@ -661,7 +661,10 @@ def cmd_gamelogs(args: argparse.Namespace) -> int:
         print(f"fetching game logs into {root} ...", file=sys.stderr)
         download.fetch_gamelogs(root)
 
-    files = sorted(p for p in root.glob("*")
+    # Recursive: the postseason and all-star archives extract into their own
+    # subdirectory, and leaving them out is what made the coverage gap a guess
+    # from the calendar rather than a fact (05-DATABASE §5.3).
+    files = sorted(p for p in root.rglob("*")
                    if p.is_file() and p.suffix.lower() in (".txt", ".csv"))
     if not files:
         print(f"no game log files in {root}.\n"
@@ -737,6 +740,11 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
         print("no game logs in the archive; run `rsse gamelogs` first",
               file=sys.stderr)
         return 2
+    from .database.gamelogs import has_series_column
+    if not has_series_column(archive):
+        print("note: this archive predates the `series` column, so postseason "
+              "and all-star games cannot be told from missing event files. "
+              "Re-run `rsse gamelogs` to reclassify.", file=sys.stderr)
     query = dbschema.connect(f"file:{query_path}?mode=ro")
 
     seasons = [int(y) for y in args.season.split(",")] if args.season else None
@@ -749,12 +757,20 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
     # "34,393 games in the logs only" reads as a defect until you know that
     # 29,133 of them predate the corpus and 1,992 are postseason and all-star
     # games the event files never contained.
+    from .database.gamelogs import SERIES_LABELS
     print(f"\nin the logs only     {result.log_only:,}")
     print(f"  before the corpus  {result.log_only_before_corpus:,}")
-    print(f"  postseason         {result.log_only_postseason:,}")
-    print(f"  all-star           {result.log_only_allstar:,}")
+    for code, n in sorted(result.log_only_special.items(),
+                          key=lambda kv: -kv[1]):
+        print(f"  {SERIES_LABELS.get(code, code):18s} {n:,}")
     print(f"  NO EVENT FILE      {result.log_only_gap:,}"
           "   <- the real coverage gap")
+    if result.gap_by_season:
+        worst = sorted(result.gap_by_season.items(), key=lambda kv: -kv[1])[:5]
+        print("    worst seasons:   "
+              + ", ".join(f"{y} ({n})" for y, n in worst))
+        modern = sum(n for y, n in result.gap_by_season.items() if y >= 1960)
+        print(f"    1960 onward:     {modern:,}")
     print(f"in the replay only   {result.replay_only:,}"
           "   (Negro Leagues; the logs are Major League)")
     print(f"  log row skipped    {result.replay_only_skipped:,}")
@@ -780,9 +796,9 @@ def cmd_reconcile(args: argparse.Namespace) -> int:
             "mismatches": result.mismatches,
             "log_only": result.log_only,
             "log_only_before_corpus": result.log_only_before_corpus,
-            "log_only_postseason": result.log_only_postseason,
-            "log_only_allstar": result.log_only_allstar,
+            "log_only_special": result.log_only_special,
             "log_only_gap": result.log_only_gap,
+            "gap_by_season": result.gap_by_season,
             "replay_only": result.replay_only,
             "replay_only_skipped": result.replay_only_skipped,
             "skipped_forfeit": result.skipped_forfeit,
@@ -856,6 +872,16 @@ def cmd_coverage(args: argparse.Namespace) -> int:
         conn = dbschema.connect(str(db_path))
         rows = cov.build(conn)
         print(f"coverage rebuilt: {rows} (season, league) rows")
+        archive_path = Path(args.archive) if args.archive else ARCHIVE
+        if archive_path.exists():
+            archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+            missing = cov.fill_missing_games(conn, archive)
+            archive.close()
+            if missing < 0:
+                print("  games_missing left NULL: no game logs in the archive."
+                      " Run `rsse gamelogs` to measure what the corpus lacks.")
+            else:
+                print(f"  games with no event file: {missing:,}")
         conn.close()
 
     conn = dbschema.connect(f"file:{db_path}?mode=ro")
@@ -863,18 +889,35 @@ def cmd_coverage(args: argparse.Namespace) -> int:
     if args.season_range:
         lo, hi = (int(x) for x in args.season_range.split(","))
         where, params = " WHERE season BETWEEN ? AND ?", (lo, hi)
-    print(f"{'season':>7} {'lg':<4} {'games':>7} {'plays':>10} "
-          f"{'pitches':>8} {'unparsed':>9} {'untrusted':>10}  dates")
-    total_games = total_plays = 0
+    print(f"{'season':>7} {'lg':<4} {'games':>7} {'missing':>8} "
+          f"{'plays':>10} {'pitches':>8} {'unparsed':>9} {'untrusted':>10}"
+          "  dates")
+    total_games = total_plays = total_missing = 0
+    unknown_missing = False
     for row in conn.execute(
             "SELECT season, league, games, plays, games_with_pitches,"
-            " plays_unparsed, plays_inconsistent, first_date, last_date"
+            " plays_unparsed, plays_inconsistent, first_date, last_date,"
+            " games_missing"
             f" FROM coverage{where} ORDER BY season, league", params):
-        print(f"{row[0]:>7} {row[1]:<4} {row[2]:>7,} {row[3]:>10,} "
-              f"{row[4]:>8,} {row[5]:>9,} {row[6]:>10,}  {row[7]}..{row[8]}")
+        missing = row[9]
+        if missing is None:
+            unknown_missing = True
+        else:
+            total_missing += missing
+        print(f"{row[0]:>7} {row[1]:<4} {row[2]:>7,} "
+              f"{('?' if missing is None else f'{missing:,}'):>8} "
+              f"{row[3]:>10,} {row[4]:>8,} {row[5]:>9,} {row[6]:>10,}"
+              f"  {row[7]}..{row[8]}")
         total_games += row[2]
         total_plays += row[3]
     print(f"\n{total_games:,} games, {total_plays:,} plays")
+    if unknown_missing:
+        print("games with no event file: unknown for some seasons "
+              "(run `rsse gamelogs`, then `rsse coverage --rebuild`)")
+    else:
+        whole = total_games + total_missing
+        print(f"games with no event file: {total_missing:,} "
+              f"({total_games / whole:.2%} of known games held)")
     print(f"\n{ATTRIBUTION}")
     conn.close()
     return 0
@@ -1395,6 +1438,7 @@ def main(argv: list[str] | None = None) -> int:
 
     cv = sub.add_parser("coverage", help="what the corpus actually covers")
     cv.add_argument("--database")
+    cv.add_argument("--archive")
     cv.add_argument("--rebuild", action="store_true")
     cv.add_argument("--season-range", help="LO,HI inclusive")
     cv.set_defaults(func=cmd_coverage)

@@ -22,6 +22,11 @@ CREATE TABLE IF NOT EXISTS coverage (
   games_without_pitch_data INTEGER NOT NULL,
   plays INTEGER NOT NULL, plays_unparsed INTEGER NOT NULL,
   plays_inconsistent INTEGER NOT NULL,
+  -- Games Retrosheet's own game logs list for this season and league that the
+  -- corpus has no event file for. NULL when the game logs have not been
+  -- loaded, which is *not* the same as zero: "we know of no missing games" and
+  -- "we have not looked" must not read alike.
+  games_missing INTEGER,
   PRIMARY KEY (corpus_id, season, league)
 );
 """
@@ -85,3 +90,76 @@ def build(conn, corpus_id: int = 1) -> int:
     conn.commit()
     return conn.execute("SELECT count(*) FROM coverage WHERE corpus_id = ?",
                         (corpus_id,)).fetchone()[0]
+
+
+#: Added after `coverage` first shipped; `CREATE TABLE IF NOT EXISTS` will not
+#: add it to an existing table (the same gap that bit `game_logs.series`).
+_MIGRATIONS = (("games_missing", "INTEGER"),)
+
+
+def _migrate(conn) -> None:
+    present = {r[1] for r in conn.execute("PRAGMA table_info(coverage)")}
+    if not present:
+        return
+    for column, decl in _MIGRATIONS:
+        if column not in present:
+            conn.execute(f"ALTER TABLE coverage ADD COLUMN {column} {decl}")
+    conn.commit()
+
+
+def fill_missing_games(conn, archive, corpus_id: int = 1) -> int:
+    """Record, per season and league, the games the corpus has no file for.
+
+    Counted against Retrosheet's own game logs, which is the only external
+    list of what *should* exist. Postseason and all-star games are excluded by
+    `series`: the corpus holds regular-season team files and never claimed to
+    hold the others, so counting those as missing would turn a design boundary
+    into a defect.
+
+    Returns the total. Leaves `games_missing` NULL and returns -1 if the game
+    logs are absent, because a coverage report that says "0 missing" when
+    nothing was checked is worse than one that says nothing.
+    """
+    _migrate(conn)
+    have = archive.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type='table'"
+        " AND name='game_logs'").fetchone()[0]
+    if not have:
+        return -1
+    series_sql = "series" if any(
+        r[1] == "series" for r in archive.execute("PRAGMA table_info(game_logs)")
+    ) else "'regular'"
+
+    known = {r[0] for r in conn.execute("SELECT game_id FROM games")}
+    first, last = conn.execute(
+        "SELECT min(season), max(season) FROM games").fetchone()
+    missing: dict[tuple, int] = {}
+    #: (season, league) pairs the logs say anything at all about. A pair with
+    #: no log rows is *unmeasured*, not complete -- Retrosheet's game logs
+    #: cover the Major Leagues, so all 36 Negro Leagues rows would otherwise
+    #: record `games_missing = 0` and read as "nothing is missing" when the
+    #: truth is "we have no list to check against". That is the same mistake
+    #: as storing 0 for an unloaded corpus, one level down.
+    covered: set[tuple] = set()
+    for game_id, date, league in archive.execute(
+            f"SELECT game_id, date, home_league FROM game_logs"
+            f" WHERE {series_sql} = 'regular'"):
+        season = int(date[:4])
+        if season < (first or 0) or season > (last or 0):
+            continue
+        key = (season, league or _UNKNOWN_LEAGUE)
+        covered.add(key)
+        if game_id in known:
+            continue
+        missing[key] = missing.get(key, 0) + 1
+
+    conn.execute("UPDATE coverage SET games_missing = NULL WHERE corpus_id = ?",
+                 (corpus_id,))
+    for season, league in covered:
+        conn.execute(
+            "UPDATE coverage SET games_missing = ?"
+            " WHERE corpus_id = ? AND season = ? AND league = ?",
+            (missing.get((season, league), 0), corpus_id, season, league))
+    conn.commit()
+    return sum(missing.values())
+

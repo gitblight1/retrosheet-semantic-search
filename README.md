@@ -163,11 +163,16 @@ all passing.
 - **7 plays cannot be parsed** and 15 more inherit a base-out state known to be
   wrong because of them; those carry `state_untrusted` and are excluded by
   default ([03-STATE §7.1](spec/03-STATE.md)).
-- **3,385 Major League games have no event file.** Retrosheet's own game logs
-  list them and the corpus cannot cover them. They are concentrated in
-  1920–1955 and peak in the war years — 289 games missing from 1944, 23% of the
-  season. From 1960 onward the gap is essentially nil, but for a pre-1960 era
-  question it is a real limit on what any count here can mean.
+- **3,433 Major League games have no event file.** Retrosheet's own game logs
+  list them and the corpus does not hold them. They are concentrated in
+  1920–1955 and peak in the war years — 282 games missing from 1944, leaving
+  that season **76.56% complete**. From 1960 onward the gap is 41 games in
+  total. Every `CoverageReport` states the figure for the seasons you searched,
+  so a zero result is bounded rather than absolute.
+- **Negro Leagues coverage is unmeasured, not verified.** Retrosheet's game
+  logs are Major League only, so for the 2,193 Negro Leagues games the corpus
+  holds there is no external list to check against. `CoverageReport` reports
+  those separately as `games_unmeasured` rather than counting them complete.
 - **Retrosheet data is subject to correction** and carries no guarantee of
   accuracy.
 
@@ -185,7 +190,7 @@ Everything in the build order is built and validated against the full corpus.
 | Derived tables | 17,891,790 plays, 11.6 GB, **21/21** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 246, all passing |
+| Tests | 250, all passing |
 
 **Every replayed score matches the published one.** `rsse reconcile` compares
 `games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
@@ -238,7 +243,7 @@ rsse/model/      half-inning replay, force derivation, `com` and game-log record
 rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary and coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           246 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           250 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

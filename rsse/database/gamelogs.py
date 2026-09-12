@@ -41,6 +41,12 @@ CREATE TABLE IF NOT EXISTS game_logs (
   game_number  TEXT NOT NULL,
   home_team    TEXT NOT NULL,
   away_team    TEXT NOT NULL,
+  -- Which series the row belongs to, from the file it came in: 'regular', or
+  -- 'ws' / 'lc' / 'dv' / 'wc' / 'as' / 'ct'. Retrosheet publishes the
+  -- postseason and all-star games as their own archives, and this column is
+  -- what makes "the corpus has no event file for this game" an exact
+  -- statement rather than a guess from the date.
+  series       TEXT NOT NULL DEFAULT 'regular',
   home_league  TEXT,
   away_league  TEXT,
   home_score   INTEGER NOT NULL,
@@ -59,6 +65,8 @@ CREATE TABLE IF NOT EXISTS game_logs (
 );
 
 CREATE INDEX IF NOT EXISTS ix_game_logs_id ON game_logs (game_id);
+CREATE INDEX IF NOT EXISTS ix_game_logs_series ON game_logs (series)
+  WHERE series <> 'regular';
 CREATE INDEX IF NOT EXISTS ix_game_logs_date ON game_logs (date);
 """
 
@@ -75,14 +83,52 @@ class LoadStats:
     layout: list = field(default_factory=list)
 
 
+#: Filename stem -> series. `gl1871_2025.txt` and `glYYYY.txt` are regular
+#: season; the postseason and all-star archives are named for their series.
+SERIES_BY_PREFIX = {
+    "glws": "ws", "gllc": "lc", "gldv": "dv",
+    "glwc": "wc", "glas": "as", "glct": "ct",
+}
+
+
+def series_for(path) -> str:
+    """Which series a game log file holds, from its name."""
+    return SERIES_BY_PREFIX.get(Path(path).stem.lower(), "regular")
+
+
 _INSERT = """
 INSERT OR REPLACE INTO game_logs (
   gl_file_id, line_no, game_id, date, game_number, home_team, away_team,
   home_league, away_league, home_score, away_score, outs, park_id,
   completion, forfeit, home_er_individual, home_er_team,
-  away_er_individual, away_er_team, raw)
-VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+  away_er_individual, away_er_team, raw, series)
+VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 """
+
+
+#: Columns added to `game_logs` after it first shipped. `CREATE TABLE IF NOT
+#: EXISTS` does not alter an existing table, so an archive loaded by an earlier
+#: version keeps the old shape and the next statement referring to a new column
+#: fails -- which is exactly what happened with `series`. Every test built a
+#: fresh database and so none of them saw it.
+_MIGRATIONS = (
+    ("series", "TEXT NOT NULL DEFAULT 'regular'"),
+)
+
+
+def _migrate(conn) -> list[str]:
+    """Add any `game_logs` columns missing from an older archive."""
+    present = {r[1] for r in conn.execute("PRAGMA table_info(game_logs)")}
+    if not present:
+        return []                      # table does not exist yet; DDL will make it
+    added = []
+    for column, decl in _MIGRATIONS:
+        if column not in present:
+            conn.execute(f"ALTER TABLE game_logs ADD COLUMN {column} {decl}")
+            added.append(column)
+    if added:
+        conn.commit()
+    return added
 
 
 def load(conn, paths: list[Path], progress=None) -> LoadStats:
@@ -91,6 +137,7 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
 
     from ..util.download import sha256
 
+    _migrate(conn)
     conn.executescript(GAMELOG_DDL)
     stats = LoadStats()
     parsed: list = []
@@ -122,6 +169,7 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
                 (str(path), digest, path.stat().st_size, now))
             gl_file_id = cur.lastrowid
 
+        series = series_for(path)
         rows = []
         file_parsed: list = []
         # latin-1: the logs carry the same accented names the event files do,
@@ -146,7 +194,7 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
                 gl.away_league, gl.home_score, gl.away_score, gl.outs,
                 gl.park_id, gl.completion, gl.forfeit,
                 gl.home_er_individual, gl.home_er_team,
-                gl.away_er_individual, gl.away_er_team, gl.raw))
+                gl.away_er_individual, gl.away_er_team, gl.raw, series))
         conn.executemany(_INSERT, rows)
         conn.execute("UPDATE game_log_files SET line_count = ? WHERE gl_file_id = ?",
                      (len(rows), gl_file_id))
@@ -177,8 +225,8 @@ class Reconciliation:
     #: what a coverage report exists to avoid: "34,393 games in the logs only"
     #: reads as a defect until you know 29,133 of them predate the corpus.
     log_only_before_corpus: int = 0
-    log_only_postseason: int = 0
-    log_only_allstar: int = 0
+    #: Postseason and all-star games, by series code.
+    log_only_special: dict = field(default_factory=dict)
     #: Major League games the logs list and the corpus has no event file for.
     #: The real coverage gap, and the only part of `log_only` that is one.
     log_only_gap: int = 0
@@ -192,8 +240,11 @@ class Reconciliation:
 
     @property
     def log_only(self) -> int:
-        return (self.log_only_before_corpus + self.log_only_postseason
-                + self.log_only_allstar + self.log_only_gap)
+        return (self.log_only_before_corpus + sum(self.log_only_special.values())
+                + self.log_only_gap)
+
+    #: Seasons where the corpus is missing games, worst first.
+    gap_by_season: dict = field(default_factory=dict)
     #: Games excluded because the log row is not a fair test: a forfeit's score
     #: is awarded by rule, and a suspended game is split across records.
     skipped_forfeit: int = 0
@@ -204,25 +255,36 @@ class Reconciliation:
         return self.agreed / self.compared if self.compared else 0.0
 
 
-#: Home-team codes used for the All-Star Game in the logs.
-_ALLSTAR_HOMES = frozenset({"NLS", "ALS", "AAS", "NAS"})
+#: Human labels for the series codes, for reporting.
+SERIES_LABELS = {
+    "ws": "World Series", "lc": "league championship",
+    "dv": "division series", "wc": "wild card",
+    "as": "all-star", "ct": "19th-c. championship",
+}
 
 
-def _classify_log_only(date: str, home_team: str, first_season: int) -> str:
+def _classify_log_only(date: str, series: str, first_season: int) -> str:
     """Why a game log row has no counterpart in the corpus.
 
-    October and November games are postseason: the corpus holds regular-season
-    team files only, so the combined `gl1871_2025` archive carries games the
-    event files never could.
+    Classified by the *series the row came from*, not by its date. The first
+    version read October and November as postseason, which is wrong in both
+    directions: the regular season now ends in early October, and the World
+    Series used to start there. It understated the real coverage gap by 48
+    games. Loading Retrosheet's own postseason and all-star archives makes
+    this exact -- the question "is this a postseason game" is answered by
+    Retrosheet rather than by a month.
     """
-    year = int(date[:4])
-    if year < first_season:
+    if int(date[:4]) < first_season:
         return "before_corpus"
-    if home_team in _ALLSTAR_HOMES:
-        return "allstar"
-    if date[5:7] in ("10", "11"):
-        return "postseason"
+    if series != "regular":
+        return "special"
     return "gap"
+
+
+def has_series_column(conn) -> bool:
+    """Whether the archive's `game_logs` carries the `series` column."""
+    return any(r[1] == "series"
+               for r in conn.execute("PRAGMA table_info(game_logs)"))
 
 
 def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
@@ -238,11 +300,20 @@ def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
     logs: dict[str, tuple] = {}
     meta: dict[str, tuple[str, str]] = {}
     skipped_ids: set[str] = set()
+    # A game that appears in both the combined archive and a postseason one
+    # must be remembered as the postseason game: the series label is the whole
+    # point, and 'regular' arriving second would erase it.
+    # An archive loaded before `series` existed has no such column. Reading
+    # every row as 'regular' would silently reclassify 1,949 postseason games
+    # as missing event files, so the absence is reported by the caller rather
+    # than papered over here.
+    series_sql = "series" if has_series_column(archive_conn) else "'regular'"
     for row in archive_conn.execute(
             "SELECT game_id, away_score, home_score, forfeit, completion,"
-            " date, home_team FROM game_logs"):
-        (game_id, away, home, forfeit, completion, date, home_team) = row
-        meta.setdefault(game_id, (date, home_team))
+            f" date, {series_sql} AS series FROM game_logs"
+            " ORDER BY (series = 'regular')"):
+        (game_id, away, home, forfeit, completion, date, series) = row
+        meta.setdefault(game_id, (date, series))
         if forfeit.strip():
             out.skipped_forfeit += 1
             skipped_ids.add(game_id)
@@ -266,6 +337,14 @@ def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
     first_season = query_conn.execute(
         "SELECT min(season) FROM games").fetchone()[0] or 0
 
+    # Every game id the corpus holds, so coverage can be accounted for
+    # separately from the score comparison. A forfeited game with no event
+    # file is still a missing event file: excluding it from the comparison is
+    # right, and excluding it from the coverage count is not. Doing both made
+    # `reconcile` report 3,429 where `coverage --rebuild` reported 3,433, two
+    # numbers with the same label disagreeing by four.
+    corpus_ids = {r[0] for r in query_conn.execute("SELECT game_id FROM games")}
+
     seen = set()
     for game_id, replay_away, replay_home in query_conn.execute(sql, params):
         entry = logs.get(game_id)
@@ -283,10 +362,17 @@ def reconcile(query_conn, archive_conn, seasons=None) -> Reconciliation:
         else:
             out.mismatches.append(
                 (game_id, replay_away, replay_home, log_away, log_home))
-    for game_id in logs.keys() - seen:
-        date, home_team = meta[game_id]
-        kind = _classify_log_only(date, home_team, first_season)
-        setattr(out, f"log_only_{kind}", getattr(out, f"log_only_{kind}") + 1)
+    for game_id in meta.keys() - corpus_ids:
+        date, series = meta[game_id]
+        kind = _classify_log_only(date, series, first_season)
+        if kind == "before_corpus":
+            out.log_only_before_corpus += 1
+        elif kind == "special":
+            out.log_only_special[series] = out.log_only_special.get(series, 0) + 1
+        else:
+            out.log_only_gap += 1
+            year = int(date[:4])
+            out.gap_by_season[year] = out.gap_by_season.get(year, 0) + 1
     return out
 
 

@@ -507,6 +507,40 @@ Because these tables are not derived, `derive --rebuild` — which replaces the
 file — destroys them. It counts and names them before doing so rather than
 letting them disappear quietly.
 
+### 5.3 Game logs, and measuring what the corpus lacks
+
+Retrosheet's game logs are one 161-field CSV row per game, compiled separately
+from the event files, and they live in the **archive** — source data, not
+derived. They are not in `raw_records`, which is partitioned exactly by
+`game_spans`; a game log line belongs *to* a game without being one of its
+records.
+
+The `series` column is what makes the corpus's coverage gap measurable rather
+than guessable. Retrosheet publishes the regular season as one combined
+archive and the postseason and all-star games as their own, so the series a row
+belongs to is a fact about which file it came from:
+
+| Series | Rows |
+|---|---|
+| `regular` | 235,607 |
+| `ws` / `lc` / `dv` / `wc` | World Series, league championship, division, wild card |
+| `as` | all-star |
+| `ct` | 19th-century championship |
+
+The first version had no such column and inferred the postseason from the
+date — October and November. That is wrong in both directions: the regular
+season now ends in early October and the World Series used to start there. It
+understated the coverage gap by 48 games, and no amount of tuning the cutoff
+would fix it, because the boundary moves by era. Loading Retrosheet's own
+postseason archives replaces the inference with a lookup.
+
+**`coverage.games_missing`** then records, per season and league, the
+regular-season games the logs list that the corpus has no event file for. It is
+`NULL` when the game logs have not been loaded — deliberately not `0`, because
+"we know of no missing games" and "we have not looked" must not read alike in
+a table whose purpose is to bound a negative result. `CoverageReport` carries
+the same distinction through to the query API.
+
 ## 6. Operational notes
 
 - `PRAGMA journal_mode = WAL`, `synchronous = NORMAL`, and a large `cache_size`

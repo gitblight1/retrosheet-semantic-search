@@ -202,8 +202,8 @@ class Reconcile(unittest.TestCase):
             (key, game_id, season, away, home))
         self.query.commit()
 
-    def write_logs(self, lines):
-        path = self.tmp / "GL2000.TXT"
+    def write_logs(self, lines, name="gl2000.txt"):
+        path = self.tmp / name
         path.write_text("\n".join(lines) + "\n", encoding="latin-1")
         from rsse.database import gamelogs
         return gamelogs.load(self.archive, [path])
@@ -249,25 +249,71 @@ class Reconcile(unittest.TestCase):
     def test_log_only_games_are_broken_down_by_cause(self):
         """One lumped number reads as a defect; the parts do not.
 
-        Of 34,393 games the logs have and the corpus does not, 29,133 predate
-        the corpus and 1,992 are postseason or all-star games the event files
+        Of 34,515 games the logs have and the corpus does not, 29,133 predate
+        the corpus and 1,949 are postseason or all-star games the event files
         never contained. Only the remainder is a coverage gap.
         """
         self.add_game(1, "KCA200004070", away=3, home=7, season=2000)
         self.write_logs([
             make_line(away_score="3", home_score="7"),                  # match
             make_line(date="19000501", home_team="BSN"),                # early
-            make_line(date="20001015", home_team="NYN"),                # October
-            make_line(date="20000711", home_team="NLS"),                # all-star
             make_line(date="20000612", home_team="CHN"),                # real gap
         ])
+        self.write_logs([make_line(date="20001021", home_team="NYN")],
+                        name="glws.txt")                                # series
+        self.write_logs([make_line(date="20000711", home_team="ANA")],
+                        name="glas.txt")                                # all-star
         r = self.run_reconcile()
         self.assertEqual(r.compared, 1)
         self.assertEqual(r.log_only_before_corpus, 1)
-        self.assertEqual(r.log_only_postseason, 1)
-        self.assertEqual(r.log_only_allstar, 1)
+        self.assertEqual(r.log_only_special, {"ws": 1, "as": 1})
         self.assertEqual(r.log_only_gap, 1)
         self.assertEqual(r.log_only, 4)
+
+    def test_the_series_comes_from_the_file_not_the_date(self):
+        """An October game is not automatically a postseason game.
+
+        The first classifier read October and November as postseason. That is
+        wrong in both directions -- the regular season now ends in early
+        October, and the World Series used to start there -- and it understated
+        the real coverage gap by 48 games.
+        """
+        self.add_game(1, "KCA200004070", away=3, home=7, season=2000)
+        # An October regular-season game with no event file is a *gap*.
+        self.write_logs([make_line(away_score="3", home_score="7"),
+                         make_line(date="20001003", home_team="CHN")])
+        r = self.run_reconcile()
+        self.assertEqual(r.log_only_gap, 1)
+        self.assertEqual(r.log_only_special, {})
+
+    def test_the_gap_is_reported_per_season(self):
+        # Which seasons are thin matters more than the total: the corpus is
+        # 23% short in 1944 and essentially complete after 1960.
+        self.add_game(1, "KCA200004070", away=3, home=7, season=2000)
+        self.write_logs([make_line(away_score="3", home_score="7"),
+                         make_line(date="20000612", home_team="CHN"),
+                         make_line(date="20000613", home_team="CHN")])
+        r = self.run_reconcile()
+        self.assertEqual(r.gap_by_season, {2000: 2})
+
+    def test_a_forfeited_game_with_no_event_file_still_counts_as_a_gap(self):
+        """Excluded from the comparison, not from the coverage count.
+
+        A forfeit is not a fair test of the replay, so it is left out of the
+        score check. It is still a game the corpus has no event file for, and
+        leaving it out of the gap made `reconcile` and `coverage --rebuild`
+        disagree by four games under the same label.
+        """
+        self.add_game(1, "KCA200004070", away=3, home=7, season=2000)
+        fields = make_line(date="20000612", home_team="CHN").split(",")
+        fields[FIELDS["forfeit"]] = "H"
+        self.write_logs([make_line(away_score="3", home_score="7"),
+                         ",".join(fields)])
+        r = self.run_reconcile()
+        self.assertEqual(r.compared, 1)
+        self.assertEqual(r.skipped_forfeit, 1)
+        self.assertEqual(r.log_only_gap, 1,
+                         "a forfeit with no event file is still a gap")
 
     def test_a_skipped_log_row_is_not_reported_as_absent(self):
         # A forfeited game the corpus *does* hold is not "in the replay only":
@@ -317,6 +363,37 @@ class Reconcile(unittest.TestCase):
         files = self.archive.execute(
             "SELECT count(*) FROM game_log_files").fetchone()[0]
         self.assertEqual(files, 1)
+
+    def test_an_archive_without_the_series_column_is_migrated(self):
+        """`CREATE TABLE IF NOT EXISTS` does not add a column.
+
+        An archive loaded by an earlier version keeps the old shape, and the
+        next statement naming a new column fails. Every other test here builds
+        a fresh database, which is exactly why none of them caught it.
+        """
+        from rsse.database import gamelogs
+        self.archive.executescript(
+            "CREATE TABLE game_log_files (gl_file_id INTEGER PRIMARY KEY,"
+            " path TEXT NOT NULL UNIQUE, sha256 TEXT NOT NULL,"
+            " byte_length INTEGER NOT NULL, loaded_at TEXT NOT NULL,"
+            " line_count INTEGER NOT NULL DEFAULT 0);"
+            "CREATE TABLE game_logs (gl_id INTEGER PRIMARY KEY,"
+            " gl_file_id INTEGER NOT NULL, line_no INTEGER NOT NULL,"
+            " game_id TEXT NOT NULL, date TEXT NOT NULL,"
+            " game_number TEXT NOT NULL, home_team TEXT NOT NULL,"
+            " away_team TEXT NOT NULL, home_league TEXT, away_league TEXT,"
+            " home_score INTEGER NOT NULL, away_score INTEGER NOT NULL,"
+            " outs INTEGER, park_id TEXT, completion TEXT NOT NULL DEFAULT '',"
+            " forfeit TEXT NOT NULL DEFAULT '',"
+            " home_er_individual INTEGER, home_er_team INTEGER,"
+            " away_er_individual INTEGER, away_er_team INTEGER,"
+            " raw TEXT NOT NULL, UNIQUE (gl_file_id, line_no));")
+        self.assertFalse(gamelogs.has_series_column(self.archive))
+        self.write_logs([make_line()])
+        self.assertTrue(gamelogs.has_series_column(self.archive))
+        self.assertEqual(
+            self.archive.execute("SELECT series FROM game_logs").fetchone(),
+            ("regular",))
 
     def test_a_malformed_line_is_recorded_not_dropped(self):
         stats = self.write_logs([make_line(), ",".join([""] * 12)])

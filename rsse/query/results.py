@@ -35,6 +35,16 @@ class CoverageReport:
     #: range -- the denominator's own defects, stated up front.
     plays_unparsed: int = 0
     plays_inconsistent: int = 0
+    #: Games Retrosheet's game logs list for the seasons searched that the
+    #: corpus has no event file for. `None` means the game logs have not been
+    #: loaded -- *not* that nothing is missing. A zero and an unknown must not
+    #: read alike in a report whose whole job is to bound a negative result.
+    games_missing: int | None = None
+    #: Games in scope whose league the game logs do not cover at all -- the
+    #: Negro Leagues. Not counted as complete and not counted as missing:
+    #: there is no external list to check them against, and saying so is the
+    #: only honest option.
+    games_unmeasured: int = 0
     #: Caveats that apply to this particular search, in plain English.
     notes: tuple[str, ...] = ()
 
@@ -44,11 +54,35 @@ class CoverageReport:
             return "no seasons"
         return f"{min(self.seasons)}-{max(self.seasons)}"
 
+    @property
+    def completeness(self) -> float | None:
+        """Fraction of the known games in range that the corpus holds.
+
+        Measured only over the games an external list covers: games in an
+        unmeasured league are excluded from both sides, because counting them
+        as held against a denominator that never included them would report a
+        completeness better than anything was checked.
+        """
+        if self.games_missing is None:
+            return None
+        held = self.games - self.games_unmeasured
+        total = held + self.games_missing
+        return held / total if total else None
+
     def describe(self) -> str:
-        return (f"{self.games:,} games, {self.plays:,} plays, "
+        text = (f"{self.games:,} games, {self.plays:,} plays, "
                 f"{self.season_range}, "
                 f"leagues {'/'.join(self.leagues) or 'none'}, "
                 f"{self.first_date} to {self.last_date}")
+        if self.games_missing:
+            text += (f"; {self.games_missing:,} known games have no event file"
+                     f" ({self.completeness:.2%} complete)")
+        elif self.games_missing is None:
+            text += "; completeness unknown (no game logs loaded)"
+        if self.games_unmeasured:
+            text += (f"; {self.games_unmeasured:,} games in leagues the game "
+                     "logs do not cover, so unmeasured")
+        return text
 
 
 @dataclass(frozen=True)

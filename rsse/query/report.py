@@ -63,13 +63,26 @@ def build_coverage(conn, search) -> CoverageReport:
     leagues = tuple(sorted({p[1] for p in pairs}))
 
     unparsed = inconsistent = 0
+    missing = 0
+    unmeasured = 0
+    measured_any = False
     for season, league in pairs:
         defects = conn.execute(
-            "SELECT plays_unparsed, plays_inconsistent FROM coverage"
-            " WHERE season = ? AND league = ?", (season, league)).fetchone()
+            "SELECT plays_unparsed, plays_inconsistent, games_missing, games"
+            " FROM coverage WHERE season = ? AND league = ?",
+            (season, league)).fetchone()
         if defects:
             unparsed += defects[0]
             inconsistent += defects[1]
+            if defects[2] is None:
+                # No external list covers this slice, so its games are neither
+                # held-and-verified nor missing. Counting them either way would
+                # be a claim nothing checked.
+                unmeasured += defects[3]
+            else:
+                measured_any = True
+                missing += defects[2]
+    missing_total = missing if measured_any else None
 
     notes = []
     if search._game_types and set(search._game_types).issubset(
@@ -77,6 +90,14 @@ def build_coverage(conn, search) -> CoverageReport:
         notes.append(_NO_POSTSEASON_FILES)
     if unparsed or inconsistent:
         notes.append(_COARSE_DEFECTS)
+    if missing_total:
+        notes.append(
+            f"{missing_total:,} games in range have no event file; a zero "
+            "result cannot rule them out")
+    if unmeasured:
+        notes.append(
+            f"{unmeasured:,} games are in leagues the game logs do not cover, "
+            "so their completeness is unknown rather than confirmed")
     return CoverageReport(
         seasons=seasons, leagues=leagues,
         games=row[0], plays=row[1],
@@ -85,6 +106,7 @@ def build_coverage(conn, search) -> CoverageReport:
         games_with_count_only=row[5] or 0,
         games_without_pitch_data=row[6] or 0,
         plays_unparsed=unparsed, plays_inconsistent=inconsistent,
+        games_missing=missing_total, games_unmeasured=unmeasured,
         notes=tuple(notes),
     )
 
