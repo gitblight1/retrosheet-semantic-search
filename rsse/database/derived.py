@@ -21,6 +21,7 @@ needed some, that was a sign the fact belonged one layer down -- `htbf` and
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -62,8 +63,13 @@ class DeriveStats:
 # reading games back out of the archive
 # ---------------------------------------------------------------------------
 
+#: SQLite's default parameter ceiling is 999; this leaves room for the rest.
+_KEY_CHUNK = 500
+
+
 def iter_archive_games(archive, seasons: list[int] | None = None,
-                       limit: int | None = None
+                       limit: int | None = None,
+                       game_keys: list[int] | None = None
                        ) -> Iterator[tuple[dict, list[Record], list[int]]]:
     """Yield ``(span, records, record_ids)`` for each game in the archive.
 
@@ -73,12 +79,29 @@ def iter_archive_games(archive, seasons: list[int] | None = None,
     index over 31 million rows.
     """
     sql = ("SELECT s.game_key, s.game_id, s.occurrence, s.file_id, "
-           "       s.first_record_id, s.last_record_id, f.path, f.season "
+           "       s.first_record_id, s.last_record_id, f.path, f.season, "
+           "       f.sha256 "
            "  FROM game_spans s JOIN source_files f ON f.file_id = s.file_id")
     params: list = []
+    where = []
     if seasons:
-        sql += " WHERE f.season IN (%s)" % ",".join("?" * len(seasons))
+        where.append("f.season IN (%s)" % ",".join("?" * len(seasons)))
         params += list(seasons)
+    if game_keys is not None:
+        # Chunked rather than a temp table: the archive is opened read-only,
+        # and a refresh touches tens of games, not the corpus.
+        keys = list(game_keys)
+        if not keys:
+            return
+        if len(keys) > _KEY_CHUNK:
+            for start in range(0, len(keys), _KEY_CHUNK):
+                yield from iter_archive_games(
+                    archive, seasons, limit, keys[start:start + _KEY_CHUNK])
+            return
+        where.append("s.game_key IN (%s)" % ",".join("?" * len(keys)))
+        params += keys
+    if where:
+        sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY s.game_key"
     if limit:
         sql += " LIMIT ?"
@@ -86,7 +109,7 @@ def iter_archive_games(archive, seasons: list[int] | None = None,
 
     for span in archive.execute(sql, params).fetchall():
         (game_key, game_id, occurrence, file_id,
-         first_id, last_id, path, season) = span
+         first_id, last_id, path, season, sha256) = span
         rows = archive.execute(
             "SELECT record_id, line_no, raw_line FROM raw_records "
             " WHERE record_id BETWEEN ? AND ? ORDER BY record_id",
@@ -102,7 +125,8 @@ def iter_archive_games(archive, seasons: list[int] | None = None,
             record_ids.append(record_id)
         yield (
             {"game_key": game_key, "game_id": game_id, "occurrence": occurrence,
-             "file_id": file_id, "path": path, "season": season},
+             "file_id": file_id, "path": path, "season": season,
+             "sha256": sha256},
             records,
             record_ids,
         )
@@ -319,8 +343,9 @@ _INSERTS = {
     "games": ("INSERT INTO games (game_key, game_id, occurrence, date, season,"
               " game_number, home_team, away_team, league, site, game_type,"
               " scheduled_innings, use_dh, home_bats_first, pitch_detail,"
-              " tiebreaker_base, final_home, final_away, plays, parse_status)"
-              " VALUES (" + ",".join("?" * 20) + ")"),
+              " tiebreaker_base, final_home, final_away, plays, parse_status,"
+              " source_sha256)"
+              " VALUES (" + ",".join("?" * 21) + ")"),
     "game_info": "INSERT INTO game_info (game_key, key, value, seq) VALUES (?,?,?,?)",
     "plays": None,   # built from _PLAY_COLUMNS below
     "runner_advances": ("INSERT INTO runner_advances VALUES ("
@@ -361,7 +386,8 @@ _GAME_COLUMNS = ("game_key", "game_id", "occurrence", "date", "season",
                  "game_number", "home_team", "away_team", "league", "site",
                  "game_type", "scheduled_innings", "use_dh",
                  "home_bats_first", "pitch_detail", "tiebreaker_base",
-                 "final_home", "final_away", "plays", "parse_status")
+                 "final_home", "final_away", "plays", "parse_status",
+                 "source_sha256")
 
 
 def _check_row(table: str, row: tuple, columns: tuple) -> tuple:
@@ -395,9 +421,120 @@ def load_tags_table(conn) -> dict[str, int]:
             in conn.execute("SELECT name, tag_id FROM tags")}
 
 
+#: Every table holding rows that belong to one game, in the order they must be
+#: deleted. The last three are not built by `derive` at all -- they belong to
+#: `secondary` and `earned-runs` -- and they are here because `plays` is about
+#: to be deleted underneath their `play_id`. Leaving them would be a dangling
+#: reference nothing checks for, which is the same shape as the bug that let
+#: `coverage` vanish unnoticed.
+_GAME_TABLES_BY_PLAY = ("play_tags", "credit_sequences", "fielding_credits",
+                        "runner_advances")
+_GAME_TABLES_BY_KEY = ("earned_runs", "comments", "lineup_entries", "plays",
+                       "game_info", "games")
+
+
+def _has_table(conn, name: str) -> bool:
+    return bool(conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = ?",
+        (name,)).fetchone()[0])
+
+
+class NoSourceDigests(Exception):
+    """The derived database predates `games.source_sha256`."""
+
+
+def stale_and_missing(conn, archive) -> tuple[list[int], list[int]]:
+    """`(games to forget, games to build)`, by comparing content.
+
+    The archive is the source of truth, so agreement is decided by comparing
+    the two databases rather than by anything remembered between runs -- but
+    it must be compared on **content**, not identity. `game_spans.game_key`
+    and `raw_records.record_id` are plain `INTEGER PRIMARY KEY`s, so deleting
+    a reissued file's rows and inserting its replacement hands back the very
+    same integers: measured, a refreshed two-game file came back as keys 1 and
+    2, exactly as before. Comparing key sets reported nothing stale and
+    nothing missing, and would have left the derived layer serving the old
+    vintage of a corrected file with every check green -- the precise outcome
+    `CorpusChanged` exists to prevent.
+
+    So a game agrees when its key *and* its source file's digest agree. A
+    reissue changes the digest by definition, so its games appear in both
+    lists and are rebuilt.
+    """
+    archive_games = {r[0]: r[1] for r in archive.execute(
+        "SELECT s.game_key, f.sha256 FROM game_spans s"
+        " JOIN source_files f ON f.file_id = s.file_id")}
+    try:
+        derived_games = {r[0]: r[1] for r in conn.execute(
+            "SELECT game_key, source_sha256 FROM games")}
+    except sqlite3.OperationalError as exc:
+        raise NoSourceDigests(str(exc)) from None
+
+    if derived_games and all(v is None for v in derived_games.values()):
+        raise NoSourceDigests("games.source_sha256 is empty")
+
+    stale = [k for k, sha in derived_games.items()
+             if archive_games.get(k) != sha]
+    missing = [k for k, sha in archive_games.items()
+               if derived_games.get(k) != sha]
+    return sorted(stale), sorted(missing)
+
+
+def adopt_digests(conn, archive) -> int:
+    """Record the archive's current digests as this database's vintage.
+
+    A migration for databases built before `games.source_sha256`, and an
+    assertion rather than a measurement: it says "these derived games came
+    from the files the archive holds now", which nothing here can verify. It
+    is true of a database built from this archive and not since re-ingested,
+    and false -- silently -- of one built from an earlier vintage. That is why
+    it needs an explicit flag rather than happening on demand.
+    """
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(games)")}
+    if "source_sha256" not in cols:
+        conn.execute("ALTER TABLE games ADD COLUMN source_sha256 TEXT")
+    rows = list(archive.execute(
+        "SELECT f.sha256, s.game_key FROM game_spans s"
+        " JOIN source_files f ON f.file_id = s.file_id"))
+    conn.executemany("UPDATE games SET source_sha256 = ? WHERE game_key = ?",
+                     rows)
+    conn.commit()
+    return conn.execute(
+        "SELECT count(*) FROM games WHERE source_sha256 IS NOT NULL"
+    ).fetchone()[0]
+
+
+def forget_games(conn, keys: list[int]) -> dict[str, int]:
+    """Delete every row belonging to `keys`. Returns rows removed per table."""
+    removed: dict[str, int] = {}
+    if not keys:
+        return removed
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _stale (game_key INTEGER PRIMARY KEY)")
+    conn.execute("DELETE FROM _stale")
+    conn.executemany("INSERT INTO _stale VALUES (?)", [(k,) for k in keys])
+    conn.execute("CREATE TEMP TABLE IF NOT EXISTS _stale_plays"
+                 " (play_id INTEGER PRIMARY KEY)")
+    conn.execute("DELETE FROM _stale_plays")
+    conn.execute("INSERT INTO _stale_plays SELECT play_id FROM plays"
+                 " WHERE game_key IN (SELECT game_key FROM _stale)")
+    for table in _GAME_TABLES_BY_PLAY:
+        if _has_table(conn, table):
+            cur = conn.execute(f"DELETE FROM {table} WHERE play_id IN"
+                               " (SELECT play_id FROM _stale_plays)")
+            removed[table] = cur.rowcount
+    for table in _GAME_TABLES_BY_KEY:
+        if _has_table(conn, table):
+            cur = conn.execute(f"DELETE FROM {table} WHERE game_key IN"
+                               " (SELECT game_key FROM _stale)")
+            removed[table] = cur.rowcount
+    conn.commit()
+    return removed
+
+
 def build(conn, archive, parser_version: str, seasons: list[int] | None = None,
           limit: int | None = None, progress=None,
-          curated_path: Path | None = None) -> DeriveStats:
+          curated_path: Path | None = None,
+          game_keys: list[int] | None = None) -> DeriveStats:
     """Derive every game in the archive into the query database."""
     stats = DeriveStats()
     curated = load_curated(curated_path)
@@ -415,7 +552,8 @@ def build(conn, archive, parser_version: str, seasons: list[int] | None = None,
                 rows.clear()
         conn.commit()
 
-    for span, records, record_ids in iter_archive_games(archive, seasons, limit):
+    for span, records, record_ids in iter_archive_games(archive, seasons, limit,
+                                                        game_keys):
         if progress and span["season"] not in seen_seasons:
             seen_seasons.add(span["season"])
             progress(span["season"], stats)
@@ -425,6 +563,7 @@ def build(conn, archive, parser_version: str, seasons: list[int] | None = None,
         play_id = result["next_play_id"]
 
         game = result["game"]
+        game["source_sha256"] = span["sha256"]
         pending["games"].append(tuple(game[c] for c in _GAME_COLUMNS))
         seq = 0
         for rec in records:

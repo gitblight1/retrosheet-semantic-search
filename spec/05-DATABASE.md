@@ -98,8 +98,14 @@ numbered each duplicate as a second sighting of the game. Every invariant in
 the paragraph above still held: a partition of a doubled corpus is still a
 partition ([07-TESTING](07-TESTING.md) §4).
 
-What stops it is `ingest_file` canonicalising with `Path.resolve()` before
-both the lookup and the insert, so the identity of a file is its location
+`rsse ingest --aux-only` exists for the same incident: `--aux` is additive on
+top of the event pass, so there had been no way to add the auxiliary files
+without re-offering all 2,646 event files. With the path resolved that re-offer
+is now a cheap skip rather than a second corpus, but it still re-hashes 700 MB
+to touch a directory that has nothing to do with it.
+
+What stops the double load is `ingest_file` canonicalising with
+`Path.resolve()` before both the lookup and the insert, so the identity of a file is its location
 rather than the way it was spelled on the command line, and a `sha256`
 uniqueness check in `rsse verify` that is shaped for content rather than
 partitioning. `auxiliary.ingest_file` had the `resolve()` already, having been

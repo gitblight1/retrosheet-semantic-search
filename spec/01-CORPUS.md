@@ -161,10 +161,16 @@ never revised by a later stage; a re-parse rebuilds every downstream table from
 `raw_records` without re-reading the source files.
 
 **Immutability.** Source files are opened read-only. The loader records for each
-file: absolute path, byte length, SHA-256, mtime, and line-ending style. A
+file: **resolved** path, byte length, SHA-256, mtime, and line-ending style. A
 re-ingest whose digest differs from the stored one MUST fail loudly rather than
 silently mixing corpus vintages — Retrosheet reissues corrected files, and a
 half-updated corpus produces answers that are wrong in an undetectable way.
+`ingest --refresh` is the way to consent to the replacement (§5.3); nothing
+else may proceed past the digest.
+
+The path is resolved rather than stored as typed because the uniqueness
+constraint is on the string: two spellings of one file are two files, and that
+once loaded a second complete copy of the corpus (spec/05-DATABASE.md §1.1).
 
 ## 5. Coverage and provenance
 
@@ -199,28 +205,53 @@ one whose digest differs rather than mixing vintages silently. So local change
 detection is already per-file and already cheap — a re-ingest over an unchanged
 corpus reads and hashes, but writes nothing.
 
-**What is missing**, and is required before the corpus is refreshed in anger:
+**Upstream change detection.** `rsse fetch --refresh` sends the stored `ETag`
+and `Last-Modified` as `If-None-Match`/`If-Modified-Since`; a `304` ends the
+request with no body transferred. The validators live in a sidecar
+`.fetch-state.json` beside the season archives rather than in the corpus
+database, because `fetch` runs before any database exists and what it is
+tracking is the state of a directory of zip files.
 
-1. **Upstream change detection without a full download.** The fetcher pulls a
-   season archive unconditionally. It should issue a conditional request
-   (`If-Modified-Since` / `If-None-Match`) against the stored `mtime`/ETag and
-   skip unchanged seasons on a `304`. This matters twice over: Retrosheet is a
-   volunteer nonprofit, and an unconditional refresh of 118 archives is what
-   got this host rate-limited during the first build.
-2. **A refresh path that re-imports only what changed.** Today a changed file
-   is fatal and the remedy is a full rebuild — correct but far too blunt, since
-   a typical correction touches a handful of files. `ingest --refresh` should
-   delete the affected file's records and spans, reload just that file, and
-   record the supersession, leaving the other 2,645 files untouched.
-3. **A record of what changed.** A corrected file may change results a
-   published answer depended on. The supersession should be retained — old
-   digest, new digest, date, record counts — so that "this answer changed
-   because Retrosheet corrected the 1957 Braves file" is a question the
-   database can answer.
+It is **not** the default. Checking all 118 seasons is 118 requests against a
+volunteer-run nonprofit that stopped answering this project once already
+(BUILD-LOG §3.3), so a present archive is still taken as current unless the
+question is asked explicitly. Two smaller consequences of the same principle:
+a 4xx other than 408/429 now fails after one request instead of being retried
+four times with exponential backoff, and the digest of the body — not the
+server's validators — decides whether anything actually changed, so a server
+that declines to answer `304` costs bytes but disturbs nothing downstream.
 
-Until (2) exists, a correction means a rebuild: ~11 minutes for the archive.
-That is tolerable precisely because it is rare, which is also why this is
-recorded as a requirement rather than built speculatively.
+**Refreshing only what changed.** `rsse ingest --refresh` replaces exactly the
+reissued file's records, spans and `source_files` row. The freed `record_id`s
+are not reclaimed and the replacement records are appended, which leaves a hole
+in `record_id` space — deliberate, and the reason `rsse verify` counts gaps but
+does not fail on them. The invariant that matters is that the spans tile the
+records that exist and do not overlap, not that the integers run consecutively;
+renumbering to close the hole would rewrite every row after the deleted file to
+buy nothing.
+
+**Refreshing the derived layer.** `rsse derive --refresh` rebuilds only the
+games the two databases disagree about. Agreement is decided on **content**:
+each derived game records the `sha256` of the file it came from
+(`games.source_sha256`), and a game agrees when its key and that digest both
+match the archive.
+
+This has to be content and not identity, which is not obvious and was got wrong
+first. `game_spans.game_key` and `raw_records.record_id` are plain `INTEGER
+PRIMARY KEY`s, so deleting a reissued file's rows frees those rowids and the
+replacement takes them straight back — measured, a refreshed two-game file came
+back as keys 1 and 2, exactly as before. A reconciler comparing key sets
+reported nothing stale and nothing missing, and would have left the derived
+layer serving the superseded vintage with every check green: the precise
+outcome the digest refusal exists to prevent.
+
+**A record of what changed.** Every refresh writes a `file_revisions` row —
+path, old digest, new digest, timestamp, record counts either side, games
+replaced — inside the same transaction as the replacement records, so the
+corpus can never hold one without the other. `rsse verify` prints them
+whenever there are any. A corpus that has been refreshed is not the corpus that
+was first ingested, and that is exactly the fact a published answer may need to
+be re-checked against.
 
 ### 5.4 Retrosheet game ids are not unique
 

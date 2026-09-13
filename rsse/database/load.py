@@ -32,9 +32,14 @@ class IngestStats:
     games: int = 0
     plays: int = 0
     skipped_files: int = 0
+    refreshed_files: int = 0
     parse_failures: list[tuple[str, str, str]] = field(default_factory=list)
     roundtrip_failures: list[tuple[str, str, str]] = field(default_factory=list)
     repeated_game_ids: list[tuple[str, int, int]] = field(default_factory=list)
+    #: `(path, old digest, new digest, game_keys removed)` per refreshed file.
+    #: The game keys matter downstream: they are what the derived layer has to
+    #: forget, and after a refresh they no longer exist in `game_spans`.
+    refreshed: list[tuple[str, str, str, list[int]]] = field(default_factory=list)
 
     def summary(self) -> str:
         return (
@@ -81,12 +86,38 @@ def open_corpus(conn, rsse_version: str, parser_version: str, notes: str = "") -
     return cur.lastrowid
 
 
+def _forget_file(conn, file_id: int) -> list[int]:
+    """Remove one file's records and spans. Returns the game keys dropped.
+
+    The deleted `record_id`s are *not* reclaimed and the replacement records
+    are appended at the end, which leaves a hole in `record_id` space. That is
+    deliberate and is why `rsse verify` counts gaps but does not fail on them:
+    the invariant that matters is that the spans tile the records that exist
+    and do not overlap, not that the integers run consecutively. Renumbering
+    to close the hole would rewrite every row after the deleted file -- up to
+    31 million of them -- to buy nothing.
+    """
+    keys = [r[0] for r in conn.execute(
+        "SELECT game_key FROM game_spans WHERE file_id = ?", (file_id,))]
+    conn.execute("DELETE FROM raw_records WHERE file_id = ?", (file_id,))
+    conn.execute("DELETE FROM game_spans WHERE file_id = ?", (file_id,))
+    conn.execute("DELETE FROM source_files WHERE file_id = ?", (file_id,))
+    return keys
+
+
 def ingest_file(conn, corpus_id: int, path: Path, stats: IngestStats,
-                verify: bool = True) -> bool:
+                verify: bool = True, refresh: bool = False) -> bool:
     """Load one event file in a single transaction.
 
-    Returns False if the file was already present and unchanged. Raises
-    CorpusChanged if it is present but different.
+    Returns False if the file was already present and unchanged. A file that
+    is present but *different* means Retrosheet has reissued it, and mixing
+    vintages within one corpus is wrong in a way nothing downstream detects --
+    so by default this raises `CorpusChanged` rather than guessing.
+
+    `refresh` is the way to say yes. It replaces exactly that file's records,
+    spans and `source_files` row, leaving the rest of the corpus untouched,
+    and records the game keys it dropped in `stats.refreshed` so the derived
+    layer can be brought back into agreement without a full rebuild.
     """
     # Resolved, not as given. `UNIQUE (corpus_id, path)` only prevents a
     # double load if the same file yields the same string, and it does not:
@@ -103,15 +134,34 @@ def ingest_file(conn, corpus_id: int, path: Path, stats: IngestStats,
         "SELECT file_id, sha256 FROM source_files WHERE corpus_id = ? AND path = ?",
         (corpus_id, canonical),
     ).fetchone()
+    dropped: list[int] = []
+    revision: tuple | None = None
     if existing:
         if existing[1] == digest:
             stats.skipped_files += 1
             return False
-        raise CorpusChanged(
-            f"{path}: digest changed since ingest "
-            f"({existing[1][:12]} -> {digest[:12]}). Retrosheet has reissued "
-            f"this file. Rebuild the corpus rather than mixing vintages."
-        )
+        if not refresh:
+            raise CorpusChanged(
+                f"{path}: digest changed since ingest "
+                f"({existing[1][:12]} -> {digest[:12]}). Retrosheet has "
+                f"reissued this file. Re-ingest it with `rsse ingest "
+                f"--refresh`, or rebuild, rather than mixing vintages."
+            )
+        old_records = conn.execute(
+            "SELECT record_count FROM source_files WHERE file_id = ?",
+            (existing[0],)).fetchone()[0]
+        conn.execute("BEGIN")
+        dropped = _forget_file(conn, existing[0])
+        conn.commit()
+        stats.refreshed_files += 1
+        stats.refreshed.append((str(path), existing[1], digest, dropped))
+        # Retained, not just reported. A corrected file may change an answer
+        # someone has already published, and "this changed because Retrosheet
+        # reissued the 1957 Braves file" is a question the database should be
+        # able to answer on its own (spec/01-CORPUS.md §5.3).
+        revision = (corpus_id, canonical, existing[1], digest,
+                    datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                    old_records, len(dropped))
 
     rows: list[tuple] = []
     spans: list[tuple] = []
@@ -164,6 +214,14 @@ def ingest_file(conn, corpus_id: int, path: Path, stats: IngestStats,
             "UPDATE source_files SET record_count = ? WHERE file_id = ?",
             (n_records, file_id),
         )
+        if revision is not None:
+            # Written inside the same transaction as the replacement records,
+            # so the corpus can never hold one without the other.
+            conn.execute(
+                "INSERT INTO file_revisions (corpus_id, path, old_sha256,"
+                " new_sha256, replaced_at, old_record_count, new_record_count,"
+                " games_replaced) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                revision[:5] + (revision[5], n_records, revision[6]))
         conn.commit()
     except Exception:
         # Roll the whole file back: a partially loaded game is worse than none.
@@ -230,10 +288,11 @@ def _season(path: Path) -> int | None:
 
 
 def ingest(conn, paths: Iterable[Path], corpus_id: int, verify: bool = True,
-           progress=None) -> IngestStats:
+           progress=None, refresh: bool = False) -> IngestStats:
     stats = IngestStats()
     for path in paths:
-        loaded = ingest_file(conn, corpus_id, path, stats, verify=verify)
+        loaded = ingest_file(conn, corpus_id, path, stats, verify=verify,
+                             refresh=refresh)
         if progress:
             progress(path, loaded, stats)
     return stats

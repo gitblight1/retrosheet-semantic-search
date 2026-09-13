@@ -93,6 +93,21 @@ CREATE TABLE IF NOT EXISTS game_spans (
 -- exactly as they are: `source_files` keeps meaning "a file of game records",
 -- and the two new checks below are of the same shape rather than weakened
 -- versions of the old ones (spec/05-DATABASE.md §1.2).
+CREATE TABLE IF NOT EXISTS file_revisions (
+  revision_id       INTEGER PRIMARY KEY,
+  corpus_id         INTEGER NOT NULL REFERENCES corpus,
+  path              TEXT NOT NULL,
+  old_sha256        TEXT NOT NULL,
+  new_sha256        TEXT NOT NULL,
+  replaced_at       TEXT NOT NULL,
+  old_record_count  INTEGER NOT NULL,
+  new_record_count  INTEGER NOT NULL,
+  games_replaced    INTEGER NOT NULL
+);
+
+CREATE INDEX IF NOT EXISTS ix_revisions_path
+  ON file_revisions (path, replaced_at);
+
 CREATE TABLE IF NOT EXISTS aux_files (
   aux_file_id   INTEGER PRIMARY KEY,
   corpus_id     INTEGER NOT NULL REFERENCES corpus,
@@ -197,6 +212,13 @@ CREATE TABLE IF NOT EXISTS games (
   final_away         INTEGER,
   plays              INTEGER NOT NULL DEFAULT 0,
   parse_status       TEXT NOT NULL DEFAULT 'ok',
+  -- The digest of the source file this game was derived from, carried over
+  -- from `source_files.sha256`. It is what `derive --refresh` compares, and
+  -- it has to be content rather than an identifier: `game_spans.game_key` and
+  -- `raw_records.record_id` are both plain INTEGER PRIMARY KEYs, so deleting
+  -- a file's rows and re-inserting them hands back the *same* numbers. A
+  -- reissued file compared by key looks identical to the file it replaced.
+  source_sha256      TEXT,
   UNIQUE (game_id, occurrence)
 );
 

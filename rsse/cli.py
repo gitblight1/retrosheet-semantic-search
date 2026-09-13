@@ -22,6 +22,7 @@ from .database import load as dbload
 from .database import schema as dbschema
 from .parser.parser import ParseError, parse
 from .parser.records import detect_line_ending, iter_plays
+from .util import download
 from .util.download import available_years, fetch_season
 
 VERSION = "0.1.0"
@@ -73,17 +74,50 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         years = [y for y in years if y >= args.since]
     if args.until:
         years = [y for y in years if y <= args.until]
-    print(f"fetching {len(years)} seasons ({years[0]}-{years[-1]}) into {EVENTS}")
-    ok = 0
-    for year in years:
-        if (EVENTS / str(year)).exists() and not args.force:
-            ok += 1
-            continue
-        if fetch_season(year, EVENTS):
-            ok += 1
-            print(f"  {year} ok", flush=True)
-    print(f"done: {ok}/{len(years)} seasons available")
-    return 0 if ok == len(years) else 1
+    refresh = getattr(args, "refresh", False)
+    verb = "checking" if refresh else "fetching"
+    print(f"{verb} {len(years)} seasons ({years[0]}-{years[-1]}) into {EVENTS}")
+    if refresh:
+        # Said before the requests start, not after: this is 118 requests at
+        # the deliberate 5s delay, against a volunteer-run server that has
+        # stopped answering this project once already.
+        print(f"  {len(years)} conditional requests, "
+              f"~{len(years) * download.DELAY_SECONDS / 60:.0f} min", flush=True)
+
+    state = download.load_state(EVENTS) if refresh else None
+    counts: collections.Counter[str] = collections.Counter()
+    changed_files: list[Path] = []
+    try:
+        for year in years:
+            if (EVENTS / str(year)).exists() and not args.force and not refresh:
+                counts["present"] += 1
+                continue
+            got = fetch_season(year, EVENTS, refresh=refresh, state=state)
+            counts[got.status] += 1
+            changed_files.extend(got.changed_files)
+            if got.status == "changed":
+                print(f"  {year} CHANGED: {len(got.changed_files)} files",
+                      flush=True)
+            elif got.status == "downloaded":
+                print(f"  {year} ok", flush=True)
+    finally:
+        # Saved even if the run is interrupted: the validators already
+        # collected are what make the *next* refresh cheap, and throwing them
+        # away would mean re-requesting every season in full.
+        if state is not None:
+            download.save_state(EVENTS, state)
+
+    for status in ("present", "downloaded", "unchanged", "changed", "failed"):
+        if counts[status]:
+            print(f"{status:12s} {counts[status]}")
+    if changed_files:
+        print(f"\n{len(changed_files)} files reissued by Retrosheet:")
+        for path in changed_files[: args.top or 20]:
+            print(f"  {path}")
+        print("\nThe archive still holds the previous vintage. Load the new"
+              " one with `rsse ingest --refresh`, which replaces exactly these"
+              " files' records and leaves the rest of the corpus untouched.")
+    return 0 if not counts["failed"] else 1
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -209,10 +243,17 @@ def cmd_ingest(args: argparse.Namespace) -> int:
                else DATA / "database" / ARCHIVE_DEFAULT)
     db_path.parent.mkdir(parents=True, exist_ok=True)
 
-    files = dbload.event_files(root)
+    # `--aux-only` exists because `--aux` is additive on top of this pass, and
+    # adding rosters and parks to an archive should not mean re-offering 2,646
+    # event files. It did once, under a different path spelling, and loaded a
+    # second complete copy of the corpus (spec/05-DATABASE.md §1.1). Resolving
+    # the path made that re-offer a cheap skip rather than a hazard, so this
+    # flag is now about not re-hashing 700 MB to touch a different directory.
+    aux_only = getattr(args, "aux_only", False)
+    files = [] if aux_only else dbload.event_files(root)
     if args.limit:
         files = files[: args.limit]
-    if not files:
+    if not files and not aux_only:
         print(f"no event files under {root}; run `rsse fetch` first", file=sys.stderr)
         return 2
 
@@ -233,13 +274,14 @@ def cmd_ingest(args: argparse.Namespace) -> int:
 
     try:
         stats = dbload.ingest(conn, files, corpus_id, verify=not args.no_verify,
-                              progress=progress)
+                              progress=progress,
+                              refresh=getattr(args, "refresh", False))
     except dbload.CorpusChanged as exc:
         print(f"\nCORPUS CHANGED: {exc}", file=sys.stderr)
         return 3
 
     aux_stats = None
-    if args.aux:
+    if args.aux or aux_only:
         # Rosters, team files, ballparks and biographies: the same archive,
         # its own tables, because a record belonging to no game cannot live in
         # one partitioned by game (spec/05-DATABASE.md §1.2).
@@ -272,7 +314,28 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         for path, why in aux_stats.roundtrip_failures[: args.top or 5]:
             print(f"  ROUND-TRIP FAILED  {why}", file=sys.stderr)
 
+    if aux_only:
+        size = db_path.stat().st_size
+        print(f"archive               {db_path} ({size / 1e9:.2f} GB)")
+        conn.close()
+        print(f"\n{ATTRIBUTION}")
+        return 0 if not (aux_stats and aux_stats.roundtrip_failures) else 1
+
     print(stats.summary())
+    if stats.refreshed:
+        total = sum(len(keys) for *_r, keys in stats.refreshed)
+        print(f"refreshed files       {len(stats.refreshed)}"
+              f"  ({total:,} games replaced)")
+        for path, old_digest, new_digest, keys in stats.refreshed[: args.top or 20]:
+            print(f"  {Path(path).name}  {old_digest[:12]} -> {new_digest[:12]}"
+                  f"  {len(keys)} games")
+        # The derived database still holds rows for game keys that no longer
+        # exist in the archive. Naming the command is the whole point: saying
+        # only "the derived tables are stale" is the half-answer that has sent
+        # a user to run the wrong pass twice (BUILD-LOG §3.32, §3.40).
+        print("\nThe derived database is now behind the archive. Bring it back"
+              " into agreement with `rsse derive --refresh`, which rebuilds"
+              " only the affected games.")
     known = load_known_defects()
     unexplained = [f for f in stats.parse_failures if f[1] not in known]
     if stats.parse_failures:
@@ -374,6 +437,22 @@ def cmd_verify(args: argparse.Namespace) -> int:
             " (SELECT sha256 FROM source_files GROUP BY corpus_id, sha256"
             "  HAVING count(*) > 1 LIMIT 1)").fetchone()[0]
         failures.append(f"{same} files ingested more than once, e.g. {example}")
+
+    has_revisions = conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'file_revisions'").fetchone()[0]
+    if has_revisions:
+        revisions = conn.execute(
+            "SELECT path, old_sha256, new_sha256, replaced_at, games_replaced"
+            " FROM file_revisions ORDER BY replaced_at DESC").fetchall()
+        # Printed whenever there are any: a corpus that has been refreshed is
+        # not the corpus that was first ingested, and that is exactly the fact
+        # a published answer may need to be re-checked against.
+        if revisions:
+            print(f"files reissued       {len(revisions)}")
+            for path, old_sha, new_sha, when, games in revisions[:10]:
+                print(f"  {Path(path).name}  {old_sha[:8]} -> {new_sha[:8]}"
+                      f"  {when}  {games} games")
 
     # --- auxiliary records: the same two shapes, asserted separately.
     # Kept apart from the checks above on purpose. `source_files` and
@@ -1548,13 +1627,25 @@ def cmd_replay(args: argparse.Namespace) -> int:
 #: replaces the file, so each of these is destroyed with it and has to be
 #: named before that happens -- `coverage` included, which was missing from
 #: this list and is the reason it silently vanished from the database.
-NON_DERIVED_TABLES = ("comments", "lineup_entries", "earned_runs", "coverage",
-                      "people", "roster_entries", "teams", "franchises",
-                      "parks")
+#: Kept as table -> the command that rebuilds it, because naming the table
+#: without naming its command is the half-answer that sent a user to run the
+#: wrong pass: every casualty used to be reported as "rebuild it with `rsse
+#: secondary`", which is true of two of the nine.
+NON_DERIVED_TABLES = {
+    "comments": "rsse secondary",
+    "lineup_entries": "rsse secondary",
+    "earned_runs": "rsse earned-runs --check",
+    "coverage": "rsse coverage --rebuild",
+    "people": "rsse reference",
+    "roster_entries": "rsse reference",
+    "teams": "rsse reference",
+    "franchises": "rsse reference",
+    "parks": "rsse reference",
+}
 
 
-def _non_derived_tables(path: Path) -> list[tuple[str, int]]:
-    """`(table, row count)` for non-derived tables present and non-empty."""
+def _non_derived_tables(path: Path) -> list[tuple[str, int, str]]:
+    """`(table, row count, rebuild command)` for those present and non-empty."""
     try:
         conn = dbschema.connect(f"file:{path}?mode=ro")
     except Exception:
@@ -1567,12 +1658,96 @@ def _non_derived_tables(path: Path) -> list[tuple[str, int]]:
             if table in present:
                 rows = conn.execute(f"SELECT count(*) FROM {table}").fetchone()[0]
                 if rows:
-                    found.append((table, rows))
+                    found.append((table, rows, NON_DERIVED_TABLES[table]))
     except Exception:
         return found
     finally:
         conn.close()
     return found
+
+
+def _derive_refresh(args: argparse.Namespace, archive_path: Path,
+                    query_path: Path) -> int:
+    """Bring the derived database back into agreement with the archive.
+
+    Agreement is defined by comparing the two sets of game keys, not by
+    anything remembered between runs: a file re-ingested with `ingest
+    --refresh` loses its old `game_spans` rows and gains new ones with new
+    keys, so its games appear here as stale keys to forget and missing keys to
+    build. Nothing else in the corpus is touched.
+
+    This is the half that makes `--refresh` worth having. Re-ingesting one
+    reissued file takes seconds; without a targeted derive it still cost a
+    79-minute rebuild, which is why the two halves had to be designed
+    together.
+    """
+    from .database import derived
+
+    if not query_path.exists():
+        print(f"no derived database at {query_path}; run `rsse derive` first",
+              file=sys.stderr)
+        return 2
+    conn = dbschema.connect(str(query_path))
+    for pragma in dbschema.LOAD_PRAGMAS:
+        conn.execute(pragma)
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+
+    try:
+        stale, missing = derived.stale_and_missing(conn, archive)
+    except derived.NoSourceDigests:
+        if not getattr(args, "adopt", False):
+            print(
+                "this derived database has no recorded source digests, so"
+                " there is nothing to compare the archive against. It was"
+                " built before `games.source_sha256` existed.\n\n"
+                "  rsse derive --rebuild            rebuilds from the archive"
+                " (~80 min, always correct)\n"
+                "  rsse derive --refresh --adopt    records the archive's"
+                " current digests as this database's vintage (seconds)\n\n"
+                "`--adopt` asserts that the derived tables already agree with"
+                " the archive. That is true of a database built from it and"
+                " not since re-ingested; it is false, silently, of one built"
+                " from an earlier vintage of any file.",
+                file=sys.stderr)
+            return 2
+        adopted = derived.adopt_digests(conn, archive)
+        print(f"adopted source digests for {adopted:,} games")
+        stale, missing = derived.stale_and_missing(conn, archive)
+    print(f"stale games          {len(stale):,}  (in the derived db, not the archive)")
+    print(f"missing games        {len(missing):,}  (in the archive, not derived)")
+    if not stale and not missing:
+        print("\nalready in agreement; nothing to do")
+        return 0
+
+    if stale:
+        removed = derived.forget_games(conn, stale)
+        for table, rows in removed.items():
+            if rows:
+                print(f"  forgot {table:18s} {rows:,}")
+
+    stats = None
+    if missing:
+        started = time.time()
+        stats = derived.build(conn, archive, PARSER_VERSION,
+                              game_keys=missing)
+        print(f"  derived {stats.games:,} games, {stats.plays:,} plays"
+              f" in {time.time() - started:.1f}s")
+    dbschema.create_derived_indexes(conn)
+    conn.commit()
+
+    # `secondary` and `earned-runs` own rows that were deleted with the games
+    # above; `reference` and `coverage` are computed from the whole corpus.
+    # Naming each pass is the point -- "the derived tables are stale" is the
+    # half-answer that has sent a user to run the wrong command twice.
+    if stale or missing:
+        print("\nrebuild what depends on these games:")
+        print("  rsse secondary                 (full pass, ~3 min)")
+        print("  rsse earned-runs --check       (--season limits it)")
+        print("  rsse reference")
+        print("  rsse coverage --rebuild")
+    conn.close()
+    print(f"\n{ATTRIBUTION}")
+    return 0
 
 
 def cmd_derive(args: argparse.Namespace) -> int:
@@ -1593,6 +1768,9 @@ def cmd_derive(args: argparse.Namespace) -> int:
         print(f"no archive at {archive_path}; run `rsse ingest` first",
               file=sys.stderr)
         return 2
+
+    if getattr(args, "refresh", False):
+        return _derive_refresh(args, archive_path, query_path)
 
     query_path.parent.mkdir(parents=True, exist_ok=True)
     if args.rebuild and query_path.exists() and not args.keep_file:
@@ -1615,9 +1793,15 @@ def cmd_derive(args: argparse.Namespace) -> int:
         for suffix in ("", "-wal", "-shm"):
             sibling = query_path.with_name(query_path.name + suffix)
             sibling.unlink(missing_ok=True)
-        for table, rows in casualties:
+        for table, rows, command in casualties:
             print(f"note: dropped {table} ({rows:,} rows) with the file; "
-                  f"rebuild it with `rsse secondary`", file=sys.stderr)
+                  f"rebuild it with `{command}`", file=sys.stderr)
+        if casualties:
+            order = []
+            for _t, _r, command in casualties:
+                if command not in order:
+                    order.append(command)
+            print("note: in order -- " + ", ".join(order), file=sys.stderr)
     conn = dbschema.connect(str(query_path))
     for pragma in dbschema.LOAD_PRAGMAS:
         conn.execute(pragma)
@@ -1871,6 +2055,10 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--since", type=int)
     f.add_argument("--until", type=int)
     f.add_argument("--force", action="store_true")
+    f.add_argument("--refresh", action="store_true",
+                   help="ask the server whether each season archive has been"
+                        " reissued (one conditional request per season)")
+    f.add_argument("--top", type=int, default=20)
     f.set_defaults(func=cmd_fetch)
 
     s = sub.add_parser("sweep", help="parse every event string in the corpus")
@@ -1894,6 +2082,12 @@ def main(argv: list[str] | None = None) -> int:
     i.add_argument("--no-index", action="store_true")
     i.add_argument("--aux", action="store_true",
                    help="also archive rosters, team files, parks and bios")
+    i.add_argument("--aux-only", action="store_true",
+                   help="archive only the auxiliary files, skipping the"
+                        " event-file pass entirely")
+    i.add_argument("--refresh", action="store_true",
+                   help="replace the records of files Retrosheet has reissued"
+                        " instead of refusing (see `rsse fetch --refresh`)")
     i.add_argument("--parks", help="directory holding the whole-corpus"
                    " auxiliary files (default data/parks)")
     i.set_defaults(func=cmd_ingest)
@@ -1913,6 +2107,12 @@ def main(argv: list[str] | None = None) -> int:
                    help="sample N seasons spread across the corpus")
     d.add_argument("--season", help="explicit season(s), comma separated")
     d.add_argument("--limit", type=int, help="first N games")
+    d.add_argument("--adopt", action="store_true",
+                   help="with --refresh, record the archive's current digests"
+                        " as this database's vintage instead of rebuilding")
+    d.add_argument("--refresh", action="store_true",
+                   help="rebuild only the games the archive and the derived"
+                        " database disagree about (see `rsse ingest --refresh`)")
     d.add_argument("--rebuild", action="store_true",
                    help="replace the query database; safe, nothing in it is a "
                         "source of truth")

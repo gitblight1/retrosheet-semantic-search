@@ -5,6 +5,7 @@ goes in must come back out identical, and a file that is already in must not
 go in twice.
 """
 
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -156,3 +157,64 @@ class Discovery(unittest.TestCase):
             (events / "TEAM1998").write_bytes(b"x\r\n")
             found = aux.discover(Path(tmp), Path(tmp) / "none")
         self.assertEqual({s for _k, _p, s in found}, {1998})
+
+class AuxOnlyIngest(unittest.TestCase):
+    """`rsse ingest --aux-only` must not touch the event-file tables.
+
+    `--aux` is additive on top of an unconditional event-file pass, which is
+    how a run meant to add rosters and parks came to re-ingest 2,646 event
+    files and -- under a second path spelling -- load a whole second copy of
+    the corpus (spec/05-DATABASE.md §1.1).
+    """
+
+    def setUp(self):
+        import shutil, tempfile
+        self.tmp = Path(tempfile.mkdtemp())
+        events = self.tmp / "events" / "1998"
+        events.mkdir(parents=True)
+        (events / "BOS1998.ROS").write_bytes(
+            b"beckr001,Beck,Rodney,R,R,BOS,P\r\n")
+        shutil.copyfile(
+            Path(__file__).parent / "fixtures" / "TEST2000KCA.EVA",
+            events / "2000KCA.EVA")
+        self.db = self.tmp / "archive.db"
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def run_ingest(self, **over):
+        import argparse
+        from rsse import cli
+        args = argparse.Namespace(
+            path=str(self.tmp / "events"), archive=str(self.db), limit=None,
+            top=5, notes="", progress=False, no_verify=False, no_index=True,
+            aux=False, aux_only=False, parks=str(self.tmp / "parks"))
+        for k, v in over.items():
+            setattr(args, k, v)
+        return cli.cmd_ingest(args)
+
+    def counts(self):
+        conn = sqlite3.connect(str(self.db))
+        try:
+            return tuple(conn.execute(f"SELECT count(*) FROM {t}").fetchone()[0]
+                         for t in ("source_files", "raw_records", "aux_files"))
+        finally:
+            conn.close()
+
+    def test_aux_only_skips_the_event_files(self):
+        self.assertEqual(self.run_ingest(aux_only=True), 0)
+        source_files, raw_records, aux_files = self.counts()
+        self.assertEqual(source_files, 0)
+        self.assertEqual(raw_records, 0)
+        self.assertEqual(aux_files, 1)
+
+    def test_aux_still_ingests_the_event_files(self):
+        self.run_ingest(aux=True)
+        source_files, raw_records, aux_files = self.counts()
+        self.assertEqual(source_files, 1)
+        self.assertGreater(raw_records, 0)
+        self.assertEqual(aux_files, 1)
+
+    def test_aux_only_then_events_gives_one_of_each(self):
+        self.run_ingest(aux_only=True)
+        self.run_ingest(aux=True)
+        self.assertEqual(self.counts()[0], 1)
+        self.assertEqual(self.counts()[2], 1)
