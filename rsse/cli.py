@@ -31,19 +31,71 @@ ARCHIVE_DEFAULT = "archive.db"     # verbatim source records (spec/05 §7)
 QUERY_DEFAULT = "rsse.db"          # derived, queryable tables
 
 ROOT = Path(__file__).resolve().parent.parent
-DATA = ROOT / "data"
-EVENTS = DATA / "events"
-GAMELOGS = DATA / "gamelogs"
-PARKS = DATA / "parks"
-KNOWN_DEFECTS = ROOT / "tests" / "known-source-defects.json"
-ARCHIVE = DATA / "database" / ARCHIVE_DEFAULT
-QUERY_DB = DATA / "database" / QUERY_DEFAULT
+
+#: Shipped inside the package, not beside it: an installed `rsse` has no
+#: `tests/` directory, and a missing defect list would silently turn seven
+#: known-bad source strings into unexplained parse failures.
+KNOWN_DEFECTS = (Path(__file__).resolve().parent / "parser"
+                 / "known-source-defects.json")
+
+
+def _is_source_checkout() -> bool:
+    """True when `rsse` is being run from the repository rather than installed."""
+    return ((ROOT / "pyproject.toml").is_file()
+            and (ROOT / "rsse" / "__init__.py").is_file())
+
+
+def default_data_dir() -> Path:
+    """Where the corpus and the two databases live, absent an explicit choice.
+
+    A checkout keeps them in `<repo>/data`, which is what every spec and every
+    README command line names, and that stays true. An installed `rsse` has no
+    writable directory next to its code: `site-packages` is not one to write 16
+    GB into, and `pipx` replaces that tree wholesale on upgrade, which would
+    take a 90-minute derive with it. So an installed run resolves to the user
+    data directory instead.
+
+    Order: `--data-dir`, then `$RSSE_DATA`, then the checkout, then the
+    platform user data directory.
+    """
+    env = os.environ.get("RSSE_DATA")
+    if env:
+        return Path(env).expanduser()
+    if _is_source_checkout():
+        return ROOT / "data"
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA")
+                    or Path.home() / "AppData" / "Local")
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        xdg = os.environ.get("XDG_DATA_HOME")
+        base = Path(xdg).expanduser() if xdg else Path.home() / ".local" / "share"
+    return base / "rsse"
+
+
+def set_data_dir(path: Path) -> None:
+    """Repoint every default path at `path`, before any command runs."""
+    global DATA, EVENTS, GAMELOGS, PARKS, ARCHIVE, QUERY_DB
+    DATA = Path(path).expanduser()
+    EVENTS = DATA / "events"
+    GAMELOGS = DATA / "gamelogs"
+    PARKS = DATA / "parks"
+    ARCHIVE = DATA / "database" / ARCHIVE_DEFAULT
+    QUERY_DB = DATA / "database" / QUERY_DEFAULT
+
+
+DATA = EVENTS = GAMELOGS = PARKS = ARCHIVE = QUERY_DB = None  # set below
+set_data_dir(default_data_dir())
 
 
 def load_known_defects() -> set[str]:
     """Event strings that are malformed at source (spec/02-GRAMMAR.md §8.1)."""
     if not KNOWN_DEFECTS.exists():
-        return set()
+        raise FileNotFoundError(
+            f"{KNOWN_DEFECTS} is missing. It ships with the package; an "
+            "install without it would report known source defects as "
+            "unexplained parse failures.")
     doc = json.loads(KNOWN_DEFECTS.read_text())
     return {d["event"] for d in doc["defects"]}
 
@@ -2235,10 +2287,20 @@ def _games_in(path: Path):
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(prog="rsse")
+    # --data-dir is accepted both before and after the subcommand, because
+    # `rsse fetch --data-dir X` is what people type. argparse.SUPPRESS on both
+    # copies keeps the subparser's unset default from clobbering a value given
+    # to the top-level parser.
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--data-dir", default=argparse.SUPPRESS,
+                        help="corpus and database root (default"
+                             f" {default_data_dir()}; $RSSE_DATA also sets it)")
+
+    ap = argparse.ArgumentParser(prog="rsse", parents=[common])
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    f = sub.add_parser("fetch", help="download Retrosheet season archives")
+    f = sub.add_parser("fetch", parents=[common],
+                       help="download Retrosheet season archives")
     f.add_argument("--since", type=int)
     f.add_argument("--until", type=int)
     f.add_argument("--force", action="store_true")
@@ -2257,7 +2319,8 @@ def main(argv: list[str] | None = None) -> int:
                    f" files (default {PARKS})")
     f.set_defaults(func=cmd_fetch)
 
-    s = sub.add_parser("sweep", help="parse every event string in the corpus")
+    s = sub.add_parser("sweep", parents=[common],
+                       help="parse every event string in the corpus")
     s.add_argument("--path")
     s.add_argument("--top", type=int, default=25)
     s.add_argument("--by-season", action="store_true")
@@ -2266,8 +2329,9 @@ def main(argv: list[str] | None = None) -> int:
     s.add_argument("--report", help="write a JSON report to this path")
     s.set_defaults(func=cmd_sweep)
 
-    i = sub.add_parser("ingest", help="load the raw layer into SQLite")
-    i.add_argument("--path", help="event-file root (default data/events)")
+    i = sub.add_parser("ingest", parents=[common],
+                       help="load the raw layer into SQLite")
+    i.add_argument("--path", help=f"event-file root (default {EVENTS})")
     i.add_argument("--archive", help="archive database path")
     i.add_argument("--limit", type=int, help="only the first N files")
     i.add_argument("--top", type=int, default=15)
@@ -2288,7 +2352,8 @@ def main(argv: list[str] | None = None) -> int:
                    " auxiliary files (default data/parks)")
     i.set_defaults(func=cmd_ingest)
 
-    r = sub.add_parser("replay", help="replay every game and check the state machine")
+    r = sub.add_parser("replay", parents=[common],
+                       help="replay every game and check the state machine")
     r.add_argument("--path")
     r.add_argument("--limit", type=int)
     r.add_argument("--top", type=int, default=20)
@@ -2296,7 +2361,8 @@ def main(argv: list[str] | None = None) -> int:
     r.add_argument("--report", help="write failing games to this JSON path")
     r.set_defaults(func=cmd_replay)
 
-    d = sub.add_parser("derive", help="build the derived tables from the archive")
+    d = sub.add_parser("derive", parents=[common],
+                       help="build the derived tables from the archive")
     d.add_argument("--archive", help=f"archive path (default {ARCHIVE})")
     d.add_argument("--database", help=f"query database path (default {QUERY_DB})")
     d.add_argument("--seasons", type=int,
@@ -2322,7 +2388,8 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--report", help="write a JSON report to this path")
     d.set_defaults(func=cmd_derive)
 
-    t = sub.add_parser("tags", help="derive tags over the corpus and "
+    t = sub.add_parser("tags", parents=[common],
+                       help="derive tags over the corpus and "
                                     "report a census")
     t.add_argument("--path")
     t.add_argument("--limit", type=int, help="first N event files")
@@ -2334,17 +2401,19 @@ def main(argv: list[str] | None = None) -> int:
     t.add_argument("--report", help="write a JSON census to this path")
     t.set_defaults(func=cmd_tags)
 
-    q = sub.add_parser("query", help="search the derived tables")
+    q = sub.add_parser("query", parents=[common], help="search the derived tables")
     _add_query_flags(q)
     q.add_argument("--format", choices=["table", "json", "csv"],
                    default="table")
     q.set_defaults(func=cmd_query)
 
-    x = sub.add_parser("explain", help="show the SQL and plan for a search")
+    x = sub.add_parser("explain", parents=[common],
+                       help="show the SQL and plan for a search")
     _add_query_flags(x)
     x.set_defaults(func=cmd_explain)
 
-    bn = sub.add_parser("bench", help="run the pinned query benchmarks")
+    bn = sub.add_parser("bench", parents=[common],
+                        help="run the pinned query benchmarks")
     bn.add_argument("--database")
     bn.add_argument("--repeats", type=int, default=3)
     bn.add_argument("--only", help="substring of a benchmark name")
@@ -2352,7 +2421,7 @@ def main(argv: list[str] | None = None) -> int:
     bn.add_argument("--report", help="write a JSON report to this path")
     bn.set_defaults(func=cmd_bench)
 
-    gl = sub.add_parser("gamelogs",
+    gl = sub.add_parser("gamelogs", parents=[common],
                         help="download/load Retrosheet game logs")
     gl.add_argument("--fetch", action="store_true", help="download first")
     gl.add_argument("--dir", help="where the game log files live")
@@ -2360,7 +2429,7 @@ def main(argv: list[str] | None = None) -> int:
     gl.add_argument("--progress", action="store_true")
     gl.set_defaults(func=cmd_gamelogs)
 
-    rc = sub.add_parser("reconcile",
+    rc = sub.add_parser("reconcile", parents=[common],
                         help="check replayed scores against the game logs")
     rc.add_argument("--archive")
     rc.add_argument("--database")
@@ -2372,7 +2441,7 @@ def main(argv: list[str] | None = None) -> int:
     rc.add_argument("--report", help="write a JSON report to this path")
     rc.set_defaults(func=cmd_reconcile)
 
-    ern = sub.add_parser("earned-runs",
+    ern = sub.add_parser("earned-runs", parents=[common],
                          help="derive earned runs from the play-by-play")
     ern.add_argument("--archive")
     ern.add_argument("--database")
@@ -2387,33 +2456,34 @@ def main(argv: list[str] | None = None) -> int:
     ern.add_argument("--report", help="write a JSON report to this path")
     ern.set_defaults(func=cmd_earnedruns)
 
-    rf = sub.add_parser("reference",
+    rf = sub.add_parser("reference", parents=[common],
                         help="build people, rosters, teams and parks")
     rf.add_argument("--archive")
     rf.add_argument("--database")
     rf.set_defaults(func=cmd_reference)
 
-    apc = sub.add_parser("appearances",
+    apc = sub.add_parser("appearances", parents=[common],
                          help="build appearances from allplayers.csv")
     apc.add_argument("--archive")
     apc.add_argument("--database")
     apc.set_defaults(func=cmd_appearances)
 
-    sc = sub.add_parser("secondary",
+    sc = sub.add_parser("secondary", parents=[common],
                         help="build comments and lineup_entries")
     sc.add_argument("--archive")
     sc.add_argument("--database")
     sc.add_argument("--progress", action="store_true")
     sc.set_defaults(func=cmd_secondary)
 
-    cv = sub.add_parser("coverage", help="what the corpus actually covers")
+    cv = sub.add_parser("coverage", parents=[common],
+                        help="what the corpus actually covers")
     cv.add_argument("--database")
     cv.add_argument("--archive")
     cv.add_argument("--rebuild", action="store_true")
     cv.add_argument("--season-range", help="LO,HI inclusive")
     cv.set_defaults(func=cmd_coverage)
 
-    v = sub.add_parser("verify", help="check raw-layer integrity")
+    v = sub.add_parser("verify", parents=[common], help="check raw-layer integrity")
     v.add_argument("--archive")
     v.add_argument("--quick", action="store_true",
                    help="skip rebuilding every auxiliary file from its records")
@@ -2424,6 +2494,8 @@ def main(argv: list[str] | None = None) -> int:
                                    else cmd_verify(a)))
 
     args = ap.parse_args(argv)
+    if getattr(args, "data_dir", None):
+        set_data_dir(Path(args.data_dir))
     try:
         return args.func(args)
     except BrokenPipeError:

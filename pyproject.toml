@@ -14,3 +14,10 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["rsse*"]
+
+# Both files are read at runtime, and a wheel without them is not a smaller
+# install -- it is a different deriver. See rsse/semantic/derive.py:load_curated
+# and rsse.cli:load_known_defects, which now refuse to run without them.
+[tool.setuptools.package-data]
+"rsse.semantic" = ["curated_tags.json"]
+"rsse.parser" = ["known-source-defects.json"]

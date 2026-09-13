@@ -2,10 +2,9 @@
 resolution rules that the grammar spec calls out as ambiguous.
 """
 
-import json
 import unittest
-from pathlib import Path
 
+from rsse.cli import load_known_defects
 from rsse.parser import grammar as G
 from rsse.parser.parser import ParseError, parse
 
@@ -50,13 +49,9 @@ CORPUS_EXAMPLES = [
 
 #: Malformed strings present in the corpus. The grammar must REJECT these --
 #: accepting them would weaken it as a validator (spec/02-GRAMMAR.md §8.1).
-#: Read from the same file the corpus sweep uses, so the two cannot drift.
-KNOWN_SOURCE_DEFECTS = [
-    d["event"]
-    for d in json.loads(
-        (Path(__file__).parent / "known-source-defects.json").read_text()
-    )["defects"]
-]
+#: Read through the same loader the corpus sweep uses, so the two cannot
+#: drift -- not merely the same path, which a move would silently break.
+KNOWN_SOURCE_DEFECTS = sorted(load_known_defects())
 
 
 class RoundTrip(unittest.TestCase):

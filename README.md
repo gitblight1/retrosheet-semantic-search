@@ -268,7 +268,7 @@ python3 -m unittest discover -s tests -t .
 ```
 
 `sweep` exits non-zero on any round-trip failure or any parse failure not
-listed in [tests/known-source-defects.json](tests/known-source-defects.json).
+listed in [rsse/parser/known-source-defects.json](rsse/parser/known-source-defects.json).
 `derive --rebuild` replaces the query database; it warns before removing
 anything `derive` itself does not rebuild.
 

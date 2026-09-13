@@ -172,7 +172,11 @@ def load_curated(path: Path | None = None) -> dict[tuple[str, int], CuratedEntry
     """
     path = path or CURATED_PATH
     if not path.exists():
-        return {}
+        raise FileNotFoundError(
+            f"{path} is missing. The curated set ships with the package; "
+            "returning an empty one instead would make a derive quietly "
+            "disagree with a derive from the source tree, which is exactly "
+            "the difference §8 exists to keep visible.")
     doc = json.loads(path.read_text())
     out: dict[tuple[str, int], CuratedEntry] = {}
     for entry in doc.get("entries", []):
