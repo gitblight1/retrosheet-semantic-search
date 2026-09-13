@@ -265,12 +265,19 @@ The evidence, recorded so a future reader can finish the job:
 
 | Observation | Value |
 |---|---|
-| Years using `U` | 1996, 1997 (1,551 plays); 1994 (9 plays); zero in 1993, 1995, 1998–2025 |
+| Years using `U` | 1996 (696 plays), 1997 (816); 1994 (9); zero in every other season, 1908–2025 |
+| Total | 1,521 plays in **three** seasons of 118 |
 | Error co-occurrence, `U` plays | **21.8%** |
 | Error co-occurrence, `R`-only plays | 1.4% |
 | Error co-occurrence, all other plays | 0.4% |
 | Fielders in `R` groups | 4 and 6 dominate — middle infielders, consistent with the documented relay |
 | Fielders in `U` groups | spread across all nine, with 8, 4, 1, 6 most common |
+
+**Count `U` on `U` followed by a digit, not on the letter.** 1995 holds one
+`UINT` (interference) and the corpus is full of `(UR)` and `(TUR)` earned-run
+markers; a pattern keyed on the letter alone picks those up and reports a
+fourth season that does not exist. This note is here because that is exactly
+the miscount this spec carried until it was checked against the corpus.
 
 The per-play geometry is more telling than the aggregate. In the 1994 plays,
 every one is an error, and the `U` fielder is the one positioned to retrieve a
@@ -474,7 +481,7 @@ above:
    documentation is the starting point; **the corpus is the authority.**
 3. **Era coverage matters more than play count.** 582,006 plays from 1965, 2000
    and 2023 found six gaps. Adding 1908–1961 found three more, and 1994–97
-   found two that no other era contains — `U` exists in exactly four seasons
+   found two that no other era contains — `U` exists in exactly three seasons
    out of 118. A sample drawn by volume rather than by era would have missed
    them.
 4. **The round-trip gate earned its place.** It stayed green at every stage,
