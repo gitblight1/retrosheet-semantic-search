@@ -43,12 +43,14 @@ Python 3.11+, no third-party dependencies.
 ```bash
 git clone <this repo> && cd retrosheet
 python3 -m rsse.cli fetch                 # download the corpus  (~862 MB)
+python3 -m rsse.cli fetch --aux           # Negro Leagues data   (~335 MB)
 python3 -m rsse.cli ingest --progress     # byte-exact archive   (~11 min, 1.9 GB)
 python3 -m rsse.cli derive --progress     # queryable tables     (~90 min, 11.6 GB)
 python3 -m rsse.cli ingest --aux          # rosters/teams/parks  (~10 s)
 python3 -m rsse.cli secondary --progress  # comments + lineups   (~10 min)
 python3 -m rsse.cli earned-runs           # earned runs, derived (~21 min)
 python3 -m rsse.cli reference             # people, teams, parks (~5 s)
+python3 -m rsse.cli appearances           # per-season playing time (~5 s)
 python3 -m rsse.cli coverage --rebuild    # coverage table       (~10 s)
 ```
 
@@ -61,6 +63,12 @@ python3 -m rsse.cli query --triple-play --format json
 python3 -m rsse.cli coverage --season-range 1908,1920
 ```
 
+`fetch --aux` is a second download, and it is not optional. Retrosheet
+packages the Negro Leagues separately, and that archive carries both the
+whole-corpus reference CSVs and the 704 roster files the season archives do
+not ship. Without it, 283 team-seasons have a lineup and no names behind it,
+and `reference` and `appearances` have nothing to read.
+
 `fetch` is throttled and resumable. `derive` reads the **archive**, never the
 event files, so a rebuild reproduces exactly the bytes that were ingested —
 Retrosheet reissues corrected files, and a rebuild that silently picked up new
@@ -70,6 +78,12 @@ If you only want a season or two, every build step takes `--season`:
 
 ```bash
 python3 -m rsse.cli derive --season 2000    # ~1 min instead of ~90
+```
+
+You can install this as a package using `pipx`:
+
+```
+pipx install git+https://github.com/gitblight1/retrosheet-semantic-search.git
 ```
 
 ## Querying
@@ -153,7 +167,7 @@ source of truth, which is what makes it safe to rebuild:
 | `lineup_entries` | 5,537,381 | starters and substitutions, as a timeline |
 | `coverage` | 274 | what the corpus covers, per season and league |
 
-Total 11.6 GB. `rsse verify --derived` runs 21 integrity checks over it,
+Total 11.6 GB. `rsse verify --derived` runs 37 integrity checks over it,
 all passing.
 
 ### Coverage caveats you should know about
@@ -191,11 +205,11 @@ Everything in the build order is built and validated against the full corpus.
 | Archive | 31,115,272 records, 1.94 GB, all raw invariants hold |
 | State machine | 203,285 games, **0** state-inconsistent plays |
 | Ontology | 84 tags, one derivation rule each, a positive **and** a negative case each |
-| Derived tables | 17,891,790 plays, 11.6 GB, **33/33** integrity checks |
+| Derived tables | 17,891,790 plays, 11.6 GB, **37/37** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
 | Earned runs | 1,796,610 derived from the play-by-play; **98.9486%** agree with Retrosheet's own per-run flags |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 327, all passing |
+| Tests | 428, all passing |
 
 **Every replayed score matches the published one.** `rsse reconcile` compares
 `games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
@@ -231,18 +245,20 @@ thing.
 
 ```
 python3 -m rsse.cli fetch                      # download the corpus
+python3 -m rsse.cli fetch --aux                # Negro Leagues rosters + reference CSVs
 python3 -m rsse.cli sweep --by-season --progress   # parse every event string (~10 min)
 python3 -m rsse.cli ingest --progress          # build the archive (~11 min)
+python3 -m rsse.cli ingest --aux               # rosters, teams, parks, bios (~10 s)
 python3 -m rsse.cli verify                     # raw-layer integrity
 python3 -m rsse.cli replay --progress          # replay every game (~15 min)
 python3 -m rsse.cli tags --seasons 12          # era-spread tag census (~20 min)
 python3 -m rsse.cli derive --progress          # derived tables (~90 min)
-python3 -m rsse.cli verify --derived           # derived-table integrity (37 checks)
 python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
 python3 -m rsse.cli earned-runs --check        # derive earned runs, then check them
 python3 -m rsse.cli reference                  # people, rosters, teams, parks
 python3 -m rsse.cli appearances                # allplayers.csv, vs what survives
 python3 -m rsse.cli coverage --rebuild         # coverage table
+python3 -m rsse.cli verify --derived           # derived-table integrity (37 checks)
 python3 -m rsse.cli gamelogs --fetch           # game logs, for score reconciliation
 python3 -m rsse.cli reconcile --explain-er     # replayed scores vs published ones
 python3 -m rsse.cli bench                      # pinned query budgets (~1 min)
@@ -265,7 +281,7 @@ rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary, earned-run,
                  reference, appearances and coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           416 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           428 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

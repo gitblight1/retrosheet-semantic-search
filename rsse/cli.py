@@ -34,6 +34,7 @@ ROOT = Path(__file__).resolve().parent.parent
 DATA = ROOT / "data"
 EVENTS = DATA / "events"
 GAMELOGS = DATA / "gamelogs"
+PARKS = DATA / "parks"
 KNOWN_DEFECTS = ROOT / "tests" / "known-source-defects.json"
 ARCHIVE = DATA / "database" / ARCHIVE_DEFAULT
 QUERY_DB = DATA / "database" / QUERY_DEFAULT
@@ -69,6 +70,11 @@ def _shape(event: str) -> str:
 
 
 def cmd_fetch(args: argparse.Namespace) -> int:
+    aux = getattr(args, "aux", False) or getattr(args, "aux_only", False)
+    parks = Path(args.parks) if getattr(args, "parks", None) else PARKS
+    if getattr(args, "aux_only", False):
+        return _fetch_aux(args, parks)
+
     years = available_years()
     if args.since:
         years = [y for y in years if y >= args.since]
@@ -117,7 +123,45 @@ def cmd_fetch(args: argparse.Namespace) -> int:
         print("\nThe archive still holds the previous vintage. Load the new"
               " one with `rsse ingest --refresh`, which replaces exactly these"
               " files' records and leaves the rest of the corpus untouched.")
-    return 0 if not counts["failed"] else 1
+
+    # After the seasons, not before: the auxiliary archive is one 335 MB
+    # request and the season pass is 118, so a failure here is worth reporting
+    # against a corpus that is already on disk rather than one that is not.
+    rc = _fetch_aux(args, parks) if aux else 0
+    return rc or (0 if not counts["failed"] else 1)
+
+
+def _fetch_aux(args: argparse.Namespace, parks: Path) -> int:
+    """The Negro Leagues archive, for `fetch --aux` and `fetch --aux-only`."""
+    refresh = getattr(args, "refresh", False)
+    state = download.load_state(EVENTS) if refresh else None
+    print(f"{'checking' if refresh else 'fetching'} the Negro Leagues archive"
+          f" into {parks} and {EVENTS / download.NGL_ROSTER_DIR}")
+    if not refresh:
+        print("  one request, ~335 MB", flush=True)
+
+    got = download.fetch_aux(EVENTS, parks, refresh=refresh, state=state)
+    if state is not None:
+        download.save_state(EVENTS, state)
+
+    if not got.ok:
+        return 1
+    print(f"{got.status:12s} {len(got.csvs)} csv, {got.rosters:,} rosters")
+
+    # Counted rather than assumed: an archive that no longer carries one of
+    # these leaves `reference` or `appearances` to fail several steps later,
+    # with nothing pointing back at the download.
+    missing = sorted(set(download.aux_csv_names())
+                     - {p.name.lower() for p in got.csvs})
+    if missing:
+        print(f"  missing from the archive: {', '.join(missing)}",
+              file=sys.stderr)
+        return 1
+    if not got.rosters:
+        print("  no .ROS files in the archive; 283 Negro Leagues team-seasons"
+              " would have a lineup and no names behind it", file=sys.stderr)
+        return 1
+    return 0
 
 
 def cmd_sweep(args: argparse.Namespace) -> int:
@@ -293,7 +337,7 @@ def cmd_ingest(args: argparse.Namespace) -> int:
         # one partitioned by game (spec/05-DATABASE.md §1.2).
         from .database import auxiliary
         aux_files = auxiliary.discover(root, Path(args.parks) if args.parks
-                                       else DATA / "parks")
+                                       else PARKS)
         if not aux_files:
             print(f"no auxiliary files under {root}", file=sys.stderr)
         else:
@@ -723,6 +767,15 @@ REPLAY_CHECKS = [
 #: The second is the shape test, straight off the grammar: `zone
 #: { loc_qualifier }`, so the first character is a digit and an empty string
 #: is not a location but a missing one, which is what NULL is for.
+#:
+#: It is spelled with `substr` and a range rather than a GLOB character class,
+#: because the first version was `GLOB '[!0-9]*'` and **SQLite negates a GLOB
+#: class with `^`, not `!`** -- `!` is read as a literal member of the class.
+#: That check matched every string starting with `!` or a digit, which is to
+#: say every valid location, and it reported all 4,999,462 located plays as
+#: malformed on the first database that had any. A gate nothing has ever seen
+#: fire is a gate that may be inverted, so both of these now have tests that
+#: assert they fire on a broken row *and* stay silent on a good one.
 LOCATION_CHECKS = [
     ("location not in its own modifier list", False,
      "SELECT p.play_id FROM plays p WHERE p.event_location IS NOT NULL"
@@ -730,7 +783,8 @@ LOCATION_CHECKS = [
      "                  WHERE j.value LIKE '%' || p.event_location)"),
     ("location is not zone-shaped", False,
      "SELECT play_id FROM plays WHERE event_location IS NOT NULL"
-     " AND (event_location = '' OR event_location GLOB '[!0-9]*')"),
+     " AND (event_location = ''"
+     "      OR substr(event_location, 1, 1) NOT BETWEEN '0' AND '9')"),
 ]
 
 
@@ -2192,6 +2246,15 @@ def main(argv: list[str] | None = None) -> int:
                    help="ask the server whether each season archive has been"
                         " reissued (one conditional request per season)")
     f.add_argument("--top", type=int, default=20)
+    f.add_argument("--aux", action="store_true",
+                   help="also download the Negro Leagues archive: the"
+                        " whole-corpus CSVs and the 704 roster files the"
+                        " season archives do not ship")
+    f.add_argument("--aux-only", action="store_true",
+                   help="download only the Negro Leagues archive, skipping"
+                        " the season pass entirely")
+    f.add_argument("--parks", help="directory for the whole-corpus auxiliary"
+                   f" files (default {PARKS})")
     f.set_defaults(func=cmd_fetch)
 
     s = sub.add_parser("sweep", help="parse every event string in the corpus")

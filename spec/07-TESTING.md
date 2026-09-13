@@ -713,6 +713,25 @@ Both are skipped, with a note, on a database derived before the column existed.
 That is the same guard the reference, earned-run and replay checks carry: a
 check that cannot run should say so rather than pass.
 
+**The shape check was inverted on its first run, and nothing here caught it.**
+It was written `event_location GLOB '[!0-9]*'`. SQLite negates a GLOB character
+class with `^`, not `!`, so `!` was read as an ordinary member of the class:
+the check matched every string beginning with `!` or a digit — which is every
+*valid* location — and reported all **4,999,462** located plays as malformed
+the first time it met a database that had any.
+
+The bug is a one-character syntax error. What it exposes is a hole in the
+discipline of §4, which has always been about the *class of error a gate is
+shaped for*: nothing here had ever asked whether a gate fires **at all**. Both
+of these had been exercised only against data that passes, so an inverted check
+and a working one were indistinguishable. Every check added from here gets a
+pair of cases — a row it must catch and a row it must let through — and the
+existing location gates now have six of them between them, including the
+literal string `!7` that the broken version let by.
+
+A gate that has never been seen to fail is not a gate. It is a query that
+returns zero.
+
 ## 5. Performance suite
 
 `rsse bench` runs twelve pinned queries against the full corpus, each with a

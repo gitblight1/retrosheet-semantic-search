@@ -219,6 +219,20 @@ query wants them. Every predicate this method builds spells `event_location IS
 NOT NULL` out explicitly even where the equality beside it makes that
 redundant; without the term SQLite will not prove the partial index applies.
 
+Measured on the full corpus, warm:
+
+| | rows | time | plan |
+|---|---|---|---|
+| `.hit_location('7')` | 80,069 | **159 ms** | `SEARCH p USING INDEX ix_plays_location (event_location=?)` |
+| `.hit_location('7*')` | 841,975 | **1.78 s** | `(event_location>? AND event_location<?)` |
+| `.hit_located()` | 4,998,966 | **28.3 s** | `(event_location>?)` |
+
+`.hit_located()` is a **denominator, not a filter**. It selects 28% of the
+corpus, so it is slow for the same reason `.season(1998)` alone is slow —
+there is no such thing as a fast predicate that matches five million rows.
+Combine it with something selective, or use it through `.count()` to get the
+denominator a zone query needs.
+
 This replaced a `LIKE '%pattern%'` over the emitted modifier JSON, which was
 wrong in both directions. It matched the JSON text rather than the location, so
 `'8'` also found every play carrying `/E8`; and a leading wildcard cannot use

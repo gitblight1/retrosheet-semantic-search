@@ -193,3 +193,133 @@ class State(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AuxArchive(unittest.TestCase):
+    """`fetch --aux` (rsse/util/download.py).
+
+    One download with two destinations, so the things worth asserting are
+    where each member lands and what happens when one is absent -- a missing
+    CSV surfaces here or not at all, since `reference` and `appearances` fail
+    several steps later with nothing pointing back at the download.
+    """
+
+    def setUp(self):
+        import shutil, tempfile
+        self.tmp = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        self.events = self.tmp / "events"
+        self.parks = self.tmp / "parks"
+        patch = mock.patch.object(download, "DELAY_SECONDS", 0)
+        patch.start()
+        self.addCleanup(patch.stop)
+
+    def an_ngl_zip(self, **extra: bytes) -> bytes:
+        members = {
+            "biofiles/ballparks.csv": b"PARKID,NAME\nACY01,Inlet Park\n",
+            "biofiles/biofile.csv": b"PLAYERID,LAST\nbellw103,Bell\n",
+            "biofiles/teams.csv": b"TEAM,LEAGUE\nACY,ECL\n",
+            "biofiles/allplayers.csv": b"id,last\nbellw103,Bell\n",
+            "rosters/ACY1916.ROS": b"bellw103,Bell,William\n",
+            "rosters/BAG1922.ROS": b"x,Y,Z\n",
+            "readme.txt": b"ignored\n",
+        }
+        members.update(extra)
+        return a_zip(**members)
+
+    def fetch(self, body: bytes, **kw):
+        with mock.patch("urllib.request.urlopen", serve(body, {})):
+            return download.fetch_aux(self.events, self.parks,
+                                      urls=("http://x/allngldata.zip",), **kw)
+
+    def test_csvs_and_rosters_land_in_their_own_places(self):
+        got = self.fetch(self.an_ngl_zip())
+        self.assertEqual(got.status, "downloaded")
+        self.assertEqual({p.name for p in got.csvs},
+                         {"ballparks.csv", "biofile.csv", "teams.csv",
+                          "allplayers.csv"})
+        self.assertTrue((self.parks / "allplayers.csv").exists())
+        roster_dir = self.events / download.NGL_ROSTER_DIR
+        self.assertEqual(got.rosters, 2)
+        self.assertTrue((roster_dir / "ACY1916.ROS").exists())
+
+    def test_the_archives_directory_layout_is_not_depended_on(self):
+        """Members are matched on basename, so a reshuffle still works."""
+        flat = a_zip(**{"ballparks.csv": b"PARKID\n", "biofile.csv": b"x\n",
+                        "teams.csv": b"x\n", "allplayers.csv": b"x\n",
+                        "ACY1916.ROS": b"x\n"})
+        got = self.fetch(flat)
+        self.assertEqual(len(got.csvs), 4)
+        self.assertEqual(got.rosters, 1)
+
+    def test_nothing_escapes_the_destination(self):
+        got = self.fetch(a_zip(**{"../../evil.csv": b"x\n",
+                                  "ballparks.csv": b"x\n"}))
+        self.assertFalse((self.tmp.parent / "evil.csv").exists())
+        self.assertEqual([p.name for p in got.csvs], ["ballparks.csv"])
+
+    def test_unrelated_members_are_left_alone(self):
+        self.fetch(self.an_ngl_zip())
+        self.assertFalse((self.parks / "readme.txt").exists())
+        self.assertFalse(
+            (self.events / download.NGL_ROSTER_DIR / "readme.txt").exists())
+
+    def test_a_present_archive_costs_no_request(self):
+        self.fetch(self.an_ngl_zip())
+        urlopen = refuse(500, "should not be called")
+        with mock.patch("urllib.request.urlopen", urlopen):
+            got = download.fetch_aux(self.events, self.parks,
+                                     urls=("http://x/allngldata.zip",))
+        self.assertEqual(got.status, "present")
+        self.assertEqual(len(urlopen.calls), 0)
+
+    def test_a_304_reports_unchanged_and_still_extracts(self):
+        self.fetch(self.an_ngl_zip())
+        (self.parks / "ballparks.csv").unlink()
+        with mock.patch("urllib.request.urlopen", refuse(304, "Not Modified")):
+            got = download.fetch_aux(self.events, self.parks, refresh=True,
+                                     state={}, urls=("http://x/a.zip",))
+        self.assertEqual(got.status, "unchanged")
+        self.assertTrue((self.parks / "ballparks.csv").exists(),
+                        "a 304 means the zip on disk is current, not that"
+                        " what it should have placed is present")
+
+    def test_identical_bytes_count_as_unchanged(self):
+        body = self.an_ngl_zip()
+        state: dict = {}
+        with mock.patch("urllib.request.urlopen", serve(body, {})):
+            download.fetch_aux(self.events, self.parks, state=state,
+                               urls=("http://x/a.zip",))
+        with mock.patch("urllib.request.urlopen", serve(body, {})):
+            got = download.fetch_aux(self.events, self.parks, refresh=True,
+                                     state=state, urls=("http://x/a.zip",))
+        self.assertEqual(got.status, "unchanged")
+
+    def test_a_candidate_that_404s_moves_on_to_the_next(self):
+        calls = []
+
+        def urlopen(req, timeout=None):
+            calls.append(req.full_url)
+            if req.full_url.endswith("one.zip"):
+                raise urllib.error.HTTPError(req.full_url, 404, "no", {}, None)
+            return Response(self.an_ngl_zip(), {})
+
+        with mock.patch("urllib.request.urlopen", urlopen):
+            got = download.fetch_aux(self.events, self.parks,
+                                     urls=("http://x/one.zip",
+                                           "http://x/two.zip"))
+        self.assertEqual(got.status, "downloaded")
+        self.assertEqual(got.url, "http://x/two.zip")
+        self.assertEqual(len(calls), 2, "a 404 costs one request, not four")
+
+    def test_every_candidate_failing_is_reported_not_raised(self):
+        with mock.patch("urllib.request.urlopen", refuse(404, "no")):
+            got = download.fetch_aux(self.events, self.parks,
+                                     urls=("http://x/one.zip",))
+        self.assertFalse(got.ok)
+        self.assertEqual(got.status, "failed")
+
+    def test_the_csv_list_is_the_one_the_aux_ingest_reads(self):
+        from rsse.database.auxiliary import WHOLE_CORPUS
+        self.assertEqual(download.aux_csv_names(),
+                         frozenset(n.lower() for n, _ in WHOLE_CORPUS))

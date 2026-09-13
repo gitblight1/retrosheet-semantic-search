@@ -1,7 +1,9 @@
 """Corpus acquisition (spec/01-CORPUS.md §2, §4).
 
-Event archives, and the game logs used to check the replay against numbers
-Retrosheet published independently of the event files.
+Event archives, the game logs used to check the replay against numbers
+Retrosheet published independently of the event files, and the Negro Leagues
+archive that carries the whole-corpus reference CSVs and the 704 roster files
+the season archives do not ship.
 
 Downloads Retrosheet's per-season event archives. Source files are treated as
 immutable: each is recorded with its SHA-256 so a later re-ingest can detect
@@ -123,12 +125,13 @@ def _validators(headers: dict) -> dict:
 
 #: Candidate locations for the game log index, tried in order.
 #:
-#: **Unverified.** retrosheet.org was unreachable from the development machine
-#: when this was written -- DNS resolved and TCP to :443 timed out, while other
-#: hosts connected immediately -- so no path here has been confirmed against
-#: the live site. A list is used rather than a single guess because a wrong
-#: path costs a request and requests are the scarce resource: this project has
-#: already been rate-limited off the server once (BUILD-LOG §3.3).
+#: The first was **verified against the live site on 2026-09-13**: it answers
+#: 200 and carries 173 `gl*.zip` links. It was written blind -- retrosheet.org
+#: was unreachable from the development machine that day, DNS resolving while
+#: TCP to :443 timed out -- and the other two remain unconfirmed guesses, kept
+#: as fallback. A list rather than a single path because a wrong one costs a
+#: request and requests are the scarce resource: this project has already been
+#: rate-limited off the server once (BUILD-LOG §3.3).
 #:
 #: If all of these fail, the game logs can be unzipped into `data/gamelogs/`
 #: by hand and `rsse gamelogs` will load them without any network access.
@@ -218,6 +221,171 @@ def fetch_gamelogs(dest: Path, urls: list[str] | None = None) -> list[Path]:
             print(f"  {name}: corrupt archive, removing", flush=True)
             zip_path.unlink(missing_ok=True)
     return extracted
+
+
+#: The Negro Leagues data archive.
+#:
+#: **Verified against the live site on 2026-09-13**, found from the link on
+#: `www.retrosheet.org/NegroLeagues/downloads.html`: 334,966,934 bytes of
+#: `application/zip`,
+#: answering with both an `ETag` and a `Last-Modified`. That pair is what makes
+#: `--refresh` a real conditional request rather than a 335 MB re-download.
+NGL_ARCHIVE = f"{BASE}/downloads/allngldata.zip"
+
+#: Tried in order, so a moved path can be added without touching the loop. A
+#: wrong entry costs one request, not four -- 404 is not in `_RETRYABLE`.
+NGL_ARCHIVE_CANDIDATES = (NGL_ARCHIVE,)
+
+#: Where the Negro Leagues roster files are extracted.
+#:
+#: A directory of their own rather than the season directories, for a reason
+#: that is not tidiness: `auxiliary.discover()` finds rosters by walking the
+#: events root and takes the season from the *filename*, so placement carries
+#: no meaning -- while `fetch_season` diffs a season directory to report which
+#: files Retrosheet reissued. Extracting 704 rosters into those directories
+#: would put files there that no season archive placed, and the first
+#: `fetch --refresh` would report every one of them as changed.
+NGL_ROSTER_DIR = "ngl-rosters"
+
+
+def aux_csv_names() -> frozenset[str]:
+    """Basenames `ingest --aux` reads, from the one list that defines them.
+
+    Imported rather than restated: a second copy of this list would drift, and
+    the failure would be a file silently not extracted -- which is the shape
+    of bug this project keeps finding (BUILD-LOG §3.25).
+    """
+    from ..database.auxiliary import WHOLE_CORPUS
+    return frozenset(name.lower() for name, _ in WHOLE_CORPUS)
+
+
+@dataclass(frozen=True)
+class FetchedAux:
+    """What one auxiliary fetch did.
+
+    `csvs` and `rosters` are counted from what was *extracted*, not from what
+    the archive was expected to hold: the point of this pass is to find out
+    that something is missing, not to assume it is not.
+    """
+
+    #: present | downloaded | unchanged | changed | failed
+    status: str
+    url: str | None = None
+    csvs: tuple[Path, ...] = ()
+    rosters: int = 0
+
+    @property
+    def ok(self) -> bool:
+        return self.status != "failed"
+
+
+def _extract_aux(zip_path: Path, events_dest: Path,
+                 parks_dest: Path) -> tuple[tuple[Path, ...], int]:
+    """Split the archive between the two places its contents belong.
+
+    Members are matched on basename alone, so the archive's internal layout is
+    not depended on -- and, incidentally, a member named `../../etc/passwd`
+    cannot escape either destination.
+    """
+    wanted = aux_csv_names()
+    roster_dir = events_dest / NGL_ROSTER_DIR
+    parks_dest.mkdir(parents=True, exist_ok=True)
+    roster_dir.mkdir(parents=True, exist_ok=True)
+
+    csvs: list[Path] = []
+    rosters = 0
+    with zipfile.ZipFile(zip_path) as zf:
+        for info in zf.infolist():
+            if info.is_dir():
+                continue
+            name = Path(info.filename).name
+            if name.lower() in wanted:
+                out = parks_dest / name
+            elif name.upper().endswith(".ROS"):
+                out = roster_dir / name
+                rosters += 1
+            else:
+                continue
+            with zf.open(info) as src:
+                out.write_bytes(src.read())
+            if out.parent == parks_dest:
+                csvs.append(out)
+    return tuple(sorted(csvs)), rosters
+
+
+def fetch_aux(events_dest: Path, parks_dest: Path, refresh: bool = False,
+              state: dict | None = None,
+              urls: tuple[str, ...] | None = None) -> FetchedAux:
+    """Download the Negro Leagues archive and place what `ingest --aux` reads.
+
+    One download, two destinations. The archive carries both the whole-corpus
+    CSVs (`ballparks.csv`, `biofile.csv`, `teams.csv`, `allplayers.csv`) and
+    the 704 Negro Leagues roster files that the season archives do not ship --
+    without which 283 team-seasons have a lineup and no names behind it
+    (BUILD-LOG §3.25).
+
+    Conditional on `refresh`, exactly as `fetch_season` is, and for the same
+    reason: this is a 335 MB file against a volunteer-run server, and "is the
+    copy on disk still the published one" should cost one request and no
+    bytes. Skipping on the zip being *present* is what hid a reissue for the
+    season archives until `--refresh` existed.
+    """
+    events_dest.mkdir(parents=True, exist_ok=True)
+    parks_dest.mkdir(parents=True, exist_ok=True)
+    zip_path = parks_dest / "allngldata.zip"
+
+    if zip_path.exists() and not refresh:
+        csvs, rosters = _extract_aux(zip_path, events_dest, parks_dest)
+        return FetchedAux("present", None, csvs, rosters)
+
+    candidates = urls if urls is not None else NGL_ARCHIVE_CANDIDATES
+    conditional = zip_path.exists() and refresh
+    tried: list[str] = []
+    for url in candidates:
+        entry = (state or {}).get(url, {})
+        try:
+            blob, headers = _get(
+                url, with_headers=True,
+                etag=entry.get("etag") if conditional else None,
+                last_modified=entry.get("last_modified") if conditional else None)
+        except NotModified:
+            csvs, rosters = _extract_aux(zip_path, events_dest, parks_dest)
+            return FetchedAux("unchanged", url, csvs, rosters)
+        except Exception as exc:  # noqa: BLE001 - reported below
+            tried.append(f"{url}: {exc}")
+            time.sleep(DELAY_SECONDS)
+            continue
+
+        if conditional and _digest_bytes(blob) == entry.get("sha256"):
+            status = "unchanged"
+        else:
+            status = "changed" if conditional else "downloaded"
+
+        tmp = zip_path.with_suffix(".zip.part")
+        tmp.write_bytes(blob)
+        tmp.replace(zip_path)
+        if state is not None:
+            state[url] = {"sha256": _digest_bytes(blob),
+                          "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                      time.gmtime()),
+                          **_validators(headers)}
+        time.sleep(DELAY_SECONDS)
+
+        try:
+            csvs, rosters = _extract_aux(zip_path, events_dest, parks_dest)
+        except zipfile.BadZipFile:
+            print(f"  {url}: corrupt archive, removing", flush=True)
+            zip_path.unlink(missing_ok=True)
+            return FetchedAux("failed", url)
+        return FetchedAux(status, url, csvs, rosters)
+
+    print("could not download the Negro Leagues archive. Tried:\n  "
+          + "\n  ".join(tried)
+          + "\nDownload allngldata.zip by hand, then unzip its CSVs into"
+            f" {parks_dest}/ and its .ROS files into"
+            f" {events_dest / NGL_ROSTER_DIR}/;"
+            " `rsse ingest --aux` needs no network access.", flush=True)
+    return FetchedAux("failed", None)
 
 
 def available_years() -> list[int]:

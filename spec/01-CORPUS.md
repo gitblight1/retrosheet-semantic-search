@@ -42,11 +42,16 @@ part of byte-exact round-trip (§6 of [02-GRAMMAR](02-GRAMMAR.md)).
 |---|---|---|
 | `TEAMYYYY` | team code → league, city, nickname for that season | yes |
 | `*.ROS` | per-team roster: player id, name, bats, throws, team, position | yes |
-| `parkcode.txt` | ballpark id → name, city, dates | yes |
+| `parkcode.txt` | ballpark id → name, city, dates | no |
 
 Rosters supply the batting/throwing handedness that `badj` and `padj` records
 override. Without them those records cannot be interpreted, so roster load is a
 hard prerequisite, not an enrichment.
+
+`parkcode.txt` is **deliberately not ingested** ([05-DATABASE §8.1](05-DATABASE.md)).
+It carries the same nine columns as `ballparks.csv` (§2.4) and contributes no
+park id that file lacks — 113 of the corpus's 292 sites against 285, a strict
+subset rather than a second source.
 
 ### 2.3 Player ids
 
@@ -56,6 +61,32 @@ appearing in or after 1983; from `101`, players who finished before 1983.
 Example: `joner002` is Ruppert Jones.
 
 Ids are opaque keys. RSSE MUST NOT parse meaning out of them.
+
+### 2.4 The Negro Leagues archive
+
+The season archives ship `.ROS` files for the Major Leagues only. Retrosheet
+packages the Negro Leagues separately, as `allngldata.zip`, and that archive
+carries two things the corpus cannot be built without:
+
+| From `allngldata.zip` | Goes to | Read by |
+|---|---|---|
+| `ballparks.csv`, `biofile.csv`, `teams.csv` | `data/parks/` | `rsse reference` |
+| `allplayers.csv` | `data/parks/` | `rsse appearances` |
+| 704 `*.ROS` files | `data/events/ngl-rosters/` | `rsse ingest --aux` |
+
+`rsse fetch --aux` downloads it and places both halves. Implementations MUST
+match members on **basename**, not on the archive's internal directory layout,
+and MUST NOT write outside the two destinations above.
+
+The roster files MUST NOT be extracted into the per-season directories. A
+season directory is diffed against its archive to report which files
+Retrosheet reissued (§5.3); files that no season archive placed there would
+every one be reported as changed on the first refresh.
+
+Without this archive, 283 team-seasons — every one of them Negro Leagues —
+have a lineup and no names behind it, and the failure is silent: 2,893
+team-seasons matched against 2,610 roster files is a 90% match that looks
+fine until the missing 10% turns out to be a whole league.
 
 ## 3. Record types
 

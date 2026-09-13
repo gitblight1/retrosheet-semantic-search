@@ -16,6 +16,7 @@ from rsse.database import derived as dbderived
 from rsse.database import load as dbload
 from rsse.database import schema as dbschema
 from rsse.database import secondary as dbsecondary
+from rsse import cli
 from rsse.query import QueryError, Search, connect
 
 FIXTURE = Path(__file__).parent / "fixtures" / "TEST2000KCA.EVA"
@@ -514,6 +515,47 @@ class HitLocations(QueryBase):
             Search().hit_location("7").count(old)
         self.assertIn("derive --rebuild", str(caught.exception))
         old.close()
+
+    def test_the_verify_gates_stay_silent_on_good_data(self):
+        for name, _trusted, sql in cli.LOCATION_CHECKS:
+            with self.subTest(name):
+                [(n,)] = self.conn.execute(f"SELECT count(*) FROM ({sql})")
+                self.assertEqual(n, 0, name)
+
+    def test_the_verify_gates_fire_on_bad_data(self):
+        """A gate nobody has watched fail is a gate that may be inverted.
+
+        `location is not zone-shaped` was first written `GLOB '[!0-9]*'`.
+        SQLite negates a GLOB class with `^`, not `!`, so `!` was read as an
+        ordinary member: the check matched every string beginning with `!` or
+        a digit, which is every *valid* location, and it reported all
+        4,999,462 located plays in the corpus as malformed. Nothing caught it
+        because both gates had only ever been run against data that passes.
+        """
+        broken = sqlite3.connect(":memory:")
+        broken.executescript(
+            "CREATE TABLE plays (play_id INTEGER, event_modifiers TEXT,"
+            " event_location TEXT, parse_status TEXT DEFAULT 'ok');")
+        rows = [
+            # (play_id, modifiers, location, how many checks must catch it)
+            (1, '["L78D"]', "78D", 0),      # good: a suffix, and zone-shaped
+            (2, '["8"]', "8", 0),           # good: the whole modifier
+            (3, '["L78D"]', "56", 1),       # drifted from its own row
+            (4, '["L78D"]', "", 1),         # empty is missing, not present
+            (5, '["LXX"]', "XX", 1),        # not zone-shaped (suffix is fine)
+            (6, '["L78D"]', "!7", 2),       # the string the old check let by
+        ]
+        broken.executemany(
+            "INSERT INTO plays (play_id, event_modifiers, event_location)"
+            " VALUES (?,?,?)", [(r[0], r[1], r[2]) for r in rows])
+        caught = {play_id: 0 for play_id, *_ in rows}
+        for _name, _trusted, sql in cli.LOCATION_CHECKS:
+            for (play_id,) in broken.execute(sql):
+                caught[play_id] += 1
+        for play_id, _mods, _loc, expected in rows:
+            self.assertEqual(caught[play_id], expected,
+                             f"play {play_id}")
+        broken.close()
 
     def test_only_one_located_modifier_per_play(self):
         # `Event.hit_location` returns the first, which is only the right
