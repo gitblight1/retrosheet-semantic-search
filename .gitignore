@@ -3,6 +3,10 @@ __pycache__/
 *.egg-info/
 .venv/
 
+# setuptools staging and wheel output; `python -m build` leaves both here.
+build/
+dist/
+
 # Retrosheet source files, and everything derived from them. The corpus is
 # downloaded with `rsse fetch`; sweep reports and the database are rebuilt from
 # it. Retrosheet reissues corrected files, so a checked-in copy would go stale

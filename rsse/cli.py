@@ -25,7 +25,12 @@ from .parser.records import detect_line_ending, iter_plays
 from .util import download
 from .util.download import available_years, fetch_season
 
-VERSION = "0.1.0"
+#: The tool version, recorded in `corpus.rsse_version` by `open_corpus`. Kept
+#: in step with `version` in pyproject.toml: two builds that derive differently
+#: must not answer the same when asked which one produced an archive.
+VERSION = "0.1.1"
+#: The grammar's version, recorded per play in `plays.parser_version`. It moves
+#: only when the parser does, which is why it did not move for 0.1.1.
 PARSER_VERSION = "0.1.0"
 ARCHIVE_DEFAULT = "archive.db"     # verbatim source records (spec/05 §7)
 QUERY_DEFAULT = "rsse.db"          # derived, queryable tables
