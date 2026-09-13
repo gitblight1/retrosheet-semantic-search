@@ -480,6 +480,74 @@ Where the key is absent the value is stored as NULL rather than 9, so "we were
 told nine" stays distinguishable from "we assumed nine". The replay still
 applies 9 as its default, which is right for every season that does not say.
 
+### 6.7 `com` — which play a comment describes
+
+A `com` record normally describes the play **before** it, and that is how the
+replay verdict is linked. 51 of the corpus's 5,102 structured `replay` records
+describe the play *after*: the umpires confer, the comment is written, and the
+reviewed play follows it in the file.
+
+```
+play,5,0,teixm001,01,FX,5/P5F
+com,"replay,5,guerv001,ANA,welkt901,SEA03,F,N,I,,H"
+play,5,0,guerv001,12,SFFBX,S8/UREV/G6M+        <- the reviewed play
+```
+
+The record **names the player involved**, which settles it without a guess: if
+he does not bat in the play before and does bat in the play after, the comment
+belongs to the one after. Everything else keeps the default — including the
+804 records where the same batter stands on both sides of the boundary, and
+the 4 whose named player bats in neither. That last case is not a failure:
+the field names the player in the *reviewed call*, which for a review of a
+runner's advance is the runner rather than the batter, so a name matching
+nothing is not evidence the default is wrong.
+
+**This needs a second pass.** The deciding evidence is the next play's batter,
+and a forward replay has not read it yet. `GameReplay.comments` records the
+number of plays seen when each comment arrived, so entry `i` sits between
+`plays[i - 1]` and `plays[i]`, and the link is resolved once the game is
+complete.
+
+The rule lives in `rsse/model/comments.py` and is called from both places that
+link a comment to a play — the replay, for the tag, and
+`rsse/database/secondary.py`, for the `comments` table. They previously each
+implemented "the play before" and **disagreed on 33 plays**, which is a
+discrepancy nobody has a reason to go looking for.
+
+#### `NP` is not a play, and defeats the rule
+
+The neighbours must be the nearest **real** plays. An `NP` record exists only
+to carry a substitution, and it names the batter due up — normally the same
+player as the next real play's batter. So the test above reads
+`batter_before == player_id`, the *after* branch can never fire, and the
+verdict lands on the substitution:
+
+```
+play,7,0,castw001,,,NP                          <- verdict landed here
+com,"replay,7,castw001,CHN,welkt901,CHA01,F,Y,I,,H"
+play,7,0,castw001,12,SFFBX,K/UREV               <- the reviewed play
+```
+
+141 comments linked this way. The event strings settle the direction and are
+unanimous: of the 47 where a review modifier appears on either side, it is on
+the play **after** the `NP` 47 times and on the play before it **none**. The
+other 94 carry no modifier on either side. `NO_PLAY` is skipped in both
+linkers.
+
+#### A play can be reviewed twice, and the verdicts are ORed
+
+33 plays carry one `replay` record saying a call was reversed and a second
+saying a call was upheld — a `MREV` and a `UREV` on the same event are two
+reviews, not one. Writing each verdict as it arrives let the later record win,
+and where the upheld one came second it erased the reversal; all 33 lost their
+`ReplayOverturned` tag. The tag means *a* call on this play was overturned, so
+once the verdict is True it stays True.
+
+Neither of these was caused by the linkers being unified — none of the 33
+involves a comment pointing forwards, and all 51 that do are elsewhere. They
+were found by checking the tag count against the comments rather than trusting
+a prediction about it ([07-TESTING](07-TESTING.md) §4.6).
+
 ## 7. Context derived per play
 
 Computed once at replay and persisted, since every one of these is a common

@@ -341,14 +341,39 @@ def cmd_verify(args: argparse.Namespace) -> int:
     dupes = conn.execute(
         "SELECT game_id, count(*) FROM game_spans GROUP BY game_id"
         " HAVING count(*) > 1 ORDER BY game_id").fetchall()
+    # Three games are genuinely recorded twice; the list is short enough to
+    # read, and stays readable only because the next check exists.
     print(f"repeated game ids    {len(dupes)}"
-          + (f"  {[d[0] for d in dupes]}" if dupes else ""))
+          + (f"  {[d[0] for d in dupes][:12]}" if dupes else ""))
 
     files, recorded = conn.execute(
         "SELECT count(*), sum(record_count) FROM source_files").fetchone()
     print(f"source files         {files}")
     if recorded != records:
         failures.append(f"source_files sums to {recorded:,}, raw_records has {records:,}")
+
+    # Every check above is a *partition* check: the spans tile the records, the
+    # files sum to the records, nothing overlaps. A corpus ingested twice
+    # satisfies all of them. It did: `rsse ingest` followed by `rsse ingest
+    # --path data/events` spelled the same 2,646 files two ways, and every
+    # count above simply doubled -- 62,230,544 records tiled exactly by 406,570
+    # spans, declared exactly by 5,292 files. Three green gates on a corpus
+    # with two of everything, because a partition of a doubled corpus is still
+    # a partition.
+    #
+    # This is the check shaped for that class: two files with identical content
+    # in one corpus. It is not a statement about partitioning at all, which is
+    # the point.
+    same = conn.execute(
+        "SELECT count(*) FROM (SELECT sha256 FROM source_files"
+        " GROUP BY corpus_id, sha256 HAVING count(*) > 1)").fetchone()[0]
+    print(f"files ingested twice {same}")
+    if same:
+        example = conn.execute(
+            "SELECT group_concat(path, ' == ') FROM source_files WHERE sha256 ="
+            " (SELECT sha256 FROM source_files GROUP BY corpus_id, sha256"
+            "  HAVING count(*) > 1 LIMIT 1)").fetchone()[0]
+        failures.append(f"{same} files ingested more than once, e.g. {example}")
 
     # --- auxiliary records: the same two shapes, asserted separately.
     # Kept apart from the checks above on purpose. `source_files` and
@@ -567,6 +592,39 @@ EARNED_RUN_CHECKS = [
      " WHERE earned_team = 1 AND earned_pitcher = 0"),
 ]
 
+#: `ReplayOverturned` is the only tag whose deciding evidence is not in the
+#: event string -- whether a call was reversed is in the linked `com` record
+#: alone. That makes it the only tag checkable against something it is not
+#: derived from, and until these ran, nothing was: the tag sat 85 short of the
+#: comments for two rebuilds, hiding two separate bugs (03-STATE §6.7).
+#:
+#: Stated as *both conditions* rather than as a count, because 38 plays carry
+#: a comment saying a call was reversed on an event string that never said the
+#: play was reviewed -- a gap in Retrosheet's annotation, concentrated in
+#: 2014-2017, not a gap in the derivation.
+#:
+#: Both drive from `comments` (5,102 replay rows) rather than `plays` (17.9M):
+#: the natural phrasing scans every play to test the modifier.
+_REVERSED_COMMENT = (
+    "SELECT c.play_id FROM comments c WHERE c.kind = 'replay'"
+    " AND c.play_id IS NOT NULL"
+    " AND json_extract(c.payload, '$.reversed') = 1")
+_OVERTURNED_TAG = (
+    "SELECT t.play_id FROM play_tags t JOIN tags g USING (tag_id)"
+    " WHERE g.name = 'ReplayOverturned'")
+
+REPLAY_CHECKS = [
+    ("reviewed and reversed but not tagged", False,
+     f"SELECT c.play_id FROM ({_REVERSED_COMMENT}) c"
+     f" JOIN plays p ON p.play_id = c.play_id"
+     f" WHERE (p.event_raw LIKE '%MREV%' OR p.event_raw LIKE '%UREV%')"
+     f" AND c.play_id NOT IN ({_OVERTURNED_TAG})"),
+    ("tagged overturned with no reversal linked", False,
+     f"SELECT play_id FROM ({_OVERTURNED_TAG})"
+     f" WHERE play_id NOT IN ({_REVERSED_COMMENT})"),
+]
+
+
 _TRUSTED = "p.parse_status NOT IN ('unparsed','state_untrusted')"
 
 
@@ -607,6 +665,12 @@ def cmd_verify_derived(args: argparse.Namespace) -> int:
     else:
         print("note: no reference tables; run `rsse reference` to add"
               f" {len(REFERENCE_CHECKS)} more checks\n", file=sys.stderr)
+    if conn.execute("SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+                    " AND name = 'comments'").fetchone()[0]:
+        checks += REPLAY_CHECKS
+    else:
+        print("note: no comments table; run `rsse secondary` to add"
+              f" {len(REPLAY_CHECKS)} more checks\n", file=sys.stderr)
 
     failed = 0
     for name, trusted_only, sql in checks:
@@ -641,6 +705,13 @@ _QUERY_FLAGS = [
     ("--team", "team", str), ("--batting-team", "batting_team", str),
     ("--fielding-team", "fielding_team", str), ("--batter", "batter", str),
     ("--park", "park", str), ("--runner-on", "runner_on", str),
+    # Names, resolved against the reference tables. Separate flags rather than
+    # letting `--batter` take either: `ruthb101` and `Babe Ruth` are never
+    # confusable, but a flag that silently accepts both hides which one
+    # failed when neither resolves.
+    ("--batter-named", "batter_named", str),
+    ("--park-named", "park_named", str),
+    ("--team-named", "team_named", str),
     ("--out-at", "out_at", str), ("--batter-ran", "batter_ran", str),
     ("--error", "error", int), ("--hit-location", "hit_location", str),
     ("--event-matches", "event_matches", str),
@@ -1195,6 +1266,21 @@ def cmd_reference(args: argparse.Namespace) -> int:
             "SELECT count(*) FROM aux_files").fetchone()[0]:
         print("no auxiliary files in the archive; run `rsse ingest --aux`"
               " first", file=sys.stderr)
+        return 2
+
+    # `reference` reads `lineup_entries` to find every person the corpus
+    # names, so it has to follow `secondary`. Without it the build raises on a
+    # missing table -- loud, but a traceback is a worse way to learn a build
+    # order than a sentence.
+    probe = dbschema.connect(f"file:{query_path}?mode=ro")
+    have_lineups = probe.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'lineup_entries'").fetchone()[0]
+    probe.close()
+    if not have_lineups:
+        print("no lineup_entries; run `rsse secondary` first. Without it the"
+              " people only the comments name -- 471 umpires who never bat --"
+              " would be missing.", file=sys.stderr)
         return 2
 
     conn = dbschema.connect(str(query_path))

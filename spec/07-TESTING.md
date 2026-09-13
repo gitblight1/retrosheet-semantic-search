@@ -259,6 +259,7 @@ only move downward.
 |---|---|
 | `plays_unparsed == 0` | grammar gaps |
 | round-trip failures `== 0` | information loss |
+| no two `source_files` share a `sha256` | the same file ingested twice under two path spellings |
 | `runs_on_play <= runners_on_base + 1` | runs credited to nobody |
 | `runs_on_play ==` count of scoring advances | a run counted twice |
 | reconstructed final score `==` game `info` score | state machine drift |
@@ -292,13 +293,53 @@ written against the observed value while a double-count was live. Every home
 run written with an explicit `B-H` advance had been scoring one run too many
 ([03-STATE](03-STATE.md) §3.1).
 
-The general lesson is worth stating, because this project has now hit it three
+The general lesson is worth stating, because this project has now hit it four
 times. A gate detects the class of error it is shaped for and nothing else:
 the round-trip gate proves nothing was discarded but not that it was filed
 correctly ([02-GRAMMAR](02-GRAMMAR.md) §4); the out-accounting invariant proves
-outs balance but says nothing about runs; and a unit test asserting current
-behaviour proves only that behaviour has not changed. **Adding a gate for a
-quantity nobody had checked found a bug every single time.**
+outs balance but says nothing about runs; a unit test asserting current
+behaviour proves only that behaviour has not changed; and the archive's
+partition invariants, below, proved the corpus was consistent while it held two
+of everything. **Adding a gate for a quantity nobody had checked found a bug
+every single time.**
+
+#### A partition of a doubled corpus is still a partition
+
+The archive checks are all *partition* checks: the spans tile the records, the
+files sum to the records, no span overlaps its neighbour, no gaps. They are the
+right checks, they were correct, and they were all green on an archive
+containing the corpus twice.
+
+`rsse ingest` resolves its default root to an absolute path; `rsse ingest
+--path data/events` names the same 2,646 files relatively. `source_files` is
+unique on `(corpus_id, path)`, and the two spellings are different strings, so
+the second run inserted 2,646 new files, 31,115,272 new records and 203,285 new
+spans — and every count above simply doubled. 62,230,544 records tiled exactly
+by 406,570 spans, declared exactly by 5,292 files. Contiguous, non-overlapping,
+complete. Nothing was wrong with the partition; there were just two corpora in
+it.
+
+`game_spans` is unique on `(game_id, occurrence)`, which did not stop it either.
+`occurrence` exists for the three games the corpus genuinely records twice, and
+it absorbed 203,282 duplicates as second occurrences without complaint — a
+field doing exactly what it was built to do, on data that meant something else.
+
+The check shaped for this class is not a partition check at all, which is the
+point of including it:
+
+    SELECT count(*) FROM (SELECT sha256 FROM source_files
+     GROUP BY corpus_id, sha256 HAVING count(*) > 1)
+
+Two files with identical content in one corpus. Each event file is one team's
+season, so in a sound corpus this is zero; after the double ingest it was
+2,646. The same test applied to `aux_files` would be wrong — sixteen `TEAM`
+files are byte-identical to the previous season's, because no franchise moved
+— and that asymmetry is the reason the gate is stated per table rather than as
+a general rule about duplicate content.
+
+The repair needed no re-ingest. The duplicate occupied contiguous rowid ranges
+in all three tables, so three range deletes restored the archive exactly, with
+the surviving 2,646 files re-hashed against disk first.
 
 ### 4.1 `rsse verify --derived`
 
@@ -594,6 +635,49 @@ ever names never scores, so score reconciliation stayed at **100.0000%**
 throughout. The defect was reachable only from a question nobody had asked
 yet — *did this batter's plate appearance end?* — which is the same lesson
 this document has now recorded six times, arriving from a new direction.
+
+### 4.6 Replay verdicts, and a prediction that was wrong twice over
+
+`ReplayOverturned` is the one tag that cannot be derived from the event string
+alone: whether a call was reversed is only in the linked `com` record. That
+makes it checkable against a quantity it is not derived from — the comments
+themselves — and the check found two defects that a re-derive had been
+expected to fix and did not.
+
+The prediction was that fixing the comment linker would take the tag from
+2,320 to **2,370**: +17 reversals that had been landing on no play, and +33
+from the two linkers no longer disagreeing. The rebuild produced **2,337**.
+
+The +17 was right. The +33 was wrong *in construction*: relinking a comment
+**moves** a verdict from one play to another, and a move does not change a
+count. Only a verdict landing where none existed can raise it. An arithmetic
+error of that shape survives review easily, because both terms are real
+findings and only one of them is an addition.
+
+Checking the tag against the comments is what settled it. 2,427 comments say a
+call was reversed; they reach 2,422 distinct plays; 2,337 were tagged. The 85
+split three ways, and two of the three were bugs:
+
+| | plays | |
+|---|---|---|
+| a later *upheld* verdict overwrote the reversal | 33 | bug ([03-STATE](03-STATE.md) §6.7) |
+| the verdict landed on an `NP` substitution | 44 | bug ([03-STATE](03-STATE.md) §6.7) |
+| real play, but no `MREV`/`UREV` in the event string | 8 | not a bug |
+
+Neither bug was caused by the linker work: none of the 33 involves a
+forward-pointing comment. They had been there all along, invisible because
+nothing compared the tag to the record it is derived from.
+
+**The standing invariant**, two checks in `rsse verify --derived`. Every play
+carrying a linked reversed verdict and a review modifier must carry the tag,
+and no play may carry the tag without both. Both drive from `comments` — 5,102
+replay rows — rather than from `plays`; the natural phrasing of the first tests
+the modifier with a `LIKE` and scans all 17.9 million.
+After the fixes that is 2,384 plays, with 38 left over — a linked reversal on a
+play whose event string never said it was reviewed, concentrated in 2014–2017
+and absent from 2018 on. Those 38 are a gap in Retrosheet's annotation, not in
+the derivation, and they are the reason the invariant is stated as *both
+conditions* rather than as a count.
 
 ## 5. Performance suite
 

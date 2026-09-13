@@ -12,7 +12,7 @@ from dataclasses import dataclass, field, replace
 from ..parser.parser import ParseError, ParsedEvent, parse
 from ..parser.grammar import NoPlay
 from ..parser.records import PlayRecord, Record
-from .comments import Comment, classify
+from .comments import AFTER, NO_PLAY, Comment, classify, replay_target
 from .state import (HalfInningState, ParseStatus, PlayContext, PlayOutcome,
                     Runner, apply_play)
 
@@ -115,18 +115,18 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
             after_ladj = True
             continue
         if rec.type == "com":
-            # A `com` record describes the play *before* it, so the link is to
-            # the play just appended. Only a structured `replay` record carries
-            # a verdict; prose saying "call was overturned by replay" is not
-            # read, because parsing English into a derived fact is exactly the
-            # guess this project does not make.
-            comment = classify(rec.raw)
-            out.comments.append((len(out.plays), rec.line_no, comment))
-            if (comment.replay_reversed is not None and out.plays
-                    and out.plays[-1].context is not None):
-                last = out.plays[-1]
-                last.context = replace(
-                    last.context, replay_reversed=comment.replay_reversed)
+            # Recorded here, linked in a second pass. A `com` record usually
+            # describes the play before it, but 51 of the corpus's replay
+            # records describe the play *after* -- and which one it is cannot
+            # be decided going forwards, because the deciding evidence is the
+            # next play's batter and it has not been read yet.
+            #
+            # Only a structured `replay` record carries a verdict; prose
+            # saying "call was overturned by replay" is not read, because
+            # parsing English into a derived fact is exactly the guess this
+            # project does not make.
+            out.comments.append((len(out.plays), rec.line_no,
+                                 classify(rec.raw)))
             continue
         if rec.type != "play":
             continue
@@ -211,6 +211,7 @@ def replay_game(records: list[Record], game_id: str = "") -> GameReplay:
         if outs != 3:
             out.short_innings.append((inning, team, outs))
 
+    _link_replay_verdicts(out)
     _stamp_final_play(out)
     return out
 
@@ -223,6 +224,56 @@ def half_for(team: int, home_bats_first: bool) -> str:
     """
     bats_first = 1 if home_bats_first else 0
     return "top" if team == bats_first else "bottom"
+
+
+def _real_play_before(plays: list[ReplayedPlay], index: int):
+    """The nearest actual play before `index`, skipping `NP` (comments.py)."""
+    for i in range(index - 1, -1, -1):
+        if plays[i].event != NO_PLAY:
+            return plays[i]
+    return None
+
+
+def _real_play_from(plays: list[ReplayedPlay], index: int):
+    """The nearest actual play at or after `index`, skipping `NP`."""
+    for i in range(index, len(plays)):
+        if plays[i].event != NO_PLAY:
+            return plays[i]
+    return None
+
+
+def _link_replay_verdicts(out: GameReplay) -> None:
+    """Attach each replay verdict to the play it actually describes (§6.7).
+
+    A second pass, because the rule needs the play on *both* sides of the
+    comment and the forward pass has only seen one of them. `comments` stores
+    the number of plays seen when the record arrived, so entry `i` sits
+    between `plays[i - 1]` and `plays[i]` -- and the neighbours are the nearest
+    *real* plays from there, because a substitution record is not a play and
+    cannot be the subject of a review (`NO_PLAY` in comments.py).
+
+    **A reversal is never overwritten by a later upheld verdict.** A play may
+    be reviewed twice -- a `MREV` and a `UREV` on the same event -- and 33
+    plays carry one comment saying the call was reversed and a second saying a
+    call was upheld. Taking the last one written lost all 33 reversals. The
+    tag means *a* call on this play was overturned, so the verdicts are ORed:
+    once True it stays True.
+    """
+    for index, _line_no, comment in out.comments:
+        if comment.replay_reversed is None:
+            continue
+        before = _real_play_before(out.plays, index)
+        after = _real_play_from(out.plays, index)
+        who = (comment.payload or {}).get("player_id")
+        target = (after if replay_target(
+            who, before.batter_id if before else None,
+            after.batter_id if after else None) == AFTER else before)
+        if target is None or target.context is None:
+            continue
+        if target.context.replay_reversed is True and not comment.replay_reversed:
+            continue
+        target.context = replace(
+            target.context, replay_reversed=comment.replay_reversed)
 
 
 def _stamp_final_play(out: GameReplay) -> None:

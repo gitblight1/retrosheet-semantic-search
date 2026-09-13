@@ -91,6 +91,13 @@ class Compilation(QueryBase):
             Search().putout_by(3, assist_by=[6, 4]),
             Search().exclude_curated(),
             Search().curated_only(),
+            # `.league()` reads `teams` to reach the per-season league codes.
+            # The obvious form correlates on `g.home_team` and `g.season` and
+            # cost 42% over the plain column test it replaced.
+            Search().league("NN2"),
+            Search().batter_named("Babe Ruth"),
+            Search().park_named("Fenway Park"),
+            Search().team_named("Brooklyn Dodgers"),
         )
         for search in searches:
             sql, _ = search._compile("p.play_id")
@@ -105,11 +112,13 @@ class Compilation(QueryBase):
                 # the benchmark caught it.
                 for line in sql.splitlines():
                     if "IN (SELECT" in line:
-                        self.assertNotIn(
-                            "= p.play_id", line,
-                            "a correlation clause inside the subquery keeps "
-                            "the per-play evaluation the IN form exists to "
-                            "avoid")
+                        for correlated in ("= p.play_id", "= g.home_team",
+                                           "= g.season", "= p.game_key"):
+                            self.assertNotIn(
+                                correlated, line,
+                                "a correlation clause inside the subquery "
+                                "keeps the per-row evaluation the IN form "
+                                "exists to avoid")
 
     def test_ordering_is_total(self):
         sql, _ = Search().strikeout()._compile("p.play_id")

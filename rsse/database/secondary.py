@@ -14,10 +14,11 @@ and tags are derived there. So the tag needs a re-derive; these tables do not.
 
 from __future__ import annotations
 
+import bisect
 import json
 from dataclasses import dataclass, field
 
-from ..model.comments import classify
+from ..model.comments import AFTER, NO_PLAY, classify, replay_target
 
 SECONDARY_DDL = """
 CREATE TABLE IF NOT EXISTS comments (
@@ -117,12 +118,24 @@ def build(conn, archive, progress=None) -> SecondaryStats:
             seen_seasons.add(season)
             progress(season, stats)
 
-        # record_id -> play_id for this game. Plays are the only records the
+        # The game's plays in record order. Plays are the only records the
         # derived layer kept an archive pointer for, which is exactly what
         # makes this pass possible.
-        by_record = dict(conn.execute(
-            "SELECT record_id, play_id FROM plays WHERE game_key = ?"
-            " AND record_id IS NOT NULL", (game_key,)))
+        #
+        # Held as a list as well as a map because a `replay` comment may
+        # describe the play *after* it, and deciding that needs the batter on
+        # both sides of the comment (rsse/model/comments.py).
+        game_plays = conn.execute(
+            "SELECT record_id, play_id, batter_id, event_raw FROM plays"
+            " WHERE game_key = ? AND record_id IS NOT NULL"
+            " ORDER BY record_id", (game_key,)).fetchall()
+        by_record = {r[0]: r[1] for r in game_plays}
+        # `NP` records are excluded from the *replay* decision only, and stay
+        # in `by_record` because `sub` records attach to the last play seen
+        # whatever it was. A substitution is not a play and cannot be the
+        # subject of a review (`NO_PLAY` in rsse/model/comments.py).
+        real_plays = [r for r in game_plays if r[3] != NO_PLAY]
+        real_records = [r[0] for r in real_plays]
 
         last_play_id = None
         c_seq = l_seq = 0
@@ -136,8 +149,10 @@ def build(conn, archive, progress=None) -> SecondaryStats:
                 continue
             if kind == "com":
                 comment = classify(raw)
+                linked = _comment_play(comment, record_id, real_plays,
+                                       real_records, last_play_id)
                 comment_rows.append((
-                    game_key, c_seq, last_play_id, record_id, comment.kind,
+                    game_key, c_seq, linked, record_id, comment.kind,
                     comment.text,
                     json.dumps(comment.payload) if comment.payload else None,
                     int(comment.marker)))
@@ -189,3 +204,35 @@ def _flush(conn, comment_rows: list, lineup_rows: list) -> None:
         conn.executemany(_LINEUP_INSERT, lineup_rows)
         lineup_rows.clear()
     conn.commit()
+
+
+def _comment_play(comment, record_id: int, game_plays: list,
+                  play_records: list, default) -> int | None:
+    """The play a `com` record belongs to.
+
+    Normally the play before it, which is what `default` already holds. A
+    structured `replay` record that names a player who bats in the play
+    *after* instead belongs to that one -- 51 records in the corpus
+    (rsse/model/comments.py).
+
+    `game_plays` and `play_records` must already have `NP` records removed, for
+    the reason given at `NO_PLAY`: an `NP` names the batter due up, which
+    defeats the test in `replay_target` and captured 141 comments.
+
+    The same rule runs in `rsse/model/game.py`, which is what links the
+    verdict for the `ReplayOverturned` tag. Both call `replay_target` rather
+    than each implementing "the play before": they disagreed once already, and
+    a table and a tag pointing at different plays is a discrepancy nobody has
+    a reason to look for.
+    """
+    if comment.replay_reversed is None:
+        return default
+    after = bisect.bisect_right(play_records, record_id)
+    before_row = game_plays[after - 1] if after else None
+    after_row = game_plays[after] if after < len(game_plays) else None
+    choice = replay_target((comment.payload or {}).get("player_id"),
+                           before_row[2] if before_row else None,
+                           after_row[2] if after_row else None)
+    if choice == AFTER and after_row is not None:
+        return after_row[1]
+    return before_row[1] if before_row else default

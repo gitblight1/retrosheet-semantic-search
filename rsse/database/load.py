@@ -88,11 +88,20 @@ def ingest_file(conn, corpus_id: int, path: Path, stats: IngestStats,
     Returns False if the file was already present and unchanged. Raises
     CorpusChanged if it is present but different.
     """
+    # Resolved, not as given. `UNIQUE (corpus_id, path)` only prevents a
+    # double load if the same file yields the same string, and it does not:
+    # `rsse ingest` and `rsse ingest --path data/events` name the same 2,646
+    # files two ways, and the second run loaded a whole second copy of the
+    # corpus -- 203,285 games again, 31,115,272 records again -- without
+    # violating a constraint or failing a gate. `auxiliary.ingest_file` called
+    # this hole latent and said only the CLI's habit of passing an absolute
+    # path kept it shut. The habit did not hold.
+    canonical = str(path.resolve())
     digest = sha256(path)
     stat = path.stat()
     existing = conn.execute(
         "SELECT file_id, sha256 FROM source_files WHERE corpus_id = ? AND path = ?",
-        (corpus_id, str(path)),
+        (corpus_id, canonical),
     ).fetchone()
     if existing:
         if existing[1] == digest:
@@ -116,7 +125,7 @@ def ingest_file(conn, corpus_id: int, path: Path, stats: IngestStats,
             "INSERT INTO source_files"
             " (corpus_id, path, season, sha256, byte_length, mtime, line_ending)"
             " VALUES (?, ?, ?, ?, ?, ?, ?)",
-            (corpus_id, str(path), _season(path), digest, stat.st_size,
+            (corpus_id, canonical, _season(path), digest, stat.st_size,
              datetime.fromtimestamp(stat.st_mtime, timezone.utc)
              .isoformat(timespec="seconds"),
              detect_line_ending(path)),

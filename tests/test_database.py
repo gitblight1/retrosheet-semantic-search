@@ -6,6 +6,7 @@ about losslessness and provenance rather than behaviour.
 
 import shutil
 import sqlite3
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -78,6 +79,31 @@ class RawLayer(unittest.TestCase):
         after = self.conn.execute("SELECT count(*) FROM raw_records").fetchone()[0]
         self.assertEqual(stats.skipped_files, 1)
         self.assertEqual(before, after, "re-ingest must not duplicate records")
+
+    def test_a_relative_and_an_absolute_path_are_the_same_file(self):
+        """The spelling of the path is not part of the file's identity.
+
+        `rsse ingest` (absolute, from `EVENTS`) followed by `rsse ingest
+        --path data/events` (relative) loaded a second complete copy of the
+        corpus: 2,646 files, 203,285 games and 31,115,272 records again, with
+        `UNIQUE (corpus_id, path)` never violated because the two spellings are
+        different strings. Every archive gate stayed green -- the spans still
+        tiled the records, the files still summed to the records -- because a
+        partition of a doubled corpus is still a partition.
+        """
+        self.ingest()
+        cwd = os.getcwd()
+        try:
+            os.chdir(self.tmp)
+            stats = dbload.ingest(self.conn, [Path("2000KCA.EVA")], self.corpus)
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(stats.skipped_files, 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM source_files").fetchone()[0], 1)
+        self.assertEqual(self.conn.execute(
+            "SELECT count(*) FROM game_spans WHERE occurrence > 1").fetchone()[0],
+            0, "a second copy is not a second occurrence")
 
     def test_a_changed_file_is_fatal(self):
         """Retrosheet reissues corrected files; mixing vintages is undetectable."""

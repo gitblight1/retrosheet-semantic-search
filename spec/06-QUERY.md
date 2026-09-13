@@ -304,7 +304,60 @@ Target: <100 ms for a typical query on a warm cache.
 - The benchmark suite ([07-TESTING](07-TESTING.md) §5) pins the motivating query
   and a dozen others; a regression beyond the target fails CI.
 
-## 8. CLI
+## 8. Names
+
+`.batter_named()`, `.park_named()` and `.team_named()` resolve a typed name
+against the reference tables ([05-DATABASE](05-DATABASE.md) §8). `.batter()`,
+`.park()` and `.team()` keep taking ids and work without those tables.
+
+Two measured facts shape the resolution.
+
+**The name people use is not `people.first`.** `biofile.csv` records the legal
+name — Ruth is `George Herman` — and the playing name lives in `nickname` and
+in `roster_entries.first`. **19,598 of 21,993 people (89%) differ between the
+two.** So a name is matched against four spellings: nickname + surname, first
++ surname, surname alone, and the roster's own. `Jackie Robinson`, `Jack
+Robinson` and `John Edward Robinson` all have to reach `robij101`, and only
+the first two would without the roster arm.
+
+**Names are not unique, and an ambiguous one is refused.** 207 names are
+shared by 442 people, 30 of them among players who appear in the corpus, and
+26 park names are shared — including *Wrigley Field*, which is Chicago's and
+the Los Angeles park that hosted Negro Leagues games and the 1961 Angels.
+`.batter_named("Jack Robinson")` raises, listing both candidates with their
+birth years, rather than answering for whichever sorts first. Guessing would
+answer a different question than the one asked and say nothing about it.
+
+The check happens at `run()` or `count()`, not when the predicate is built:
+the fluent API has no connection until then. That is the same division of
+labour as tag names (§9), and it means an unresolvable name costs an error
+rather than a silent empty result.
+
+`PlayResult.batter_name` is filled from `people` in **one** query per result
+set, not one per row. It is None when the reference tables are absent — a
+result without a name is still a result.
+
+### 8.1 Two league vocabularies
+
+`games.league` is the event file's own code and has four values: `AL`, `NL`,
+`FL`, `NGL`. The last collapses **seven** Negro Leagues into one.
+`teams.league` is Retrosheet's per-season code, kept verbatim, and
+distinguishes `NN1`, `NN2`, `NAL`, `ECL`, `ANL`, `NSL` and `EW` — while
+spelling the majors `A`/`N` outside 1920–1949 and `AL`/`NL` within it.
+
+`.league(code)` matches **either**, so `NGL` still works and `NN2` now does
+too. The two overlap only on `AL` and `NL`, where they agree, so there is no
+code whose meaning depends on which table answered. The corpus's 2,193 Negro
+Leagues games resolve as NN2 1,064 / NAL 780 / NN1 49 / ECL 19, with 281 at
+clubs whose league field is genuinely empty.
+
+It compiles to a **row-value `IN`**, not a correlated `EXISTS`. The `EXISTS`
+form probes `teams` once per game and cost 42% over the plain `g.league = ?`
+it replaced; the `IN` form builds the subquery once and is indistinguishable
+from it. This is the fourth time that distinction has cost real time on this
+project ([07-TESTING](07-TESTING.md) §5.1), and it is now asserted by test.
+
+## 9. CLI
 
 ```
 rsse query --bases-loaded --outs 2 --tag UncaughtThirdStrike \
@@ -321,7 +374,7 @@ version.
 ([05-DATABASE](05-DATABASE.md) §5) from `games` and `plays`. It is a GROUP BY,
 so it is rebuilt in seconds after a derive rather than carried through the load.
 
-## 9. Validation status
+## 10. Validation status
 
 Built and tested. `Search`, the compiler, `CoverageReport`, `ExcludedCounts`,
 `ForceReport`, and the `query` / `explain` / `coverage` commands.

@@ -75,6 +75,53 @@ class Pred:
     #: pure `games` column tests qualify: `.batting_team()` reads
     #: `p.batting_team` and so cannot be evaluated without `plays`.
     games_only: bool = False
+    #: `(kind, name)` when the predicate resolves a human name against the
+    #: reference tables. The SQL matches every id the name resolves to, and
+    #: `Search.validate()` is what refuses an ambiguous one -- the same
+    #: division of labour as tags, which also compile to a subquery and are
+    #: reported by name at `run()` rather than raising while the query is
+    #: being built.
+    resolves: tuple[str, str] | None = None
+
+
+def _key(name: str) -> str:
+    """Normalise a typed name: case and internal whitespace do not matter."""
+    return " ".join(name.split()).lower()
+
+
+#: Name resolution happens in SQL for the same reason tag lookup does: the
+#: fluent API has no connection while a query is being built, and a subquery
+#: with no matches is a query that returns nothing rather than one that
+#: crashes. `Search.validate()` turns "no matches" and "too many" into errors
+#: that name the candidates, at `run()`.
+#:
+#: Four spellings, because 89% of people have a different first name in
+#: `biofile.csv` than on their roster line: Ruth is `George Herman` in one and
+#: `Babe` in the other (spec/06-QUERY.md §8).
+#: Placeholders are positional `?`, repeated, **not** numbered `?1`. The
+#: compiler concatenates every predicate's SQL and parameters into one
+#: statement, so a numbered placeholder here would renumber against the whole
+#: query rather than against this fragment.
+_PERSON_SQL = """(
+ SELECT p.person_id FROM people p
+  WHERE lower(trim(coalesce(p.nickname,'') || ' ' || coalesce(p.last,''))) = ?
+     OR lower(trim(coalesce(p.first,'') || ' ' || coalesce(p.last,''))) = ?
+     OR lower(trim(coalesce(p.last,''))) = ?
+     OR p.person_id IN (SELECT r.person_id FROM roster_entries r
+        WHERE lower(trim(coalesce(r.first,'') || ' '
+                         || coalesce(r.last,''))) = ?))"""
+_PERSON_PARAMS = 4
+_PARK_PARAMS = 2
+_TEAM_PARAMS = 3
+
+_PARK_SQL = """(
+ SELECT park_id FROM parks
+  WHERE lower(coalesce(name,'')) = ? OR lower(coalesce(aka,'')) = ?)"""
+
+_TEAM_SQL = """(
+ SELECT team_id FROM teams
+  WHERE lower(trim(coalesce(city,'') || ' ' || coalesce(nickname,''))) = ?
+     OR lower(coalesce(nickname,'')) = ? OR lower(coalesce(city,'')) = ?)"""
 
 
 def _tag_id_sql(name: str) -> str:
@@ -166,8 +213,27 @@ class Search:
                                games_only=True))
 
     def league(self, code: str) -> "Search":
-        return self._with(Pred("g.league = ?", (code,), needs_games=True,
-                               games_only=True))
+        """Games in a league, by either vocabulary (§8.1).
+
+        Two exist and they are not the same size. `games.league` is the event
+        file's own four-value code -- `AL`, `NL`, `FL`, `NGL` -- which
+        collapses every Negro League into one. `teams.league` is Retrosheet's
+        per-season code, kept verbatim, which distinguishes `NN1`, `NN2`,
+        `NAL`, `ECL`, `ANL`, `NSL` and `EW`, and spells the majors `A`/`N`
+        before 1920 and after 1949.
+
+        This matches **either**, so `NGL` still works and `NN2` now does too.
+        The two overlap only on `AL` and `NL`, where they agree.
+        """
+        # A row-value `IN`, not a correlated `EXISTS`. The `EXISTS` form
+        # probes `teams` once per game and cost 42% over the plain
+        # `g.league = ?` it replaced; this builds the subquery once and is
+        # indistinguishable from it. The same distinction the performance
+        # suite found four times over (spec/07-TESTING.md §5.1).
+        return self._with(Pred(
+            "(g.league = ? OR (g.home_team, g.season) IN"
+            " (SELECT team_id, season FROM teams WHERE league = ?))",
+            (code, code), needs_games=True, games_only=True))
 
     def team(self, code: str) -> "Search":
         return self._with(Pred("(g.home_team = ? OR g.away_team = ?)",
@@ -191,9 +257,45 @@ class Search:
     def batter(self, player_id: str) -> "Search":
         return self._with(Pred("p.batter_id = ?", (player_id,)))
 
+    def batter_named(self, name: str) -> "Search":
+        """Plays batted by the person called ``name`` (§8).
+
+        Refuses an ambiguous name rather than choosing. `Jack Robinson` is two
+        players -- the one who debuted in 1949 and one who debuted in 1902 --
+        and answering for whichever sorts first would be answering a different
+        question in silence.
+        """
+        return self._with(Pred(
+            "p.batter_id IN " + _PERSON_SQL,
+            (_key(name),) * _PERSON_PARAMS,
+            resolves=("person", name)))
+
     def park(self, site_id: str) -> "Search":
         return self._with(Pred("g.site = ?", (site_id,), needs_games=True,
                                games_only=True))
+
+    def park_named(self, name: str) -> "Search":
+        """Plays at the ballpark called ``name`` (§8).
+
+        Also refuses ambiguity, and here it matters most: *Wrigley Field* is
+        both Chicago's and the Los Angeles park that hosted Negro Leagues
+        games and the 1961 Angels.
+        """
+        return self._with(Pred(
+            "g.site IN " + _PARK_SQL, (_key(name),) * _PARK_PARAMS,
+            needs_games=True, games_only=True, resolves=("park", name)))
+
+    def team_named(self, name: str) -> "Search":
+        """Games involving the club called ``name`` (§8).
+
+        Matches city, nickname, or both. One club, however many seasons: the
+        Brooklyn and Los Angeles Dodgers are different ids and so are two
+        different answers, which is why `Dodgers` alone is ambiguous.
+        """
+        return self._with(Pred(
+            "(g.home_team IN {t} OR g.away_team IN {t})".format(t=_TEAM_SQL),
+            (_key(name),) * (_TEAM_PARAMS * 2), needs_games=True,
+            games_only=True, resolves=("team", name)))
 
     def pitcher(self, player_id: str) -> "Search":
         """Plays on which ``player_id`` was the pitcher of record.
@@ -617,8 +719,35 @@ class Search:
                               "milliseconds"] if scan else [])}
 
     def count(self, conn) -> int:
+        self.check_names(conn)
         sql, params = self._compile("COUNT(*)", order=False)
         return conn.execute(sql, params).fetchone()[0]
+
+    def check_names(self, conn) -> None:
+        """Refuse a human name that resolves to none or to several.
+
+        Checked here rather than when the predicate is built, because the
+        fluent API has no connection until then -- the same reason tag names
+        are reported by `validate()`. Costs nothing unless a name predicate is
+        in use.
+        """
+        from .names import (AmbiguousName, parks_named, people_named,
+                            resolve, teams_named)
+
+        lookup = {"person": people_named, "park": parks_named,
+                  "team": teams_named}
+        for pred in self.preds:
+            if not pred.resolves:
+                continue
+            kind, name = pred.resolves
+            if not _has_reference_tables(conn):
+                raise QueryError(
+                    f"cannot resolve the name {name!r}: this database has no "
+                    "reference tables. Run `rsse reference` to build them.")
+            try:
+                resolve(lookup[kind](conn, name), kind, name)
+            except AmbiguousName as exc:
+                raise QueryError(str(exc)) from exc
 
     def validate(self, conn) -> list[str]:
         """Names used by this query that the database does not know."""
@@ -634,6 +763,7 @@ class Search:
     def run(self, conn, limit: int | None = None) -> ResultSet:
         from .report import build_coverage, build_excluded, build_force
         search = self if limit is None else self.limit(limit)
+        search.check_names(conn)
         unknown = search.validate(conn)
         if unknown:
             raise QueryError(f"no such tag(s) in this database: {unknown}. "
@@ -647,6 +777,11 @@ class Search:
         for r in conn.execute(sql, params):
             rows.append(PlayResult(*r))
         rows = tuple(replace(r, tags=_tags_for(conn, r.play_id)) for r in rows)
+        # One query for every name in the result set, not one per row.
+        names = _names_for(conn, [r.batter_id for r in rows])
+        if names:
+            rows = tuple(replace(r, batter_name=names.get(r.batter_id))
+                         for r in rows)
 
         # `build_excluded` groups the population by `parse_status`, and its
         # `ok` bucket *is* the number of matches -- so the total comes from
@@ -662,6 +797,24 @@ class Search:
             ontology_version=ONTOLOGY_VERSION,
             corpus_version=_corpus_version(conn),
         )
+
+
+def _has_reference_tables(conn) -> bool:
+    return bool(conn.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'people'").fetchone()[0])
+
+
+def _names_for(conn, person_ids) -> dict:
+    """Batter names for a result set, or `{}` if the tables are absent.
+
+    A query database without `rsse reference` still returns results; it
+    returns them without names, which is a smaller loss than refusing.
+    """
+    if not _has_reference_tables(conn):
+        return {}
+    from .names import names_for
+    return names_for(conn, person_ids)
 
 
 def _tags_for(conn, play_id: int) -> tuple[str, ...]:

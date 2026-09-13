@@ -55,6 +55,7 @@ python3 -m rsse.cli coverage --rebuild    # coverage table       (~10 s)
 Then ask it something:
 
 ```bash
+python3 -m rsse.cli query --batter-named "Babe Ruth" --season 1927 --tag HomeRun
 python3 -m rsse.cli query --strikeout --force-play-at H --seasons 1996,1997
 python3 -m rsse.cli query --triple-play --format json
 python3 -m rsse.cli coverage --season-range 1908,1920
@@ -194,7 +195,7 @@ Everything in the build order is built and validated against the full corpus.
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
 | Earned runs | 1,796,610 derived from the play-by-play; **98.9486%** agree with Retrosheet's own per-run flags |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 313, all passing |
+| Tests | 327, all passing |
 
 **Every replayed score matches the published one.** `rsse reconcile` compares
 `games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
@@ -256,7 +257,7 @@ rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary, earned-run and
                  coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           313 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           327 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

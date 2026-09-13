@@ -62,7 +62,7 @@ database on two indexes**, and neither survived scrutiny:
 
 | Index | Share | Verdict |
 |---|---|---|
-| `UNIQUE (file_id, line_no)` | 13% | **Redundant.** `source_files UNIQUE (corpus_id, path)` already prevents loading a file twice, and each file is read once line by line, so the pair is unique by construction. It guarded nothing and served no query. |
+| `UNIQUE (file_id, line_no)` | 13% | **Redundant.** Each file is read once, line by line, and is inserted under a fresh `file_id`, so the pair is unique by construction. It guarded nothing and served no query. |
 | `ix_raw_game (game_id, …)` | 25% | **Replaced.** ~760 MB over the full corpus, to support a lookup that `game_spans` answers with ~200k rows. |
 
 A game lookup is now a `game_spans` seek plus a range scan on the integer
@@ -86,6 +86,27 @@ The contiguity `game_spans` relies on is an invariant of the loader, not an
 assumption about the data, and it is asserted directly: the spans must
 partition `raw_records` exactly, must not overlap, and a span lookup must
 return the same rows as a `game_id` scan.
+
+**`UNIQUE (corpus_id, path)` is not what stops a file being loaded twice.** It
+was described that way here until the corpus was ingested twice under it. A
+path is a string, and `rsse ingest` (absolute, resolved from the package root)
+and `rsse ingest --path data/events` (relative) produce two different strings
+for the same 2,646 files. The second run inserted a complete second copy —
+31,115,272 records, 203,285 spans — and violated no constraint, including
+`game_spans UNIQUE (game_id, occurrence)`, because `occurrence` obligingly
+numbered each duplicate as a second sighting of the game. Every invariant in
+the paragraph above still held: a partition of a doubled corpus is still a
+partition ([07-TESTING](07-TESTING.md) §4).
+
+What stops it is `ingest_file` canonicalising with `Path.resolve()` before
+both the lookup and the insert, so the identity of a file is its location
+rather than the way it was spelled on the command line, and a `sha256`
+uniqueness check in `rsse verify` that is shaped for content rather than
+partitioning. `auxiliary.ingest_file` had the `resolve()` already, having been
+fixed for the same bug a step earlier; the note there recorded that
+`source_files` had the same hole and was "saved from it only by the CLI always
+passing an absolute path — a convention, where this is a guarantee." The
+convention held for about a day.
 
 ### 1.2 Source records that belong to no game
 
@@ -520,6 +541,11 @@ record attaches to the play before it, and `plays.record_id` already names each
 play's archive record, so the link is a lookup. That takes minutes instead of
 an hour and a half, and it means both tables can be added to an existing query
 database without re-deriving 17.9 million plays.
+
+`comments.play_id` uses the same rule as the replay for deciding *which* play
+a structured `replay` record describes ([03-STATE](03-STATE.md) §6.7) — shared
+code, not a second implementation of it, because the two disagreed on 33 plays
+when each had its own.
 
 The tag `ReplayOverturned` is the exception and does need a re-derive, because
 it is a *tag*: `rsse/model/game.py` sets `PlayContext.replay_reversed` from a

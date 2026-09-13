@@ -114,9 +114,12 @@ def _replay(body: str) -> dict | None:
         return None
     if f[7] not in _REVERSED or not f[1].isdigit():
         return None
-    return {"inning": int(f[1]), "player_id": f[2] or None,
-            "team": f[3] or None, "umpire_id": f[4] or None,
-            "site": f[5] or None, "call": f[6] or None,
+    # Ids are stripped. Four `replay` records pad the player id with a
+    # trailing space, and an id that does not compare equal to the batter it
+    # names is an id that silently fails every link that uses it.
+    return {"inning": int(f[1]), "player_id": f[2].strip() or None,
+            "team": f[3].strip() or None, "umpire_id": f[4].strip() or None,
+            "site": f[5].strip() or None, "call": f[6].strip() or None,
             "reversed": _REVERSED[f[7]],
             # Two further coded fields whose meanings are not established.
             # Carried verbatim rather than named or dropped.
@@ -159,3 +162,51 @@ def classify(raw: str) -> Comment:
         if payload is not None:
             return Comment(kind, body, payload, marker)
     return Comment(TEXT, body, None, marker)
+
+
+#: Where a `com` record's play is, relative to the record itself.
+BEFORE = "before"
+AFTER = "after"
+
+#: `NP` -- "no play" -- is the event string of a record that exists only to
+#: carry a substitution. It is always exactly this, in all 1,784,548 of them.
+#:
+#: **A replay comment's neighbours must be chosen with these skipped**, which
+#: is a correctness requirement rather than tidiness. An `NP` names the batter
+#: due up, who is normally the same player as the next real play's batter, so
+#: `replay_target`'s test -- does the named player bat *after* but not *before*
+#: -- reads `batter_before == player_id` and can never fire. 141 replay
+#: comments landed on an `NP` that way. Of the 47 where the surrounding event
+#: strings settle the question, the review modifier `MREV`/`UREV` is on the
+#: play *after* the `NP` 47 times and on the play before it **none**; the other
+#: 94 carry no modifier either side. An `NP` is not a play and cannot be the
+#: subject of a review.
+NO_PLAY = "NP"
+
+
+def replay_target(player_id: str | None, batter_before: str | None,
+                  batter_after: str | None) -> str:
+    """Which adjacent play a structured `replay` comment describes.
+
+    A `com` record normally describes the play **before** it, and 4,241 of the
+    corpus's 5,102 replay records do. But 51 describe the play *after* — the
+    umpires confer, the comment is written, and the resulting play follows —
+    and linking those backwards attaches the verdict to a play that was never
+    reviewed. 31 of them carry a reversal, so 31 `ReplayOverturned` tags were
+    landing on the wrong play or not at all.
+
+    The record names the player involved, which settles it without a guess:
+    if he does not bat in the play before and does bat in the play after, the
+    comment belongs to the one after. Anything else keeps the default,
+    including the 804 records where the same batter is on both sides of the
+    boundary and the 6 whose named player bats in neither.
+
+    Those 6 are worth keeping in view: the field names *the player involved in
+    the reviewed call*, which for a review of a runner's advance is the
+    runner, not the batter. A name that matches nothing is not evidence that
+    the link is wrong, so it changes nothing.
+    """
+    if (player_id and batter_before != player_id
+            and batter_after == player_id):
+        return AFTER
+    return BEFORE

@@ -171,14 +171,20 @@ class PlayResult:
     runs_on_play: int
     parse_status: str
     tags: tuple[str, ...] = ()
+    #: Resolved from `people` when the reference tables are present, None when
+    #: they are not -- a result without a name is still a result. Declared
+    #: last because the row is built positionally from the SELECT, and the
+    #: name does not come from it.
+    batter_name: str | None = None
 
     def describe(self) -> str:
         """A one-line English rendering, for `--format table`."""
         where = f"{self.half[0]}{self.inning}"
         state = (f"{self.outs_before} out, bases {self.bases_before}"
                  if self.outs_before is not None else "state unknown")
+        who = self.batter_name or self.batter_id
         return (f"{self.date or '????-??-??'} {self.game_id} {where:>4} "
-                f"{state:<22} {self.event_raw}")
+                f"{state:<22} {who:<20} {self.event_raw}")
 
 
 @dataclass(frozen=True)
