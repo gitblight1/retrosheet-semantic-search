@@ -49,14 +49,17 @@ _TEAM = re.compile(r"^TEAM(?P<season>\d{4})$", re.I)
 #: source, so ingesting it would create two tables' worth of provenance for
 #: one fact.
 #:
-#: `allplayers.csv` is absent for a different reason: every one of its 3,422
-#: ids already appears in a roster or in `biofile.csv`, so it adds no *person*.
-#: What it does add is per-season appearance counts by position, which is
-#: statistics rather than identity and belongs to a later pass.
+#: `allplayers.csv` is here for the opposite reason, and was left out until
+#: the pass that reads it existed. Every one of its 3,422 ids already appears
+#: in a roster or in `biofile.csv`, so it adds no *person* and has no business
+#: in `reference`; what it adds is per-season appearance counts by position,
+#: which is a statistic about a person rather than a fact identifying one.
+#: `rsse appearances` is that pass, and this is its source.
 WHOLE_CORPUS = (
     ("ballparks.csv", "park"),
     ("biofile.csv", "bio"),
     ("teams.csv", "teamlist"),
+    ("allplayers.csv", "appearances"),
 )
 
 

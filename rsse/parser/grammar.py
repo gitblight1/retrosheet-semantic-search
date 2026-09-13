@@ -370,6 +370,21 @@ class Event(Node):
     def modifier_codes(self) -> set[str]:
         return {m.code for m in self.modifiers if m.kind == "named"}
 
+    @property
+    def hit_location(self) -> str | None:
+        """The zone the ball was hit to, or None if no modifier names one.
+
+        Singular on purpose. A `hit` modifier may carry a trajectory with no
+        location (`/L`), a location with no trajectory (`/78`), or both
+        (`/L78`), and an event may carry several `hit` modifiers -- but across
+        483,561 sampled plays not one carries two *located* ones, so "the
+        first" and "the only" are the same thing here. If that ever stops
+        being true this returns the first and the verify gate stays true, so
+        the failure would be silent; it is asserted in the tests instead.
+        """
+        return next((m.location for m in self.modifiers
+                     if m.kind == "hit" and m.location), None)
+
     def emit(self) -> str:
         out = ";".join("+".join(e.emit() for e in g) for g in self.groups)
         out += "".join("/" + m.emit() for m in self.modifiers)

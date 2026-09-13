@@ -261,3 +261,117 @@ def read_people(lines: list[str]) -> list[Person]:
         out.append(Person(row[0].strip(), row[1].strip(), row[2].strip(),
                           *f[3:17], tuple(row[17:])))
     return out
+
+
+# ---------------------------------------------------------------------------
+# appearances (`allplayers.csv`)
+# ---------------------------------------------------------------------------
+
+#: 25 columns, header lower-case where every other reference file shouts. The
+#: exact spelling is the gate: this is a positional file behind a header, and
+#: `g_lf` arriving where `g_cf` is expected shifts every count after it.
+APPEARANCE_HEADER = (
+    "id", "last", "first", "bat", "throw", "team", "g", "g_p", "g_sp", "g_rp",
+    "g_c", "g_1b", "g_2b", "g_3b", "g_ss", "g_lf", "g_cf", "g_rf", "g_of",
+    "g_dh", "g_ph", "g_pr", "first_g", "last_g", "season")
+
+#: The sixteen count columns, in file order, and the name each becomes in the
+#: derived table. `g` is games played and is **not** the sum of the rest: a
+#: player who caught and pinch-hit in the same game is one game and two
+#: positions.
+APPEARANCE_COUNTS = ("g", "g_p", "g_sp", "g_rp", "g_c", "g_1b", "g_2b", "g_3b",
+                     "g_ss", "g_lf", "g_cf", "g_rf", "g_of", "g_dh", "g_ph",
+                     "g_pr")
+
+#: `0` in `first_g`/`last_g` -- 1,494 of 11,476 rows. Not a date, and not
+#: 1 January of year zero either: Retrosheet has no game date for that
+#: player-season. It becomes NULL, for the same reason `bases_before` does on
+#: an unparsed play.
+NO_DATE = "0"
+
+
+@dataclass(frozen=True)
+class Appearance:
+    """One row of `allplayers.csv`: a person's season with one club.
+
+    **Not the whole corpus.** The file covers 1903-1962 and 3,422 people, all
+    of them Negro Leagues -- every id in it is already in a roster or in
+    `biofile.csv`, which is why it adds no *person* and was left out of the
+    reference pass (spec/05-DATABASE.md §1.2). What it adds is where those
+    people played, which the event files can only answer for the games that
+    survive.
+
+    A person may hold several of these in one season: 1,718 of the 11,476 rows
+    are a second club for a player already counted, and the file is keyed on
+    the three of `(id, season, team)` together.
+    """
+
+    person_id: str
+    last: str
+    first: str
+    bats: str | None
+    throws: str | None
+    team_id: str
+    counts: dict[str, int]
+    first_game: str | None
+    last_game: str | None
+    season: int
+
+
+def read_appearances(lines: list[str]) -> list[Appearance]:
+    """Read `allplayers.csv`, checking its shape before believing a field.
+
+    The counts are checked against each other where the file lets them be:
+    `g_p` is `g_sp + g_rp` in all 11,476 rows, so that one is a hard gate. The
+    outfield is **not**: `g_of` disagrees with `g_lf + g_cf + g_rf` in 207
+    rows, because a game in an unspecified outfield spot is recorded as
+    outfield and nothing more. Asserting the sum there would fail on correct
+    data, which is the failure mode that gets a check deleted rather than
+    fixed.
+    """
+    rows = _rows(lines)
+    if not rows:
+        return []
+    _check_header(rows[0], APPEARANCE_HEADER, "allplayers.csv")
+    idx = {name: i for i, name in enumerate(APPEARANCE_HEADER)}
+    out = []
+    for n, row in enumerate(rows[1:], 2):
+        if len(row) != len(APPEARANCE_HEADER):
+            raise LayoutError(f"allplayers.csv line {n}: {len(row)} columns")
+        f = [c.strip() for c in row]
+        if len(f[0]) != PLAYER_ID_LENGTH:
+            raise LayoutError(
+                f"allplayers.csv line {n}: player id {f[0]!r}")
+        counts = {}
+        for name in APPEARANCE_COUNTS:
+            value = f[idx[name]]
+            if not value.isdigit():
+                raise LayoutError(
+                    f"allplayers.csv line {n}: {name} is {value!r}")
+            counts[name] = int(value)
+        if counts["g_p"] != counts["g_sp"] + counts["g_rp"]:
+            raise LayoutError(
+                f"allplayers.csv line {n}: g_p {counts['g_p']} is not"
+                f" g_sp {counts['g_sp']} + g_rp {counts['g_rp']}")
+        if f[idx["bat"]] not in BATS or f[idx["throw"]] not in THROWS:
+            raise LayoutError(
+                f"allplayers.csv line {n}: bats/throws"
+                f" {f[idx['bat']]!r}/{f[idx['throw']]!r}")
+        if not f[idx["season"]].isdigit():
+            raise LayoutError(
+                f"allplayers.csv line {n}: season {f[idx['season']]!r}")
+        out.append(Appearance(
+            f[0], f[1], f[2], f[idx["bat"]] or None, f[idx["throw"]] or None,
+            f[idx["team"]], counts,
+            _game_date(f[idx["first_g"]]), _game_date(f[idx["last_g"]]),
+            int(f[idx["season"]])))
+    return out
+
+
+def _game_date(value: str) -> str | None:
+    """`YYYYMMDD` as ISO, or None for the `0` that means "no date known"."""
+    if value == NO_DATE or not value:
+        return None
+    if len(value) != 8 or not value.isdigit():
+        raise LayoutError(f"allplayers.csv: game date {value!r}")
+    return f"{value[:4]}-{value[4:6]}-{value[6:]}"

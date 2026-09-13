@@ -220,6 +220,13 @@ Retrosheet file describes still get a row, with null attributes and a `source`
 of `observed`, so a person nobody recorded is distinguishable from a broken
 join.
 
+`allplayers.csv` gets its own pass, `rsse appearances`, because what it adds is
+not identity but playing time: 11,476 person-seasons across the Negro Leagues,
+1903–1962, each carrying both Retrosheet's count of games played and a count of
+how many of them the event files actually hold. It is the one place in the
+project where the corpus can be measured against an outside count of the same
+thing.
+
 ### Commands
 
 ```
@@ -230,10 +237,11 @@ python3 -m rsse.cli verify                     # raw-layer integrity
 python3 -m rsse.cli replay --progress          # replay every game (~15 min)
 python3 -m rsse.cli tags --seasons 12          # era-spread tag census (~20 min)
 python3 -m rsse.cli derive --progress          # derived tables (~90 min)
-python3 -m rsse.cli verify --derived           # derived-table integrity (21 checks)
+python3 -m rsse.cli verify --derived           # derived-table integrity (37 checks)
 python3 -m rsse.cli secondary --progress       # comments + lineup_entries (~10 min)
 python3 -m rsse.cli earned-runs --check        # derive earned runs, then check them
 python3 -m rsse.cli reference                  # people, rosters, teams, parks
+python3 -m rsse.cli appearances                # allplayers.csv, vs what survives
 python3 -m rsse.cli coverage --rebuild         # coverage table
 python3 -m rsse.cli gamelogs --fetch           # game logs, for score reconciliation
 python3 -m rsse.cli reconcile --explain-er     # replayed scores vs published ones
@@ -254,17 +262,18 @@ anything `derive` itself does not rebuild.
 rsse/parser/     lexer, recursive-descent parser, AST that emits from its fields
 rsse/model/      half-inning replay, force derivation, `com` and game-log records
 rsse/semantic/   84 tags, implication, confidence, curated tags
-rsse/database/   archive DDL and ingest; derived, secondary, earned-run and
-                 coverage builds
+rsse/database/   archive DDL and ingest; derived, secondary, earned-run,
+                 reference, appearances and coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           327 tests; tests/gold/ holds 5 plays asserted through every layer
+tests/           416 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes
 
-Four ideas do most of the work, and each was arrived at the hard way. The full
-account of what building this found — every bug and what it implies — is in
-`BUILD-LOG.md`.
+Four ideas do most of the work, and each was arrived at the hard way. The
+reasoning behind each one lives next to the code it governs: `spec/` states the
+rules, and the module docstrings say what was measured and why the obvious
+reading was wrong.
 
 **The raw data is never the derived data.** Two databases, and the derived one
 holds no source of truth. That is what makes `--rebuild` safe and what makes a

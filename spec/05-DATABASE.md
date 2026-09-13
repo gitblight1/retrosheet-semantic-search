@@ -123,9 +123,34 @@ mirror `source_files` and `raw_records` and whose invariants are asserted
 separately (§8.1).
 
 `aux_files.kind` is one value per *format* — `roster`, `team`, `teamlist`,
-`park`, `bio` — because that is what a reader dispatches on: `TEAM####` is
-four positional fields and `teams.csv` is six with a header, so calling both
-`team` would put a branch in every consumer.
+`park`, `bio`, `appearances` — because that is what a reader dispatches on:
+`TEAM####` is four positional fields and `teams.csv` is six with a header, so
+calling both `team` would put a branch in every consumer.
+
+`parkcode.txt` is deliberately **not** ingested. It has the same nine columns
+as `ballparks.csv`, contributes no park id that file lacks, and covers 113 of
+the corpus's 292 sites against 285 — a strict subset, not a second source, so
+ingesting it would create two tables' worth of provenance for one fact.
+
+`allplayers.csv` was left out for a different reason and has since been added.
+Every one of its 3,422 ids is already in a roster or in `biofile.csv`, so it
+adds no *person* and has no place in the reference pass; what it adds is
+per-season appearance counts, which is a statistic about a person rather than a
+fact identifying one. It has its own kind and its own pass (§9).
+
+**Adding a kind is a schema migration, not a constant.** `CREATE TABLE IF NOT
+EXISTS` leaves an existing archive on the CHECK constraint it was built with,
+so the first `allplayers.csv` to reach a version-1 archive fails partway
+through an ingest — and re-ingesting 31 million records to widen one constraint
+is not a plan. `rsse ingest` runs `schema.migrate_archive` before it writes
+anything, which rebuilds the 3,435-row `aux_files` table under the current DDL.
+
+The order of that rebuild is not the obvious one. `ALTER TABLE ... RENAME TO`
+rewrites *other* tables' `REFERENCES` clauses to follow the rename (SQLite
+3.25+), so renaming `aux_files` out of the way silently repoints `aux_records`
+at `aux_files_old` and leaves it there after the drop. The new table is built
+under its own name and renamed *into* place, which nothing references, and
+`PRAGMA foreign_key_check` is run afterwards as proof rather than confidence.
 
 `aux_files.final_newline` records whether the file's last line carries a
 terminator. Exactly one of the 3,435 files does not, and without the column it
@@ -249,6 +274,7 @@ CREATE TABLE plays (
   event_modifiers TEXT NOT NULL,            -- JSON array
   event_advances TEXT NOT NULL,             -- JSON array
   annotations    TEXT NOT NULL,             -- JSON [[offset,char],...]
+  event_location TEXT,                      -- the zone, lifted; NULL if none (§3.2)
 
   -- Nullable: NULL for an unparsed play, whose state was never computed.
   -- A stored '000' would read as bases genuinely empty (03-STATE §7.1).
@@ -291,6 +317,8 @@ CREATE INDEX ix_plays_game ON plays (game_id, seq);
 -- (§7 option 2), so it carries no REFERENCES clause. It is provenance: every
 -- derived row can name the verbatim line it came from.
 CREATE INDEX ix_plays_status ON plays (parse_status) WHERE parse_status <> 'ok';
+CREATE INDEX ix_plays_location ON plays (event_location, play_id)
+  WHERE event_location IS NOT NULL;
 ```
 
 `batter_ran` records whether the batter left the box
@@ -420,6 +448,39 @@ putout group, a base-running event's parameters, or an advance parameter —
 because the same physical play moves between those sections depending on where
 the out occurred (`K23` versus `K.3XH(21)`). Requiring a query to know which
 section a play was written in would defeat the point of the layer.
+
+### 3.2 `event_location` is a lifted copy, and is gated as one
+
+The hit location lives in the modifier list — `S8/L78D` puts trajectory `L` and
+zone `78D` in one `hit` modifier — and `event_modifiers` keeps it there,
+verbatim, like everything else in this layer. `event_location` is the same
+string a second time, in a column, so it can be indexed.
+
+That makes it the first **redundant** column in `plays`, and redundant columns
+are where a positional insert quietly writes 38 plausible values into 38
+columns. Two checks in `rsse verify --derived` are shaped for it: every
+non-NULL value must still be a suffix of one of its own play's modifiers, and
+every value must be zone-shaped — a digit, then qualifiers
+([02-GRAMMAR](02-GRAMMAR.md) §2.1). The first is a weak gate for the short
+values and a total one for a column that has stopped corresponding to its row,
+which is the failure it exists for.
+
+The location is **not normalised**. Retrosheet publishes the zone system as a
+diagram and nothing else, so any rewriting here would be this project's reading
+of a picture ([02-GRAMMAR](02-GRAMMAR.md) §2.1 makes the same decision for the
+raw text).
+
+NULL means the scorer recorded no location, which is most of the corpus: 27.9%
+of parsed plays carry one, 60.4% of the 1990s against 2.8% of the 1910s. A
+trajectory with no zone (`/G`) stays NULL, because a trajectory is not a
+location. The index is partial for the same reason — `WHERE event_location IS
+NOT NULL` costs a quarter of a full index and serves every query that can use
+it ([06-QUERY](06-QUERY.md) §3.4).
+
+Across 483,561 sampled plays, no play carries two located `hit` modifiers, so
+"the first" and "the only" are the same value. That is asserted in the tests
+rather than assumed, because the day it stops being true this column silently
+starts answering a different question.
 
 ## 4. Tags
 
@@ -564,9 +625,16 @@ So the full sequence after a rebuild is:
 rsse derive --rebuild        # plays, advances, credits, tags   (~90 min)
 rsse secondary               # comments + lineup_entries        (~10 min)
 rsse earned-runs --check     # earned runs, then the 3-way check (~21 min)
+rsse reference               # people, rosters, teams, parks    (~5 s)
+rsse appearances             # allplayers.csv, measured (§9)    (~2 s)
 rsse coverage --rebuild      # what the corpus covers           (~10 s)
-rsse verify --derived        # 27 integrity checks              (~5 min)
+rsse verify --derived        # 37 integrity checks              (~5 min)
 ```
+
+`reference` and `appearances` both follow `secondary`: the first reads
+`lineup_entries` to find every person the corpus names, the second reads it to
+count what survives. `appearances` also needs `rsse ingest --aux` to have put
+`allplayers.csv` in the archive at all.
 
 **`earned-runs` must follow `secondary`, and the dependency is silent.** The
 pitcher charged with a run comes from `lineup_entries`
@@ -838,3 +906,85 @@ The first version of that measurement said **106,537** games were out of
 range. The dates are not zero-padded — `4/20/1912` — and slicing them in SQL
 produced garbage on every one. `parks.start_iso` / `end_iso` exist so that
 nobody does it again.
+
+## 9. Appearances: `allplayers.csv`
+
+Its own pass (`rsse appearances`), and the separation is the point. Everything
+§8 builds answers *who someone is*. This answers **how much someone played and
+where on the field**, which is a statistic about a person rather than a fact
+identifying one — and every id in the file is already in `people`, so folding
+it into `reference` would add a table to a pass whose contract it does not
+share.
+
+```sql
+CREATE TABLE appearances (
+  person_id   TEXT NOT NULL,
+  season      INTEGER NOT NULL,
+  team_id     TEXT NOT NULL,            -- part of the key; see below
+  last TEXT, first TEXT, bats TEXT, throws TEXT,
+  first_game  TEXT,                     -- ISO, or NULL where the file writes 0
+  last_game   TEXT,
+  g INTEGER NOT NULL,                   -- games played, not the sum of the rest
+  g_p, g_sp, g_rp, g_c, g_1b, g_2b, g_3b, g_ss,
+  g_lf, g_cf, g_rf, g_of, g_dh, g_ph, g_pr,
+  games_in_corpus INTEGER NOT NULL,     -- measured, not copied
+  PRIMARY KEY (person_id, season, team_id)
+);
+```
+
+**The file is Negro Leagues, 1903–1962**, whatever its name says: 3,422 people,
+11,476 rows, 49 seasons. That narrowness is what makes it worth having. For
+those seasons Retrosheet knows how many games a player played from sources the
+event files do not contain, which makes this the only place in the project
+where the corpus can be measured against an outside count of the same thing.
+
+`team_id` is part of the key because 1,718 of the 11,476 rows are a second club
+for a player already counted that season. Summing them into one row would lose
+which club the games were played for.
+
+`games_in_corpus` is the column the table exists for. It is a **measurement**:
+distinct games in `lineup_entries` naming that person, in that season, for that
+club — where the club comes from `games.home_team`/`away_team`, since
+`lineup_entries.team` is 0 visitor / 1 home and reading it as a team id would
+attribute every road appearance to the wrong side and still look plausible. A
+person-season with no surviving game is **0, not NULL**: the corpus genuinely
+holds none, and that is an answer (§3, and [03-STATE](03-STATE.md) §7 on the
+difference).
+
+The comparison is a **diagnostic, not a gate**, for the same reason the park
+date check is (§8.3). A disagreement is a fact about what survives. `rsse
+coverage` counts the games that are missing; this counts the *playing* that is
+missing, and the two do not have to agree.
+
+What it measures, on the current corpus:
+
+| | |
+|---|---|
+| games the file counts | 110,772 |
+| games the corpus holds | **47,713 (43.1%)** |
+| person-seasons with no surviving game | 4,747 of 11,476 |
+| rows where the corpus holds *more* than the file counts | 207 |
+
+The 43.1% is the finding. It is a much sharper statement of the Negro Leagues
+gap than a game count can be, because a surviving game covers eighteen players
+and a lost one loses eighteen.
+
+The 207 rows going the other way are **not explained here**, and guessing would
+be worse than leaving them counted. They are concentrated in 1933–34 (189 of
+207) and the excess is not only exhibition play — one 1934 player reads 8 games
+in the file against 26 regular-season games in the corpus — so the two sources
+are counting different things rather than one being incomplete. Which
+definition of "a game" the file uses is Retrosheet's to state.
+
+That 207 is the same number as the `g_of` disagreements below. The two sets
+overlap in **3** rows: it is a coincidence, recorded here so that the next
+person to notice it does not spend an afternoon on it.
+
+Two things the reader checks and two it deliberately does not. `g_p` equals
+`g_sp + g_rp` in all 11,476 rows, so that is a hard gate — a row where it fails
+is a row whose columns have shifted. `g_of` disagrees with `g_lf + g_cf + g_rf`
+in **207** rows, because a game in an unspecified outfield spot is counted in
+`g_of` alone, so asserting that sum would fail on correct data. Two rows have
+`g` lower than a position count they carry — Bill Monroe's 1913 line reads 6
+games and 7 at second base — and both numbers are kept as written, because
+reconciling them would be inventing one of the two.

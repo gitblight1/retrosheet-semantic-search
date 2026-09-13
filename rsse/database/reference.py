@@ -124,6 +124,11 @@ CREATE TABLE IF NOT EXISTS parks (
 REFERENCE_INDEXES = """
 CREATE INDEX IF NOT EXISTS ix_roster_person ON roster_entries (person_id);
 CREATE INDEX IF NOT EXISTS ix_roster_team ON roster_entries (team_id, season);
+-- `.position_played()` drives its subquery off this rather than scanning
+-- 121,600 lines: the three columns are the whole of what it selects, so the
+-- index answers the query without touching the table.
+CREATE INDEX IF NOT EXISTS ix_roster_position
+  ON roster_entries (position, season, person_id);
 CREATE INDEX IF NOT EXISTS ix_teams_season ON teams (season);
 CREATE INDEX IF NOT EXISTS ix_people_name ON people (last, first);
 """

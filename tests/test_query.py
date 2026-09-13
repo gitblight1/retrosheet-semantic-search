@@ -424,6 +424,184 @@ class BenchHarness(QueryBase):
         names = [b.name for b in bench.BENCHMARKS]
         self.assertEqual(len(names), len(set(names)))
 
+class HitLocations(QueryBase):
+    """`plays.event_location` and the predicate over it (§3).
+
+    The column is a lifted copy of something already in `event_modifiers`, so
+    every test here is really the same question: does the copy still say what
+    the modifier says.
+    """
+
+    def located(self):
+        return self.conn.execute(
+            "SELECT event_raw, event_location FROM plays"
+            " WHERE event_location IS NOT NULL").fetchall()
+
+    def test_the_column_is_filled_from_the_modifier(self):
+        rows = self.located()
+        self.assertEqual(len(rows), 120)
+        for raw, loc in rows:
+            with self.subTest(raw=raw):
+                self.assertIn(loc, raw)
+
+    def test_a_play_with_no_location_is_null_not_empty(self):
+        # `''` and NULL would both be falsy in Python and are not the same
+        # statement: one says the scorer wrote an empty zone, which never
+        # happens, and the other says they wrote none.
+        [(n,)] = self.conn.execute(
+            "SELECT count(*) FROM plays WHERE event_location = ''")
+        self.assertEqual(n, 0)
+
+    def test_a_trajectory_without_a_location_stays_null(self):
+        # `/G` is a ground ball to nowhere in particular: a `hit` modifier
+        # with a trajectory and no zone. Lifting the trajectory into this
+        # column would make `.hit_location('G')` answer something.
+        [(n,)] = self.conn.execute(
+            "SELECT count(*) FROM plays WHERE event_raw LIKE '%/G'"
+            " AND event_location IS NOT NULL")
+        self.assertEqual(n, 0)
+
+    def test_an_exact_zone_matches_only_itself(self):
+        got = {r.event_raw for r in Search().hit_location("3").run(self.conn)}
+        self.assertTrue(got)
+        for raw in got:
+            self.assertIn("3", raw)
+        self.assertNotIn("31/G34S.3-H;1-2", got,
+                         "34S is not zone 3")
+
+    def test_a_starred_zone_matches_everything_inside_it(self):
+        exact = Search().hit_location("7").count(self.conn)
+        prefix = Search().hit_location("7*").count(self.conn)
+        self.assertGreater(prefix, exact,
+                           "7* must also find 7M, 78M and the rest")
+
+    def test_the_star_is_the_only_wildcard(self):
+        # `%` would be a leading-wildcard scan dressed up as a filter, so it
+        # is a literal here and matches nothing rather than everything.
+        self.assertEqual(Search().hit_location("%7%").count(self.conn), 0)
+
+    def test_a_bare_star_is_refused(self):
+        with self.assertRaises(QueryError):
+            Search().hit_location("*")
+
+    def test_the_old_substring_behaviour_is_gone(self):
+        # `.hit_location('8')` used to match `E8` and every fielder string
+        # containing an 8, because the test was `event_modifiers LIKE '%8%'`.
+        for raw in {r.event_raw
+                    for r in Search().hit_location("8").run(self.conn)}:
+            self.assertNotIn("E8", raw)
+
+    def test_hit_located_is_the_denominator(self):
+        self.assertEqual(Search().hit_located().count(self.conn), 120)
+
+    def test_the_predicate_can_use_the_partial_index(self):
+        # The `IS NOT NULL` term is redundant with the equality beside it and
+        # is there for exactly this: without it SQLite will not prove the
+        # partial index applies, and the query scans 17.9 million rows.
+        plan = Search().hit_location("7").explain(self.conn)
+        self.assertIn("ix_plays_location", str(plan))
+
+    def test_an_old_database_gets_a_sentence_not_an_operational_error(self):
+        # A database derived before the column existed is a perfectly good
+        # database that cannot answer this one question. `no such column:
+        # p.event_location` is true and says nothing about which pass fixes it.
+        old = sqlite3.connect(":memory:")
+        old.executescript("CREATE TABLE plays (play_id INTEGER, game_key"
+                          " INTEGER, parse_status TEXT);"
+                          "CREATE TABLE games (game_key INTEGER, game_type"
+                          " TEXT, season INTEGER);")
+        with self.assertRaises(QueryError) as caught:
+            Search().hit_location("7").count(old)
+        self.assertIn("derive --rebuild", str(caught.exception))
+        old.close()
+
+    def test_only_one_located_modifier_per_play(self):
+        # `Event.hit_location` returns the first, which is only the right
+        # answer while there is never a second. Asserted rather than trusted.
+        from rsse.parser.parser import parse
+        for (raw,) in self.conn.execute(
+                "SELECT event_raw FROM plays WHERE parse_status <> 'unparsed'"):
+            located = [m for m in parse(raw).event.modifiers
+                       if m.kind == "hit" and m.location]
+            self.assertLessEqual(len(located), 1, raw)
+
+
+class PositionPlayed(QueryBase):
+    """`.position_played()` over `roster_entries` (§3).
+
+    A season fact used as a play filter, which is the whole of what can go
+    wrong with it.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        super().setUpClass()
+        write = sqlite3.connect(str(cls.db))
+        write.executescript(
+            "CREATE TABLE IF NOT EXISTS roster_entries ("
+            " person_id TEXT, season INTEGER, team_id TEXT,"
+            " stated_team_id TEXT, last TEXT, first TEXT, bats TEXT,"
+            " throws TEXT, position TEXT,"
+            " PRIMARY KEY (person_id, season, team_id));")
+        batters = [r[0] for r in write.execute(
+            "SELECT DISTINCT batter_id FROM plays ORDER BY batter_id")]
+        write.executemany(
+            "INSERT OR REPLACE INTO roster_entries VALUES"
+            " (?,2000,'KCA',NULL,'L','F','R','R',?)",
+            [(b, "SS" if i % 3 == 0 else "OF")
+             for i, b in enumerate(batters)])
+        # The same person, a different season: the predicate must not match
+        # plays from a season this line does not cover.
+        write.execute("INSERT OR REPLACE INTO roster_entries VALUES"
+                      " (?,1999,'KCA',NULL,'L','F','R','R','P')",
+                      (batters[0],))
+        write.commit()
+        write.close()
+        cls.n_ss = sum(1 for i in range(len(batters)) if i % 3 == 0)
+
+    def test_it_finds_plays_by_players_listed_there(self):
+        got = Search().position_played("SS").count(self.conn)
+        self.assertGreater(got, 0)
+        self.assertEqual(
+            got + Search().position_played("OF").count(self.conn),
+            Search().count(self.conn))
+
+    def test_the_season_has_to_match(self):
+        # The one 1999 line is a pitcher, and there are no 1999 games.
+        self.assertEqual(Search().position_played("P").count(self.conn), 0)
+
+    def test_of_does_not_imply_lf(self):
+        # An undifferentiated outfielder is what the early files record.
+        # Folding `OF` into the three modern positions would invent a
+        # precision the roster line does not have.
+        self.assertEqual(Search().position_played("LF").count(self.conn), 0)
+        self.assertGreater(Search().position_played("OF").count(self.conn), 0)
+
+    def test_it_is_case_insensitive(self):
+        self.assertEqual(Search().position_played("ss").count(self.conn),
+                         Search().position_played("SS").count(self.conn))
+
+    def test_an_unknown_position_is_refused_not_answered_with_nothing(self):
+        # A typo that returns zero rows is a typo that reads as a finding.
+        with self.assertRaises(QueryError):
+            Search().position_played("shortstop")
+
+    def test_a_database_with_no_rosters_gets_a_sentence(self):
+        bare = sqlite3.connect(":memory:")
+        bare.executescript("CREATE TABLE plays (play_id INTEGER, game_key"
+                           " INTEGER, batter_id TEXT, parse_status TEXT);"
+                           "CREATE TABLE games (game_key INTEGER, game_type"
+                           " TEXT, season INTEGER);")
+        with self.assertRaises(QueryError) as caught:
+            Search().position_played("SS").count(bare)
+        self.assertIn("rsse reference", str(caught.exception))
+        bare.close()
+
+    def test_it_joins_games_rather_than_correlating(self):
+        sql, _ = Search().position_played("SS")._compile("p.play_id")
+        self.assertIn("roster_entries", sql)
+        self.assertNotIn("EXISTS", sql)
+
 
 if __name__ == "__main__":
     unittest.main()

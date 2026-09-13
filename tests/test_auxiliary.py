@@ -139,15 +139,17 @@ class Discovery(unittest.TestCase):
         kinds = {kind: path.name for kind, path, _season in found}
         self.assertEqual(kinds, {"roster": "BOS1998.ROS", "team": "TEAM1998",
                                  "park": "ballparks.csv", "bio": "biofile.csv",
-                                 "teamlist": "teams.csv"})
+                                 "teamlist": "teams.csv",
+                                 "appearances": "allplayers.csv"})
         # Event files belong to `source_files`, not here.
         self.assertNotIn("1998BOS.EVA", {p.name for _k, p, _s in found})
         # `parkcode.txt` is a strict subset of `ballparks.csv` -- same nine
-        # columns, no park id it lacks -- and `allplayers.csv` adds no person
-        # that a roster or biography does not already carry. Both are left out
-        # deliberately, so this asserts the decision rather than the accident.
+        # columns, no park id it lacks -- so it stays out: two tables' worth
+        # of provenance for one fact. `allplayers.csv` was out for a different
+        # reason, that it adds no *person*, and it is in now because the pass
+        # that wants it is not the one that builds people (`rsse appearances`,
+        # spec/05-DATABASE.md §9). Asserting the decision, not the accident.
         self.assertNotIn("parkcode.txt", {p.name for _k, p, _s in found})
-        self.assertNotIn("allplayers.csv", {p.name for _k, p, _s in found})
 
     def test_the_season_comes_from_the_name(self):
         with tempfile.TemporaryDirectory() as tmp:

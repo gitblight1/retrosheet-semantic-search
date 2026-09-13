@@ -101,7 +101,9 @@ one player holds a position on any given play. It is asserted in
 | `.double_play()` / `.triple_play()` | tags |
 | `.stolen_base(base=None)` / `.caught_stealing(base=None)` | tags, optional base |
 | `.error(fielder=None)` | `fielding_credits.credit='error'`, optional position |
-| `.hit_location(pattern)` | `LIKE` on the retained location string |
+| `.hit_location(zone)` | `plays.event_location = zone`, or a prefix range when the zone ends `*` — see §3.4 |
+| `.hit_located()` | the play carries *a* location, whatever it is — the denominator for any question about zones |
+| `.position_played(position)` | the batter's roster line for that season lists `position` — see §3.5 |
 | `.event_matches(regex)` | regex over `event_raw` — the escape hatch for anything the ontology does not yet name |
 
 ### 3.1 Fielding sequences
@@ -199,6 +201,56 @@ The concrete use is in [08-WORKED-EXAMPLE](08-WORKED-EXAMPLE.md): the same
 plays, queried with `.force_play(at="H")` and with
 `.force_play(at="H", include_tag_outs=True)`, must differ by exactly the
 tag-out cases.
+
+### 3.4 Hit locations are a column, and `*` is the only wildcard
+
+`plays.event_location` holds Retrosheet's zone string as written — `7`, `78D`,
+`56`, `9LS` — lifted out of the modifier list at derive time
+([05-DATABASE](05-DATABASE.md) §3.2) and NULL where the scorer recorded none.
+
+`.hit_location('7')` is an equality test. `.hit_location('7*')` is a prefix
+range, which is how to ask for left field and everything inside it: the zone
+string is written outward from the fielder, so `7`, `7D`, `7LS`, `78` and `78D`
+all begin with it. Nothing else is a wildcard, and `%` in particular is not.
+
+Both forms are range tests over `ix_plays_location`, which is **partial** —
+`WHERE event_location IS NOT NULL`, because 72% of plays have none and no zone
+query wants them. Every predicate this method builds spells `event_location IS
+NOT NULL` out explicitly even where the equality beside it makes that
+redundant; without the term SQLite will not prove the partial index applies.
+
+This replaced a `LIKE '%pattern%'` over the emitted modifier JSON, which was
+wrong in both directions. It matched the JSON text rather than the location, so
+`'8'` also found every play carrying `/E8`; and a leading wildcard cannot use
+an index, so the natural query was the one that scanned.
+
+**27.9% of parsed plays carry a location, and they are overwhelmingly modern**
+— 60.4% of the 1990s against 2.8% of the 1910s. A zone query over the whole
+corpus is asking a question most of the corpus cannot answer, which is what
+`.coverage()` is for (§6.1) and what `.hit_located()` gives a denominator for.
+
+### 3.5 `.position_played()` is a season fact used as a play filter
+
+It matches plays whose batter has a `roster_entries` line for that season
+listing `position` — the position the club carried them at, not where they were
+standing when the play happened. `.fielder(6, id)` answers the second question,
+from the lineup timeline, and only for the fielding side.
+
+`OF` is its own value and does not imply `LF`/`CF`/`RF`. The corpus spans the
+undifferentiated outfielder of the early files and the three modern ones, and
+folding them together would invent a precision the roster line does not have.
+5,661 roster lines carry no position at all; those people match nothing.
+
+An unrecognised position raises rather than returning nothing, because a typo
+that returns zero rows reads as a finding.
+
+It compiles to a row-value `IN` over `(batter_id, season)`, not a correlated
+`EXISTS` on `g.season` — the same reason every other sub-table predicate here
+does (§7): correlating walks 121,600 roster lines once per candidate play
+instead of once. `ix_roster_position (position, season, person_id)` makes the
+subquery a covering-index seek: `.position_played('SS').season(1998)` went from
+6.40 s to **2.46 s** on the full corpus when the index was added, with the plan
+reading `SEARCH r USING COVERING INDEX`.
 
 ## 4. Certainty and quality
 

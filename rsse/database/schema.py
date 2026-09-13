@@ -20,7 +20,12 @@ from __future__ import annotations
 
 import sqlite3
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+
+#: Every format `aux_files` accepts, and the same set the CHECK constraint
+#: above spells out. Version 2 added `appearances` -- `allplayers.csv`, which
+#: earlier versions deliberately left out.
+AUX_KINDS = ("roster", "team", "teamlist", "park", "bio", "appearances")
 
 ARCHIVE_DDL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -115,8 +120,11 @@ CREATE TABLE IF NOT EXISTS aux_files (
   -- One kind per *format*, because that is what the reader dispatches on:
   -- `TEAM####` is four positional fields and `teams.csv` is six with a
   -- header, so calling both 'team' would put a branch in every consumer.
+  -- Keep in step with `AUX_KINDS` below. A test asserts the two agree,
+  -- because a CHECK and the constant the code validates against are exactly
+  -- the pair that drifts.
   kind          TEXT NOT NULL
-    CHECK (kind IN ('roster','team','teamlist','park','bio')),
+    CHECK (kind IN ('roster','team','teamlist','park','bio','appearances')),
   -- Rosters and team files are per-season; ballparks and biographies are not.
   season        INTEGER,
   sha256        TEXT NOT NULL,
@@ -255,6 +263,21 @@ CREATE TABLE IF NOT EXISTS plays (
   event_advances TEXT NOT NULL,
   annotations    TEXT NOT NULL,
 
+  -- The hit location, lifted out of the modifier list so it can be indexed.
+  -- Retrosheet's zone string as written (`7`, `78D`, `56`, `9LS`), never
+  -- normalised: the zone system is published only as a diagram and any
+  -- rewriting here would be this project's reading of a picture.
+  --
+  -- NULL for the 72% of plays that carry no location, which includes almost
+  -- the whole corpus before 1980 -- 2.8% of the 1910s against 60.4% of the
+  -- 1990s. NULL is "the scorer did not record one", and it is the reason the
+  -- index below is partial.
+  --
+  -- Redundant with `event_modifiers`, and deliberately so: it is a lifted
+  -- copy, not a second source, and `rsse verify` asserts that every value
+  -- here still appears in the modifier text it came from.
+  event_location TEXT,
+
   -- Nullable on purpose. An unparsed play's effect cannot be applied, so its
   -- base-out state is unknown; NOT NULL here forced the loader to write zeros,
   -- and a stored '000' is indistinguishable from bases genuinely empty. NULL
@@ -379,6 +402,14 @@ CREATE INDEX IF NOT EXISTS ix_plays_status ON plays (parse_status)
 CREATE INDEX IF NOT EXISTS ix_plays_batter_ran ON plays (batter_ran)
   WHERE batter_ran = 'unknown';
 
+-- Partial because 72% of plays have no location and no location query wants
+-- them: the index costs a quarter of what a full one would. `.hit_location()`
+-- spells `event_location IS NOT NULL` into every predicate it builds so that
+-- SQLite can see the partial index applies -- the term is redundant with the
+-- equality test beside it, and without it the planner falls back to a scan.
+CREATE INDEX IF NOT EXISTS ix_plays_location ON plays (event_location, play_id)
+  WHERE event_location IS NOT NULL;
+
 -- The force predicate of 06-QUERY §3.2, partial so it costs only the rows it
 -- serves rather than one entry per advance.
 CREATE INDEX IF NOT EXISTS ix_adv_force ON runner_advances
@@ -417,6 +448,83 @@ def create(conn: sqlite3.Connection) -> None:
             (SCHEMA_VERSION,),
         )
     conn.commit()
+
+
+def migrate_archive(conn: sqlite3.Connection) -> list[str]:
+    """Bring an existing archive up to `SCHEMA_VERSION`, returning what changed.
+
+    `CREATE TABLE IF NOT EXISTS` is not a migration: an archive built under
+    version 1 keeps version 1's CHECK constraint forever, and the first
+    `allplayers.csv` to reach it fails with `CHECK constraint failed` in the
+    middle of an ingest rather than at the start of one. Re-ingesting 31
+    million records to widen one constraint is not a plan either.
+
+    So the one thing version 2 changes is done here, by rebuilding a 3,435-row
+    table. The order matters and is not the obvious one: `ALTER TABLE ... RENAME
+    TO` rewrites every *other* table's `REFERENCES` clause to follow the rename
+    (SQLite 3.25+), so renaming `aux_files` out of the way would silently point
+    `aux_records` at `aux_files_old` and leave it there after the drop. Building
+    the new table under its own name and renaming it *into* place has no such
+    effect, because nothing references the temporary name.
+    """
+    done: list[str] = []
+    row = conn.execute("SELECT sql FROM sqlite_master"
+                       " WHERE type = 'table' AND name = 'aux_files'").fetchone()
+    if row and "'appearances'" not in row[0]:
+        columns = ",".join(r[1] for r in conn.execute(
+            "PRAGMA table_info(aux_files)"))
+        new_ddl = _statement(ARCHIVE_DDL, "aux_files").replace(
+            "aux_files", "aux_files_v2", 1)
+        conn.execute("PRAGMA foreign_keys = OFF")
+        try:
+            conn.execute("BEGIN")
+            conn.execute(new_ddl)
+            conn.execute(f"INSERT INTO aux_files_v2 ({columns})"
+                         f" SELECT {columns} FROM aux_files")
+            conn.execute("DROP TABLE aux_files")
+            conn.execute("ALTER TABLE aux_files_v2 RENAME TO aux_files")
+            conn.execute("COMMIT")
+            conn.executescript(INDEXES)
+            # Proof rather than confidence: if the rename left `aux_records`
+            # pointing at a table that no longer exists, every one of its rows
+            # is a violation and this returns them.
+            broken = conn.execute("PRAGMA foreign_key_check").fetchall()
+            if broken:
+                raise RuntimeError(
+                    f"aux_files migration left {len(broken)} dangling"
+                    f" references, e.g. {broken[0]}")
+        finally:
+            conn.execute("PRAGMA foreign_keys = ON")
+        done.append("aux_files: kind now accepts 'appearances'")
+    if done:
+        conn.execute("INSERT INTO schema_version VALUES (?, datetime('now'))",
+                     (SCHEMA_VERSION,))
+        conn.commit()
+    return done
+
+
+def _statement(script: str, table: str) -> str:
+    """The `CREATE TABLE` for ``table``, taken from the DDL rather than retyped.
+
+    A migration that carries its own copy of the target schema is a migration
+    that produces a table subtly unlike the one a fresh database gets, and the
+    difference shows up seasons later.
+
+    Scanned by line rather than split on `;`, which is the version that was
+    written first and which silently returned a statement truncated at the
+    semicolon inside a `--` comment. The comments are part of what is being
+    copied: they are what `sqlite_master` hands back to the next person who
+    asks the table what it is for.
+    """
+    want = f"CREATE TABLE IF NOT EXISTS {table} ("
+    lines = script.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip().startswith(want):
+            for j in range(i, len(lines)):
+                if lines[j].strip() == ");":
+                    return "\n".join(lines[i:j + 1])
+            break
+    raise KeyError(table)
 
 
 def create_indexes(conn: sqlite3.Connection) -> None:

@@ -16,6 +16,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field, replace
 
+from ..model import reference as ref
 from ..semantic.ontology import ONTOLOGY_VERSION, REGISTRY
 from .results import (CoverageReport, ExcludedCounts, ForceReport, PlayResult,
                       ResultSet)
@@ -28,6 +29,15 @@ POSTSEASON_TYPES = ("worldseries", "lcs", "divisionseries", "wildcard",
                     "championship")
 
 _BASES = {"1": 0, "2": 1, "3": 2}
+
+#: What to run to get the thing a predicate needs. Kept beside the check for
+#: the reason `NON_DERIVED_TABLES` in the CLI is: "the derived tables are
+#: stale" is the half-answer that sends somebody to the wrong command twice.
+_REBUILD_FOR = {
+    "plays.event_location": ("It was added after this database was derived;"
+                             " `rsse derive --rebuild` adds it."),
+    "roster_entries": "Run `rsse reference` to build it.",
+}
 
 #: Placeholder for the tag-confidence filter, substituted in `_compile` with
 #: the alias in scope. See `Search.tag`.
@@ -82,6 +92,11 @@ class Pred:
     #: reported by name at `run()` rather than raising while the query is
     #: being built.
     resolves: tuple[str, str] | None = None
+    #: `(kind, name)` for a table or column the predicate reads that an older
+    #: database may not have -- `('column', 'plays.event_location')`. Checked
+    #: before the query runs so the failure is a sentence naming the pass that
+    #: fixes it, rather than `OperationalError: no such column`.
+    requires: tuple[str, str] | None = None
 
 
 def _key(name: str) -> str:
@@ -358,6 +373,40 @@ class Search:
 
     # -- §3 play predicates ----------------------------------------------
 
+    def position_played(self, position: str) -> "Search":
+        """Plays batted by someone whose roster line that season lists
+        ``position`` (§3).
+
+        A **season** fact, not a play fact, and the difference is the whole
+        caveat. The roster file gives one position per person per club per
+        season -- the position they were carried at -- so this finds plays by
+        players *listed* as shortstops, not plays on which the batter was
+        standing at short. `.fielder(6, id)` answers that one, from the lineup
+        timeline, and only for the fielding side.
+
+        `OF` is its own value and does not imply `LF`/`CF`/`RF`: a corpus that
+        spans 1908 to now carries both the undifferentiated outfielder of the
+        early files and the three modern ones, and folding them together here
+        would invent a precision the roster line does not have. 5,661 lines
+        carry no position at all, and those people match nothing rather than
+        matching everything.
+        """
+        position = position.upper()
+        if position not in ref.POSITIONS or not position:
+            raise QueryError(
+                f"unknown position {position!r}; roster lines carry "
+                + ", ".join(sorted(p for p in ref.POSITIONS if p)))
+        # A row-value `IN` over (person, season), not a correlated `EXISTS` on
+        # `g.season`: the same reason as every other sub-table predicate here
+        # -- correlating makes SQLite walk 121,600 roster lines once per
+        # candidate play instead of once.
+        return self._with(Pred(
+            "(p.batter_id, g.season) IN ("
+            " SELECT r.person_id, r.season FROM roster_entries r"
+            "  WHERE r.position = ?)",
+            (position,), needs_games=True,
+            requires=("table", "roster_entries")))
+
     def tag(self, name: str) -> "Search":
         """Match a tag from the ontology (§3).
 
@@ -471,9 +520,58 @@ class Search:
             "p.play_id IN (SELECT f.play_id FROM fielding_credits f WHERE "
             + " AND ".join(clauses) + ")", tuple(params)))
 
-    def hit_location(self, pattern: str) -> "Search":
-        # Locations live in the modifier list, kept as emitted text.
-        return self._with(Pred("p.event_modifiers LIKE ?", (f"%{pattern}%",)))
+    def hit_location(self, zone: str) -> "Search":
+        """Plays whose hit modifier names Retrosheet zone ``zone`` (§3).
+
+        A trailing `*` means "and everything inside it": `7*` is left field
+        proper plus `7D`, `7LS`, `78`, `78D` and the rest, because the zone
+        string is written outward from the fielder. Nothing else is a
+        wildcard, and `%` in particular is not -- offering full `LIKE` here
+        would be offering a leading-wildcard scan of 17.9 million rows dressed
+        up as a filter.
+
+        This used to be `event_modifiers LIKE '%zone%'`, which was wrong twice
+        over. It matched the JSON text rather than the location, so `8` also
+        found every play carrying `E8` or an `8` anywhere in a fielder string;
+        and a leading wildcard cannot use an index, so the one query shape
+        anybody would actually write was the one that scanned. The location is
+        now lifted to its own column at derive time (spec/05-DATABASE.md §3.1)
+        and this is a range test over `ix_plays_location`.
+
+        27.9% of parsed plays carry one, and almost all of them are modern:
+        60.4% of the 1990s against 2.8% of the 1910s. A query over the whole
+        corpus is asking a question the early corpus cannot answer, which is
+        `.coverage()`'s department rather than this one's.
+        """
+        if zone.endswith("*"):
+            prefix = zone[:-1]
+            if not prefix:
+                raise QueryError("`*` alone is not a zone")
+            # An explicit range rather than `LIKE 'x%'`: with the default
+            # `case_sensitive_like=OFF` SQLite will not use a BINARY index for
+            # a LIKE whose pattern contains a letter, and every qualifier in
+            # this vocabulary is a letter. The upper bound is the prefix with
+            # its last character bumped, which is the standard trick and needs
+            # no assumption about what may follow.
+            hi = prefix[:-1] + chr(ord(prefix[-1]) + 1)
+            return self._with(Pred(
+                "(p.event_location IS NOT NULL"
+                " AND p.event_location >= ? AND p.event_location < ?)",
+                (prefix, hi), requires=("column", "plays.event_location")))
+        return self._with(Pred(
+            "(p.event_location IS NOT NULL AND p.event_location = ?)",
+            (zone,), requires=("column", "plays.event_location")))
+
+    def hit_located(self) -> "Search":
+        """Plays whose scorer recorded *a* hit location, whatever it was.
+
+        The denominator for any question about locations, and worth having
+        separately: "no plays to zone 7 in 1912" and "no located plays at all
+        in 1912" are different answers and the first one is false.
+        """
+        return self._with(Pred(
+            "p.event_location IS NOT NULL",
+            requires=("column", "plays.event_location")))
 
     def event_matches(self, pattern: str) -> "Search":
         return self._with(Pred("p.event_raw REGEXP ?", (pattern,)))
@@ -719,9 +817,36 @@ class Search:
                               "milliseconds"] if scan else [])}
 
     def count(self, conn) -> int:
+        self.check_schema(conn)
         self.check_names(conn)
         sql, params = self._compile("COUNT(*)", order=False)
         return conn.execute(sql, params).fetchone()[0]
+
+    def check_schema(self, conn) -> None:
+        """Refuse a predicate this database has no column or table for.
+
+        The derived layer grows, and a database derived a month ago is a
+        perfectly good database that cannot answer every question this API can
+        ask. `.hit_location()` against one built before `plays.event_location`
+        existed raised `no such column: p.event_location` from inside SQLite,
+        which is true, unhelpful, and does not say that one `derive` fixes it.
+        """
+        for pred in self.preds:
+            if not pred.requires:
+                continue
+            kind, name = pred.requires
+            if kind == "table":
+                present = conn.execute(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+                    " AND name = ?", (name,)).fetchone()[0]
+            else:
+                table, column = name.split(".")
+                present = any(r[1] == column for r in
+                              conn.execute(f"PRAGMA table_info({table})"))
+            if not present:
+                raise QueryError(
+                    f"this database has no {name}, so that predicate cannot"
+                    f" be answered here. {_REBUILD_FOR[name]}")
 
     def check_names(self, conn) -> None:
         """Refuse a human name that resolves to none or to several.
@@ -763,6 +888,7 @@ class Search:
     def run(self, conn, limit: int | None = None) -> ResultSet:
         from .report import build_coverage, build_excluded, build_force
         search = self if limit is None else self.limit(limit)
+        search.check_schema(conn)
         search.check_names(conn)
         unknown = search.validate(conn)
         if unknown:

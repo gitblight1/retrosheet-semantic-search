@@ -352,6 +352,10 @@ continuity of `outs_before` against the previous play's `outs_after`, the two
 run invariants, base-state agreement between `plays` and `runner_advances`, and
 `NULL`-state discipline on unparsed rows.
 
+It has grown to **37**: the original twenty, plus the earned-run, reference,
+replay and hit-location checks, each group skipped with a printed note when the
+table or column it reads is absent.
+
 It runs after every `derive`. The first time it ran it failed three checks, and
 all three traced to one omission: **a play's `parse_status` described its own
 event string and said nothing about whether the state it inherited was
@@ -678,6 +682,36 @@ play whose event string never said it was reviewed, concentrated in 2014–2017
 and absent from 2018 on. Those 38 are a gap in Retrosheet's annotation, not in
 the derivation, and they are the reason the invariant is stated as *both
 conditions* rather than as a count.
+
+### 4.7 A lifted column is a new class of thing to check
+
+`plays.event_location` ([05-DATABASE](05-DATABASE.md) §3.2) is the first column
+in the derived layer that holds a *copy* of something the same row already
+carries. Every other column is either verbatim from the archive or computed by
+a rule; this one is neither, and that is a failure mode nothing here had a
+check shaped for.
+
+The failure it invites is not a wrong reading. It is a **shift**: a positional
+insert into a 39-column table writes 39 plausible values into 39 columns and
+fails nothing, and the lifted column is the one that stops corresponding to its
+own row without changing shape. That is the same lesson as the doubled corpus
+(§4) one layer down — a check that validates each value in isolation cannot see
+it, because each value is still a valid location.
+
+So the two checks compare it to its source rather than to a vocabulary:
+
+- **location not in its own modifier list** — the value must be a suffix of one
+  of that play's emitted modifiers, which is what a `hit` modifier emits.
+  Honestly weak for the short values (a column wrongly reading `8` on a play
+  carrying `/E8` passes) and total for a column that has stopped corresponding
+  to its row at all, which is the one it is for.
+- **location is not zone-shaped** — a digit, then qualifiers. Straight off the
+  grammar, and it catches an empty string, which is a missing location
+  masquerading as a present one.
+
+Both are skipped, with a note, on a database derived before the column existed.
+That is the same guard the reference, earned-run and replay checks carry: a
+check that cannot run should say so rather than pass.
 
 ## 5. Performance suite
 

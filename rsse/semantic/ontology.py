@@ -83,8 +83,9 @@ class PlayFacts:
         hit = next((m for m in event.modifiers if m.kind == "hit"), None)
         self.trajectory = hit.trajectory if hit else None
         # The hit *location* is deliberately not lifted here: no tag keys on
-        # it, and `.hit_location()` is a column filter on `plays`
-        # (spec/06-QUERY.md §3), not a tag join.
+        # it, and `.hit_location()` is a column filter on `plays.event_location`
+        # (spec/06-QUERY.md §3.4), not a tag join. That column is populated by
+        # the derive, from `Event.hit_location`, not from anything here.
 
         self.advances = outcome.advances
         self.seqs = credit_sequences(event)

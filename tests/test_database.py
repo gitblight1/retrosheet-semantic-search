@@ -243,6 +243,26 @@ class UntrustedState(unittest.TestCase):
             self.assertIsNone(bad[0][column],
                               f"{column} must be NULL, not an invented zero")
 
+    def test_the_unparsed_row_also_stores_no_location(self):
+        # `event_location` sits between the event columns and the state
+        # columns, so an insert that forgot it here would shift every NULL
+        # after it by one and store an out count in `bases_before` -- and
+        # `_check_row` would not fire, because the row would still be the
+        # right length if the writer also dropped one at the end.
+        rows = self.derive()
+        bad = [r for r in rows if r["parse_status"] == "unparsed"][0]
+        self.assertIsNone(bad["event_location"])
+        self.assertEqual(bad["event_raw"], "S7/L6d")
+
+    def test_the_location_is_lifted_from_the_modifier(self):
+        rows = self.derive()
+        by_batter = {r["batter_id"]: r for r in rows}
+        self.assertEqual(by_batter["aaaaa001"]["event_location"], "8")
+        self.assertEqual(by_batter["ccccc001"]["event_location"], "9LD")
+        self.assertIn("8", by_batter["ddddd001"]["event_modifiers"])
+        self.assertEqual(by_batter["ddddd001"]["event_location"], "8",
+                         "`F8` is trajectory F, zone 8")
+
     def test_later_plays_in_the_half_are_untrusted(self):
         rows = self.derive()
         after = [r for r in rows if r["batting_team"] == 0][2:]

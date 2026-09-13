@@ -261,6 +261,12 @@ def cmd_ingest(args: argparse.Namespace) -> int:
     for pragma in dbschema.LOAD_PRAGMAS:
         conn.execute(pragma)
     dbschema.create(conn)
+    # Before anything is written. `CREATE TABLE IF NOT EXISTS` leaves an
+    # existing archive on the schema it was built with, so an archive from
+    # before `allplayers.csv` had a kind would take the new file half way
+    # through an ingest and then fail its CHECK.
+    for change in dbschema.migrate_archive(conn):
+        print(f"migrated: {change}", file=sys.stderr)
     corpus_id = dbload.open_corpus(conn, VERSION, PARSER_VERSION, args.notes or "")
 
     seasons_seen: set[str] = set()
@@ -704,6 +710,30 @@ REPLAY_CHECKS = [
 ]
 
 
+#: `plays.event_location` is a *lifted copy* of something already in
+#: `event_modifiers`, and a lifted copy is exactly the kind of column that
+#: drifts from its source without anything noticing -- a misaligned positional
+#: insert writes 38 plausible values into 38 columns and fails nothing.
+#:
+#: The first check is the content test: a location is emitted as the tail of
+#: its `hit` modifier, so it must be a suffix of one of them. It is honestly a
+#: weak gate for the short values -- a column wrongly reading `8` on a play
+#: carrying `/E8` would pass it -- and it is a total one for the failure it is
+#: actually shaped for, a column that stopped corresponding to its row at all.
+#: The second is the shape test, straight off the grammar: `zone
+#: { loc_qualifier }`, so the first character is a digit and an empty string
+#: is not a location but a missing one, which is what NULL is for.
+LOCATION_CHECKS = [
+    ("location not in its own modifier list", False,
+     "SELECT p.play_id FROM plays p WHERE p.event_location IS NOT NULL"
+     " AND NOT EXISTS (SELECT 1 FROM json_each(p.event_modifiers) j"
+     "                  WHERE j.value LIKE '%' || p.event_location)"),
+    ("location is not zone-shaped", False,
+     "SELECT play_id FROM plays WHERE event_location IS NOT NULL"
+     " AND (event_location = '' OR event_location GLOB '[!0-9]*')"),
+]
+
+
 _TRUSTED = "p.parse_status NOT IN ('unparsed','state_untrusted')"
 
 
@@ -750,6 +780,14 @@ def cmd_verify_derived(args: argparse.Namespace) -> int:
     else:
         print("note: no comments table; run `rsse secondary` to add"
               f" {len(REPLAY_CHECKS)} more checks\n", file=sys.stderr)
+    if any(r[1] == "event_location"
+           for r in conn.execute("PRAGMA table_info(plays)")):
+        checks += LOCATION_CHECKS
+    else:
+        print("note: plays has no event_location column; it was derived before"
+              f" the column existed. A rebuild adds {len(LOCATION_CHECKS)} more"
+              " checks -- and `.hit_location()` needs it too.\n",
+              file=sys.stderr)
 
     failed = 0
     for name, trusted_only, sql in checks:
@@ -793,11 +831,13 @@ _QUERY_FLAGS = [
     ("--team-named", "team_named", str),
     ("--out-at", "out_at", str), ("--batter-ran", "batter_ran", str),
     ("--error", "error", int), ("--hit-location", "hit_location", str),
+    ("--position-played", "position_played", str),
     ("--event-matches", "event_matches", str),
 ]
 _QUERY_SWITCHES = [
     ("--bases-loaded", "bases_loaded"), ("--bases-empty", "bases_empty"),
     ("--scoring-position", "scoring_position"),
+    ("--hit-located", "hit_located"),
     ("--inning-ending", "inning_ending"), ("--walkoff", "walkoff"),
     ("--strikeout", "strikeout"), ("--dropped-third", "dropped_third"),
     ("--batter-reached-on-k", "batter_reached_on_k"),
@@ -1398,6 +1438,84 @@ def cmd_reference(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_appearances(args: argparse.Namespace) -> int:
+    """Build `appearances` from `allplayers.csv` (spec/05-DATABASE.md §9).
+
+    Its own pass for the reason the module docstring gives: every id in the
+    file is already a person, so this is not identity data and does not belong
+    to `reference`. Needs `rsse ingest --aux` for the source and `rsse
+    secondary` for the lineups it measures the corpus with.
+    """
+    from .database import appearances as appdb
+
+    archive_path = Path(args.archive) if args.archive else ARCHIVE
+    query_path = Path(args.database) if args.database else QUERY_DB
+    for path, what in ((archive_path, "ingest"), (query_path, "derive")):
+        if not path.exists():
+            print(f"no database at {path}; run `rsse {what}` first",
+                  file=sys.stderr)
+            return 2
+
+    archive = dbschema.connect(f"file:{archive_path}?mode=ro")
+    have = archive.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'aux_files'").fetchone()[0]
+    if have:
+        have = archive.execute(
+            "SELECT count(*) FROM aux_files WHERE kind = 'appearances'"
+        ).fetchone()[0]
+    if not have:
+        # Distinguished from "no aux files at all" on purpose: an archive
+        # ingested before `allplayers.csv` had a kind has every other
+        # auxiliary file and none of this one, and "run `rsse ingest --aux`"
+        # on its own would look like advice it had already taken.
+        print("no allplayers.csv in the archive. If this archive predates the"
+              " file having a kind, `rsse ingest --aux-only` migrates it and"
+              " adds it in one pass.", file=sys.stderr)
+        return 2
+
+    probe = dbschema.connect(f"file:{query_path}?mode=ro")
+    have_lineups = probe.execute(
+        "SELECT count(*) FROM sqlite_master WHERE type = 'table'"
+        " AND name = 'lineup_entries'").fetchone()[0]
+    probe.close()
+    if not have_lineups:
+        print("no lineup_entries; run `rsse secondary` first. Without it every"
+              " games_in_corpus would be zero, which reads as a finding rather"
+              " than a missing table.", file=sys.stderr)
+        return 2
+
+    conn = dbschema.connect(str(query_path))
+    for pragma in dbschema.LOAD_PRAGMAS:
+        conn.execute(pragma)
+    started = time.time()
+    stats = appdb.build(conn, archive)
+    conn.close()
+    archive.close()
+
+    lo, hi = stats.seasons
+    print(f"appearances          {stats.rows:,}")
+    print(f"  people             {stats.people:,}")
+    print(f"  seasons            {lo}-{hi}")
+    if stats.unknown_teams:
+        print(f"  teams with no season file  "
+              f"{', '.join(stats.unknown_teams)}")
+    if stats.games_stated:
+        pct = 100 * stats.games_held / stats.games_stated
+        print(f"\ngames the file counts    {stats.games_stated:,}")
+        print(f"games the corpus holds   {stats.games_held:,}  ({pct:.1f}%)")
+        print(f"person-seasons with no surviving game  "
+              f"{stats.absent_from_corpus:,} of {stats.rows:,}")
+    if stats.more_in_corpus:
+        # Not a gate. One of the two sources is wrong and this pass is not the
+        # place to decide which -- but the number should be small and seen.
+        print(f"rows where the corpus holds MORE than the file counts  "
+              f"{stats.more_in_corpus:,}")
+    print(f"\nelapsed              {time.time() - started:.1f}s")
+    print(f"\n{ATTRIBUTION}")
+    return 0
+
+
 def cmd_secondary(args: argparse.Namespace) -> int:
     """Build `comments` and `lineup_entries` (spec/05-DATABASE.md §2, §5).
 
@@ -1641,6 +1759,7 @@ NON_DERIVED_TABLES = {
     "teams": "rsse reference",
     "franchises": "rsse reference",
     "parks": "rsse reference",
+    "appearances": "rsse appearances",
 }
 
 
@@ -1711,8 +1830,22 @@ def _derive_refresh(args: argparse.Namespace, archive_path: Path,
                 file=sys.stderr)
             return 2
         adopted = derived.adopt_digests(conn, archive)
-        print(f"adopted source digests for {adopted:,} games")
-        stale, missing = derived.stale_and_missing(conn, archive)
+        # Deliberately not followed by a comparison. Adopting *writes* the
+        # archive's digests onto these games, so re-running the check here
+        # reports zero stale and zero missing every time, on a database that
+        # agrees with the archive and equally on one that does not. Printing
+        # that as a result would dress a tautology up as a verification --
+        # exactly the shape of the reconciler that agreed with itself
+        # (BUILD-LOG §3.42). The first comparison that means anything is the
+        # next one, after the next re-ingest.
+        print(f"adopted source digests for {adopted:,} games\n\n"
+              "these games are now on record as coming from the files the"
+              " archive holds today.\nNothing was compared: an adopt is an"
+              " assertion, and after one the two agree by\nconstruction."
+              " `rsse derive --refresh` measures something from here on.")
+        conn.close()
+        print(f"\n{ATTRIBUTION}")
+        return 0
     print(f"stale games          {len(stale):,}  (in the derived db, not the archive)")
     print(f"missing games        {len(missing):,}  (in the archive, not derived)")
     if not stale and not missing:
@@ -2196,6 +2329,12 @@ def main(argv: list[str] | None = None) -> int:
     rf.add_argument("--archive")
     rf.add_argument("--database")
     rf.set_defaults(func=cmd_reference)
+
+    apc = sub.add_parser("appearances",
+                         help="build appearances from allplayers.csv")
+    apc.add_argument("--archive")
+    apc.add_argument("--database")
+    apc.set_defaults(func=cmd_appearances)
 
     sc = sub.add_parser("secondary",
                         help="build comments and lineup_entries")
