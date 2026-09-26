@@ -45,7 +45,17 @@ CONF_TOKEN = "@@CONF@@"
 
 
 class QueryError(ValueError):
-    """A query that cannot be answered, stated as such rather than guessed at."""
+    """A query that cannot be answered, stated as such rather than guessed at.
+
+    `candidates` is set when the refusal is an ambiguous name: a list of
+    `(kind, id, label)`, so a caller that can offer a choice -- the web UI
+    (spec/09-WEB.md §7) -- has the ids as data rather than having to parse
+    them back out of the message.
+    """
+
+    def __init__(self, message: str, candidates=()):
+        super().__init__(message)
+        self.candidates = tuple(candidates)
 
 
 #: Sub-table predicates compile to ``p.play_id IN (SELECT ...)``, never to a
@@ -161,6 +171,7 @@ class Search:
     _game_types: tuple[str, ...] = DEFAULT_GAME_TYPES
     _order: str | None = None
     _limit: int | None = None
+    _offset: int = 0
 
     # -- plumbing --------------------------------------------------------
 
@@ -689,6 +700,16 @@ class Search:
     def limit(self, n: int) -> "Search":
         return replace(self, _limit=int(n))
 
+    def offset(self, n: int) -> "Search":
+        """Skip the first ``n`` matches -- paging (spec/09-WEB.md §4).
+
+        Only meaningful with `.limit()`, and refused without one at compile
+        time rather than here, so the two can be applied in either order.
+        """
+        if int(n) < 0:
+            raise QueryError(f"offset must be non-negative, not {n}")
+        return replace(self, _offset=int(n))
+
     # -- compilation -------------------------------------------------------
 
     @property
@@ -796,8 +817,14 @@ class Search:
             # ids (05-DATABASE §2).
             sql.append("ORDER BY " + (self._order or
                                       "g.date, p.game_id, p.game_key, p.seq"))
+        if self._offset and not self._limit:
+            raise QueryError("offset() needs a limit(): an offset into an"
+                             " unlimited result is the result minus its"
+                             " first rows, which nobody means to ask for")
         if order and self._limit:
             sql.append(f"LIMIT {int(self._limit)}")
+            if self._offset:
+                sql.append(f"OFFSET {int(self._offset)}")
         return "\n".join(sql), tuple(jparams) + tuple(wparams)
 
     # -- execution ---------------------------------------------------------
@@ -869,10 +896,12 @@ class Search:
                 raise QueryError(
                     f"cannot resolve the name {name!r}: this database has no "
                     "reference tables. Run `rsse reference` to build them.")
+            found = lookup[kind](conn, name)
             try:
-                resolve(lookup[kind](conn, name), kind, name)
+                resolve(found, kind, name)
             except AmbiguousName as exc:
-                raise QueryError(str(exc)) from exc
+                raise QueryError(str(exc), candidates=[
+                    (kind, c.id, c.label) for c in found]) from exc
 
     def validate(self, conn) -> list[str]:
         """Names used by this query that the database does not know."""

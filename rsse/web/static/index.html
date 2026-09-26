@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>RSSE</title>
+<link rel="stylesheet" href="app.css">
+</head>
+<body>
+<header class="top">
+  <a class="brand" href="#/">RSSE</a>
+  <nav>
+    <a href="#/query">Query</a>
+    <a href="#/seasons">Seasons</a>
+    <a href="#/tags">Tags</a>
+  </nav>
+  <div class="search">
+    <input id="namebox" type="search" autocomplete="off" spellcheck="false"
+           placeholder="Player, team or park" aria-label="Find a player, team or park">
+    <div id="namehits" class="hits" hidden></div>
+  </div>
+</header>
+<main id="app" tabindex="-1"><p class="muted">Loading…</p></main>
+<footer>
+  <p id="attribution"></p>
+  <p id="versions" class="muted"></p>
+</footer>
+<script src="app.js"></script>
+</body>
+</html>

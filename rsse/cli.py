@@ -923,96 +923,19 @@ def cmd_verify_derived(args: argparse.Namespace) -> int:
 # query (spec/06-QUERY.md §8)
 # ---------------------------------------------------------------------------
 
-#: Flags that map one-to-one onto a `Search` method. Kept as data so `query`
-#: and `explain` cannot drift apart: both build the search through `_search`.
-_QUERY_FLAGS = [
-    ("--bases", "bases", str), ("--outs", "outs", int),
-    ("--outs-after", "outs_after", int), ("--inning", "inning", int),
-    ("--inning-at-least", "inning_at_least", int), ("--half", "half", str),
-    ("--season", "season", int), ("--league", "league", str),
-    ("--team", "team", str), ("--batting-team", "batting_team", str),
-    ("--fielding-team", "fielding_team", str), ("--batter", "batter", str),
-    ("--park", "park", str), ("--runner-on", "runner_on", str),
-    # Names, resolved against the reference tables. Separate flags rather than
-    # letting `--batter` take either: `ruthb101` and `Babe Ruth` are never
-    # confusable, but a flag that silently accepts both hides which one
-    # failed when neither resolves.
-    ("--batter-named", "batter_named", str),
-    ("--park-named", "park_named", str),
-    ("--team-named", "team_named", str),
-    ("--out-at", "out_at", str), ("--batter-ran", "batter_ran", str),
-    ("--error", "error", int), ("--hit-location", "hit_location", str),
-    ("--position-played", "position_played", str),
-    ("--event-matches", "event_matches", str),
-]
-_QUERY_SWITCHES = [
-    ("--bases-loaded", "bases_loaded"), ("--bases-empty", "bases_empty"),
-    ("--scoring-position", "scoring_position"),
-    ("--hit-located", "hit_located"),
-    ("--inning-ending", "inning_ending"), ("--walkoff", "walkoff"),
-    ("--strikeout", "strikeout"), ("--dropped-third", "dropped_third"),
-    ("--batter-reached-on-k", "batter_reached_on_k"),
-    ("--double-play", "double_play"), ("--triple-play", "triple_play"),
-    ("--include-uncertain", "include_uncertain"),
-    ("--include-untrusted", "include_untrusted"),
-    ("--include-unparsed", "include_unparsed"),
-    ("--curated-only", "curated_only"), ("--exclude-curated", "exclude_curated"),
-    ("--include-exhibition", "include_exhibition"),
-    ("--include-allstar", "include_allstar"),
-    ("--only-postseason", "only_postseason"),
-]
-
-
 def _search_from_args(args) -> "object":
-    from .query import Search
-    s = Search()
-    for flag, method, cast in _QUERY_FLAGS:
-        value = getattr(args, flag.lstrip("-").replace("-", "_"), None)
-        if value is not None:
-            s = getattr(s, method)(cast(value))
-    for flag, method in _QUERY_SWITCHES:
-        if getattr(args, flag.lstrip("-").replace("-", "_"), False):
-            s = getattr(s, method)()
-    if args.seasons:
-        lo, hi = (int(x) for x in args.seasons.split(","))
-        s = s.seasons(lo, hi)
-    if args.tag:
-        for name in args.tag:
-            s = s.tag(name)
-    if args.force_play_at or args.force_play:
-        s = s.force_play(at=args.force_play_at,
-                         include_tag_outs=args.include_tag_outs,
-                         certainty=args.force_certainty)
-    if args.tag_out_at:
-        s = s.tag_out(at=args.tag_out_at)
-    if args.putout_sequence:
-        s = s.putout_sequence(args.putout_sequence.split(","))
-    if args.contains_sequence:
-        s = s.contains_sequence(args.contains_sequence.split(","))
-    if args.putout_by:
-        s = s.putout_by(int(args.putout_by),
-                        assist_by=[int(x) for x in args.assist_by.split(",")]
-                        if args.assist_by else ())
-    return s
+    """The `Search` a `query` / `explain` command line describes.
+
+    Built through `rsse.query.params`, the table the web UI builds from too
+    (spec/09-WEB.md §2), so the two cannot drift apart.
+    """
+    from .query.params import params_from_namespace, search_from_params
+    return search_from_params(params_from_namespace(args))
 
 
 def _add_query_flags(sub) -> None:
-    for flag, _method, _cast in _QUERY_FLAGS:
-        sub.add_argument(flag)
-    for flag, _method in _QUERY_SWITCHES:
-        sub.add_argument(flag, action="store_true")
-    sub.add_argument("--seasons", help="LO,HI inclusive")
-    sub.add_argument("--tag", action="append", help="repeatable")
-    sub.add_argument("--force-play", action="store_true")
-    sub.add_argument("--force-play-at")
-    sub.add_argument("--force-certainty", choices=["derived", "likely",
-                                                   "ambiguous"])
-    sub.add_argument("--include-tag-outs", action="store_true")
-    sub.add_argument("--tag-out-at")
-    sub.add_argument("--putout-sequence", help="e.g. 2,1")
-    sub.add_argument("--contains-sequence")
-    sub.add_argument("--putout-by")
-    sub.add_argument("--assist-by")
+    from .query.params import add_arguments
+    add_arguments(sub)
     sub.add_argument("--database")
     sub.add_argument("--limit", type=int, default=25)
 
@@ -1037,30 +960,14 @@ def cmd_query(args: argparse.Namespace) -> int:
         return 2
 
     if args.format == "json":
-        import dataclasses
-        print(json.dumps({
-            "rows": [dataclasses.asdict(r) for r in result.rows],
-            "total": result.total,
-            "coverage": dataclasses.asdict(result.coverage),
-            "excluded": dataclasses.asdict(result.excluded),
-            "force": dataclasses.asdict(result.force) if result.force else None,
-            "corpus_version": result.corpus_version,
-            "ontology_version": result.ontology_version,
-            "sql": result.sql,
-            "attribution": ATTRIBUTION,
-        }, indent=2, default=str))
+        from .query.export import result_dict
+        print(json.dumps(result_dict(result, ATTRIBUTION), indent=2,
+                         default=str))
         return 0
 
     if args.format == "csv":
-        import csv
-        writer = csv.writer(sys.stdout)
-        writer.writerow(["game_id", "date", "inning", "half", "batter_id",
-                         "outs_before", "bases_before", "event_raw", "tags"])
-        for r in result.rows:
-            writer.writerow([r.game_id, r.date, r.inning, r.half, r.batter_id,
-                             r.outs_before, r.bases_before, r.event_raw,
-                             " ".join(r.tags)])
-        print(f"# {ATTRIBUTION}")
+        from .query.export import write_csv
+        write_csv(result, sys.stdout, ATTRIBUTION)
         return 0
 
     for r in result.rows:
@@ -1673,6 +1580,28 @@ def cmd_secondary(args: argparse.Namespace) -> int:
     conn.close()
     print(f"\n{ATTRIBUTION}")
     return 1 if stats.malformed else 0
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    """Serve the local web UI (spec/09-WEB.md)."""
+    from .web.server import Config, serve
+
+    db_path = Path(args.database) if args.database else QUERY_DB
+    if not db_path.exists():
+        print(f"no query database at {db_path}; run `rsse derive` first",
+              file=sys.stderr)
+        return 2
+    archive = Path(args.archive) if args.archive else ARCHIVE
+    config = Config(database=db_path, archive=archive, timeout=args.timeout,
+                    max_queries=args.max_queries,
+                    allowed_hosts=frozenset(args.allowed_host or ()),
+                    attribution=ATTRIBUTION)
+    try:
+        return serve(config, args.host, args.port, not args.no_browser)
+    except OSError as exc:
+        print(f"cannot listen on {args.host}:{args.port}: {exc}",
+              file=sys.stderr)
+        return 2
 
 
 def cmd_coverage(args: argparse.Namespace) -> int:
@@ -2487,6 +2416,22 @@ def main(argv: list[str] | None = None) -> int:
     cv.add_argument("--rebuild", action="store_true")
     cv.add_argument("--season-range", help="LO,HI inclusive")
     cv.set_defaults(func=cmd_coverage)
+
+    sv = sub.add_parser("serve", parents=[common],
+                        help="local web UI for the query engine")
+    sv.add_argument("--host", default="127.0.0.1")
+    sv.add_argument("--port", type=int, default=8000)
+    sv.add_argument("--database")
+    sv.add_argument("--archive", help="attached read-only for game logs and"
+                                      " source lines (default: the archive)")
+    sv.add_argument("--timeout", type=float, default=60.0,
+                    help="seconds before a query is stopped")
+    sv.add_argument("--max-queries", type=int, default=2,
+                    help="searches allowed to run at once")
+    sv.add_argument("--allowed-host", action="append",
+                    help="an extra Host header name to accept; repeatable")
+    sv.add_argument("--no-browser", action="store_true")
+    sv.set_defaults(func=cmd_serve)
 
     v = sub.add_parser("verify", parents=[common], help="check raw-layer integrity")
     v.add_argument("--archive")

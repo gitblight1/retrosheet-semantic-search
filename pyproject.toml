@@ -18,6 +18,9 @@ include = ["rsse*"]
 # Both files are read at runtime, and a wheel without them is not a smaller
 # install -- it is a different deriver. See rsse/semantic/derive.py:load_curated
 # and rsse.cli:load_known_defects, which now refuse to run without them.
+# The web UI's page is the same kind of file: `rsse serve` without it serves
+# an API with no page (spec/09-WEB.md §8).
 [tool.setuptools.package-data]
 "rsse.semantic" = ["curated_tags.json"]
 "rsse.parser" = ["known-source-defects.json"]
+"rsse.web" = ["static/*"]

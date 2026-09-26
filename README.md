@@ -86,6 +86,22 @@ You can install this as a package using `pipx`:
 pipx install git+https://github.com/gitblight1/retrosheet-semantic-search.git
 ```
 
+## Web UI
+
+```bash
+python3 -m rsse.cli serve                 # opens http://localhost:8000/
+```
+
+A browser front end over the same database, served from your machine: the
+query builder, and pages for every play, game, player, team-season, park and
+date the corpus holds. It builds exactly the query the CLI builds from the
+same inputs, shows what was searched beside every count, and opens the
+database read-only. Standard library only, and nothing is loaded from the
+network. See [09-WEB](spec/09-WEB.md).
+
+It listens on `127.0.0.1` only. It has no authentication, so do not expose it
+with `--host` on a network you do not trust.
+
 ## Querying
 
 The CLI covers the common cases; the Python API covers all of them. Every
@@ -331,6 +347,7 @@ corpus rather than against Retrosheet's documentation alone.
 | [06-QUERY](spec/06-QUERY.md) | Builder API, predicate semantics, result contract |
 | [07-TESTING](spec/07-TESTING.md) | Gold corpus format and corpus-wide gates |
 | [08-WORKED-EXAMPLE](spec/08-WORKED-EXAMPLE.md) | The motivating play through every layer |
+| [09-WEB](spec/09-WEB.md) | The local web UI: pages, disclosure, timeouts, and what hosting would take |
 
 Two documents the original discussion called for are **not** in the set: a
 roadmap, and a record of the future extensions and non-goals it listed
