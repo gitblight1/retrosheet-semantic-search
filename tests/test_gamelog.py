@@ -13,6 +13,7 @@ by shifting a field deliberately.
 """
 
 import unittest
+from pathlib import Path
 
 from rsse.model.gamelog import (EXPECTED_FIELDS, FIELDS, GameLogError,
                                 check_layout, parse_line)
@@ -363,6 +364,63 @@ class Reconcile(unittest.TestCase):
         files = self.archive.execute(
             "SELECT count(*) FROM game_log_files").fetchone()[0]
         self.assertEqual(files, 1)
+
+    def test_a_second_copy_of_a_file_is_refused(self):
+        """The same archive extracted into two directories must load once.
+
+        `glws.txt` and its siblings were ingested from both `gamelogs/` and
+        `gamelogs/postseason/`, and `UNIQUE (path)` could not see it: two
+        paths, one set of games, every postseason row counted twice.
+        """
+        from rsse.database import gamelogs
+        lines = [make_line(), make_line(date="20001021", home_team="NYA")]
+        first = self.tmp / "glws.txt"
+        (self.tmp / "postseason").mkdir()
+        second = self.tmp / "postseason" / "glws.txt"
+        for path in (first, second):
+            path.write_text("\n".join(lines) + "\n", encoding="latin-1")
+        stats = gamelogs.load(self.archive, [first, second])
+        self.assertEqual(stats.loaded, 2)
+        self.assertEqual(len(stats.refused), 1)
+        path, held_by, overlapping, total = stats.refused[0]
+        self.assertEqual(path, str(second.resolve()))
+        self.assertEqual(held_by, [str(first.resolve())])
+        self.assertEqual((overlapping, total), (2, 2))
+        self.assertEqual(self.archive.execute(
+            "SELECT count(*) FROM game_logs").fetchone()[0], 2)
+        self.assertEqual(self.archive.execute(
+            "SELECT count(*) FROM game_log_files").fetchone()[0], 1,
+            "a refused file must leave no trace in the archive")
+
+    def test_a_partial_copy_is_refused_whole(self):
+        """One shared line is enough, and none of the file is loaded."""
+        from rsse.database import gamelogs
+        self.write_logs([make_line()], name="glws.txt")
+        stats = self.write_logs(
+            [make_line(), make_line(date="20001021", home_team="NYA")],
+            name="glws-copy.txt")
+        self.assertEqual(stats.loaded, 0)
+        self.assertEqual(stats.refused[0][2:], (1, 2))
+        self.assertEqual(self.archive.execute(
+            "SELECT count(*) FROM game_logs").fetchone()[0], 1)
+
+    def test_one_file_by_two_spellings_is_one_file(self):
+        """Relative and absolute paths are different strings (BUILD-LOG §3.36)."""
+        import os
+        from rsse.database import gamelogs
+        path = self.tmp / "gl2000.txt"
+        path.write_text(make_line() + "\n", encoding="latin-1")
+        gamelogs.load(self.archive, [path])
+        cwd = os.getcwd()
+        os.chdir(self.tmp)
+        try:
+            stats = gamelogs.load(self.archive, [Path("gl2000.txt")])
+        finally:
+            os.chdir(cwd)
+        self.assertEqual(stats.refused, [], "a reload is not a second copy")
+        self.assertEqual(stats.loaded, 1)
+        self.assertEqual(self.archive.execute(
+            "SELECT count(*) FROM game_log_files").fetchone()[0], 1)
 
     def test_an_archive_without_the_series_column_is_migrated(self):
         """`CREATE TABLE IF NOT EXISTS` does not add a column.

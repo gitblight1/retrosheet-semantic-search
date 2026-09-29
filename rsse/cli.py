@@ -1078,9 +1078,12 @@ def cmd_gamelogs(args: argparse.Namespace) -> int:
         print(f"fetching game logs into {root} ...", file=sys.stderr)
         download.fetch_gamelogs(root)
 
-    # Recursive: the postseason and all-star archives extract into their own
-    # subdirectory, and leaving them out is what made the coverage gap a guess
-    # from the calendar rather than a fact (05-DATABASE §5.3).
+    # Recursive: the per-series postseason and all-star archives may be
+    # unzipped into a subdirectory by hand, and leaving them out is what made
+    # the coverage gap a guess from the calendar rather than a fact
+    # (05-DATABASE §5.3). The combined archive also carries most of them, so
+    # the same file can be found twice; `gamelogs.load` refuses the second
+    # copy (BUILD-LOG §3.47).
     files = sorted(p for p in root.rglob("*")
                    if p.is_file() and p.suffix.lower() in (".txt", ".csv"))
     if not files:
@@ -1111,6 +1114,17 @@ def cmd_gamelogs(args: argparse.Namespace) -> int:
     print(f"malformed            {len(stats.malformed):,}")
     for path, line_no, why in stats.malformed[:5]:
         print(f"    {Path(path).name}:{line_no}  {why}")
+    print(f"refused              {len(stats.refused):,}")
+    for path, held_by, overlapping, lines in stats.refused:
+        print(f"    {path}: {overlapping:,} of {lines:,} lines already loaded"
+              f" from {', '.join(held_by)}")
+    if stats.refused:
+        # Not a failure: the archive holds one copy of every row, which is
+        # the state a load is for. Said out loud because the second copy is
+        # still on disk and will be refused again on every run until removed.
+        print("  A refused file is left out whole; remove the duplicate copy"
+              " from disk, or delete the other file's rows first if this one"
+              " should win.")
 
     # The field offsets cannot be checked by a fixture -- a test file written
     # from them agrees with them however wrong they are. These check the

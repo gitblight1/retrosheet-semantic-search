@@ -49,8 +49,9 @@ python3 -m rsse.cli derive --progress     # queryable tables     (~90 min, 11.6 
 python3 -m rsse.cli ingest --aux          # rosters/teams/parks  (~10 s)
 python3 -m rsse.cli secondary --progress  # comments + lineups   (~10 min)
 python3 -m rsse.cli earned-runs           # earned runs, derived (~21 min)
-python3 -m rsse.cli reference             # people, teams, parks (~5 s)
+python3 -m rsse.cli reference             # people, teams, parks (~13 s)
 python3 -m rsse.cli appearances           # per-season playing time (~5 s)
+python3 -m rsse.cli gamelogs --fetch      # game logs, for coverage
 python3 -m rsse.cli coverage --rebuild    # coverage table       (~10 s)
 ```
 
@@ -68,6 +69,10 @@ packages the Negro Leagues separately, and that archive carries both the
 whole-corpus reference CSVs and the 704 roster files the season archives do
 not ship. Without it, 283 team-seasons have a lineup and no names behind it,
 and `reference` and `appearances` have nothing to read.
+
+`gamelogs` comes before `coverage` because Retrosheet's game logs are the
+list of games the coverage table measures the corpus against. Without them,
+`games_missing` is left unknown rather than reported as zero.
 
 `fetch` is throttled and resumable. `derive` reads the **archive**, never the
 event files, so a rebuild reproduces exactly the bytes that were ingested —
@@ -166,7 +171,8 @@ Two databases, deliberately separate.
 stored byte for byte with provenance and per-game spans, 1.9 GB. Every event
 string in it has been parsed and re-emitted identically — the round-trip gate
 ([02-GRAMMAR §6](spec/02-GRAMMAR.md)) — so nothing was silently dropped on the
-way in.
+way in. The same file also holds the reference records and Retrosheet's game
+logs, which bring it to 2.3 GB.
 
 **The query database** is derived from the archive and holds nothing that is a
 source of truth, which is what makes it safe to rebuild:
@@ -175,15 +181,15 @@ source of truth, which is what makes it safe to rebuild:
 |---|---|---|
 | `games` | 203,285 | one row per game, with the `info` header flattened |
 | `plays` | 17,891,790 | one row per play: base-out state, score, the raw event string |
-| `runner_advances` | 14,482,091 | every runner movement, with `is_force` and its certainty |
+| `runner_advances` | 14,473,528 | every runner movement, with `is_force` and its certainty |
 | `fielding_credits` | 12,983,019 | putouts, assists and errors by position |
 | `credit_sequences` | 9,057,478 | one throw sequence each — `64(1)3` is two of them, not one |
-| `play_tags` | 69,076,275 | 84 semantic tags, each with a derivation rule |
+| `play_tags` | 69,088,465 | 84 semantic tags, each with a derivation rule |
 | `comments` | 222,495 | scorer notes, including 5,102 replay verdicts and 18,129 ejections |
 | `lineup_entries` | 5,537,381 | starters and substitutions, as a timeline |
 | `coverage` | 274 | what the corpus covers, per season and league |
 
-Total 11.6 GB. `rsse verify --derived` runs 37 integrity checks over it,
+Total 12.0 GB. `rsse verify --derived` runs 37 integrity checks over it,
 all passing.
 
 ### Coverage caveats you should know about
@@ -223,9 +229,10 @@ Everything in the build order is built and validated against the full corpus.
 | Ontology | 84 tags, one derivation rule each, a positive **and** a negative case each |
 | Derived tables | 17,891,790 plays, 11.6 GB, **37/37** integrity checks |
 | Comments / lineups | 222,495 comments, 5,537,381 lineup entries, 0 unreadable |
-| Earned runs | 1,796,610 derived from the play-by-play; **98.9486%** agree with Retrosheet's own per-run flags |
+| Earned runs | 1,796,610 derived from the play-by-play; **98.9497%** agree with Retrosheet's own per-run flags |
 | Query API | `Search`, coverage and force reporting, `query` / `explain` / `coverage` |
-| Tests | 428, all passing |
+| Web UI | `rsse serve`: query builder plus play, game, player, team, park, date and season pages; local only |
+| Tests | 472, all passing |
 
 **Every replayed score matches the published one.** `rsse reconcile` compares
 `games.final_home` / `final_away` — reconstructed by replaying 17,891,790 plays
@@ -280,6 +287,7 @@ python3 -m rsse.cli reconcile --explain-er     # replayed scores vs published on
 python3 -m rsse.cli bench                      # pinned query budgets (~1 min)
 python3 -m rsse.cli query ...                  # search; --format table|json|csv
 python3 -m rsse.cli explain ...                # the SQL and plan for a search
+python3 -m rsse.cli serve                      # local web UI, localhost:8000
 python3 -m unittest discover -s tests -t .
 ```
 
@@ -297,7 +305,8 @@ rsse/semantic/   84 tags, implication, confidence, curated tags
 rsse/database/   archive DDL and ingest; derived, secondary, earned-run,
                  reference, appearances and coverage builds
 rsse/query/      Search builder, SQL compiler, coverage and force reporting
-tests/           428 tests; tests/gold/ holds 5 plays asserted through every layer
+rsse/web/        `rsse serve`: stdlib HTTP server, JSON API, static front end
+tests/           472 tests; tests/gold/ holds 5 plays asserted through every layer
 ```
 
 ## Design notes

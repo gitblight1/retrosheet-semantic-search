@@ -81,6 +81,9 @@ class LoadStats:
     #: field offsets claim. Reported on every load, because a wrong offset
     #: yields plausible numbers rather than an error.
     layout: list = field(default_factory=list)
+    #: `(path, held_by, overlapping, lines)` for each file refused because
+    #: rows it holds are already loaded from another file. See `_held_elsewhere`.
+    refused: list[tuple[str, list[str], int, int]] = field(default_factory=list)
 
 
 #: Filename stem -> series. `gl1871_2025.txt` and `glYYYY.txt` are regular
@@ -131,6 +134,32 @@ def _migrate(conn) -> list[str]:
     return added
 
 
+def _held_elsewhere(conn, path: str, parsed: list) -> tuple[list[str], int]:
+    """Which *other* files already hold any of these lines, and how many.
+
+    The same archive extracted into two directories loads twice under two
+    paths, and `UNIQUE (path)` cannot see it: `glws.txt` and its siblings were
+    ingested from both `gamelogs/` and `gamelogs/postseason/`, 3,950 rows for
+    1,977 games (BUILD-LOG §3.46). Matched on the verbatim line rather than the
+    file's hash so a re-save with different line endings is caught too, and
+    looked up through the `game_id` index so the check costs a probe per line.
+    No line legitimately appears in two of Retrosheet's files -- not even a
+    game id does -- so any overlap at all is a second copy.
+    """
+    held: dict[str, int] = {}
+    overlapping = 0
+    for gl in parsed:
+        row = conn.execute(
+            "SELECT f.path FROM game_logs g"
+            "  JOIN game_log_files f ON f.gl_file_id = g.gl_file_id"
+            " WHERE g.game_id = ? AND g.raw = ? AND f.path <> ? LIMIT 1",
+            (gl.retrosheet_game_id, gl.raw, path)).fetchone()
+        if row:
+            overlapping += 1
+            held[row[0]] = held.get(row[0], 0) + 1
+    return sorted(held), overlapping
+
+
 def load(conn, paths: list[Path], progress=None) -> LoadStats:
     """Load game log files into the archive."""
     from datetime import datetime, timezone
@@ -145,6 +174,41 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
     for path in paths:
         if progress:
             progress(path)
+        # Resolved, so one file reached by two spellings is one row: the same
+        # hole `aux_files` had, where a relative and an absolute path loaded
+        # 3,435 files twice without tripping UNIQUE (BUILD-LOG §3.36).
+        path = Path(path).resolve()
+        series = series_for(path)
+        rows = []
+        file_parsed: list = []
+        # latin-1: the logs carry the same accented names the event files do,
+        # and decoding must never be the thing that loses a game.
+        for line_no, line in enumerate(
+                path.read_text(encoding="latin-1").splitlines(), 1):
+            if not line.strip():
+                continue
+            stats.lines += 1
+            try:
+                gl = parse_line(line)
+            except GameLogError as exc:
+                # Recorded, not skipped. A game log line that cannot be read
+                # is a game the reconciliation cannot check, and a silent one
+                # would make the check look more complete than it is.
+                stats.malformed.append((str(path), line_no, str(exc)))
+                continue
+            file_parsed.append((line_no, gl))
+
+        # Refused whole, before anything is written. Loading the lines that
+        # are new and skipping the rest would leave one file's games split
+        # across two `gl_file_id`s, and which copy is the right one is a
+        # decision for whoever put the second copy there.
+        held_by, overlapping = _held_elsewhere(
+            conn, str(path), [gl for _, gl in file_parsed])
+        if overlapping:
+            stats.refused.append(
+                (str(path), held_by, overlapping, len(file_parsed)))
+            continue
+
         digest = sha256(path)
         now = datetime.now(timezone.utc).isoformat(timespec="seconds")
         # Not `INSERT OR REPLACE`: REPLACE deletes the existing row and
@@ -169,25 +233,7 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
                 (str(path), digest, path.stat().st_size, now))
             gl_file_id = cur.lastrowid
 
-        series = series_for(path)
-        rows = []
-        file_parsed: list = []
-        # latin-1: the logs carry the same accented names the event files do,
-        # and decoding must never be the thing that loses a game.
-        for line_no, line in enumerate(
-                path.read_text(encoding="latin-1").splitlines(), 1):
-            if not line.strip():
-                continue
-            stats.lines += 1
-            try:
-                gl = parse_line(line)
-            except GameLogError as exc:
-                # Recorded, not skipped. A game log line that cannot be read
-                # is a game the reconciliation cannot check, and a silent one
-                # would make the check look more complete than it is.
-                stats.malformed.append((str(path), line_no, str(exc)))
-                continue
-            file_parsed.append(gl)
+        for line_no, gl in file_parsed:
             rows.append((
                 gl_file_id, line_no, gl.retrosheet_game_id, gl.date,
                 gl.game_number, gl.home_team, gl.away_team, gl.home_league,
@@ -201,7 +247,7 @@ def load(conn, paths: list[Path], progress=None) -> LoadStats:
         stats.loaded += len(rows)
         stats.files += 1
         conn.commit()
-        parsed.extend(gl for gl in file_parsed)
+        parsed.extend(gl for _, gl in file_parsed)
 
     stats.layout = check_layout(parsed)
     return stats
